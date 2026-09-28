@@ -1,6 +1,7 @@
 // src/prefill/kernels.cu - see include/strata/prefill/kernels.hpp.
 #include "strata/prefill/kernels.hpp"
 #include "strata/kernels/mrope.hpp"
+#include "strata/kernels/native_router.hpp"
 #include "strata/kernels/router_top10.hpp"
 
 #include <cuda_fp16.h>
@@ -737,6 +738,11 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
     check("gdn_recurrence");
 }
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream) {
+    static const bool decode = env_on("STRATA_PREFILL_ROUTE_DECODE");
+    if (decode) {
+        route_decode(logits, ids, weights, T, n_expert, stream);
+        return;
+    }
     if (n_expert == 512)
         route_kernel<16><<<(unsigned) ((T + 7) / 8), 256, 0, (cudaStream_t) stream>>>(logits, ids, weights, T);
     else if (n_expert == 256)
@@ -744,6 +750,12 @@ void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t
     else
         strata::kernels::router_top10(logits, (int) T, (int) n_expert, 10, ids, weights, stream);
     check("route");
+}
+void route_decode(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream) {
+    if (T <= 0) return;
+    if (strata::kernels::native_router_enabled() && n_expert == 512) route_native(logits, ids, weights, T, stream);
+    else strata::kernels::router_top10(logits, (int) T, (int) n_expert, 10, ids, weights, stream);
+    check("route_decode");
 }
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream) {
     blob_dequant_kernel<false><<<blocks_for(1280LL * 640 + 2560LL * 160), 256, 0, (cudaStream_t) stream>>>(blob, gu16, down16);

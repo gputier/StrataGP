@@ -1329,13 +1329,24 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         };
                         const int64_t bgu = bad(m.GU, T * K * 1280), bdm = bad(m.Dm, T * K * N), bbo = bad(m.bo, T * N);
                         const int64_t bh = m.H ? bad(m.H, T * K * 640) : -1;
+                        // the router's input (B8): route masks a NaN probability as -FLT_MAX, so a row of NaN takes
+                        // experts 0-9 silently; count the rows with a non-finite logit
+                        int64_t blg = 0;
+                        {
+                            const int64_t ne = m.g->n_expert;
+                            std::vector<float> h((size_t) (T * ne));
+                            cudaMemcpy(h.data(), m.logits, h.size() * 4, cudaMemcpyDeviceToHost);
+                            for (int64_t t = 0; t < T; ++t)
+                                for (int64_t e = 0; e < ne; ++e)
+                                    if (!std::isfinite(h[(size_t) (t * ne + e)])) { ++blg; break; }
+                        }
                         static int64_t reported = -1;
-                        if ((bgu || bdm || bbo || bh > 0) && reported != stats_.chunks) {
+                        if ((bgu || bdm || bbo || bh > 0 || blg) && reported != stats_.chunks) {
                             reported = stats_.chunks;
                             std::fprintf(stderr, "strata dbg: layer %lld (mmq %d, types %d/%d, %zu experts): non-finite GU %lld "
-                                         "H %lld Dm %lld bo %lld of T %lld\n", (long long) l, (int) use_mmq, mmq_gt, mmq_dt,
-                                         order.size(), (long long) bgu, (long long) bh, (long long) bdm, (long long) bbo,
-                                         (long long) T);
+                                         "H %lld Dm %lld bo %lld, router rows %lld, of T %lld\n", (long long) l, (int) use_mmq,
+                                         mmq_gt, mmq_dt, order.size(), (long long) bgu, (long long) bh, (long long) bdm,
+                                         (long long) bbo, (long long) blg, (long long) T);
                         }
                     }
                 }

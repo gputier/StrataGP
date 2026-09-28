@@ -262,6 +262,9 @@ if(STRATA_ENABLE_CUDA)
   add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
   target_include_directories(strata_prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(strata_prefill PUBLIC strata_engine CUDA::cublas CUDA::cudart)
+  # B8 (STRATA_PREFILL_ROUTE_DECODE=1): the token path's native router over a prompt chunk, with its --use_fast_math
+  target_sources(strata_prefill PRIVATE src/prefill/route_native.cu)
+  set_source_files_properties(src/prefill/route_native.cu PROPERTIES COMPILE_OPTIONS "--use_fast_math")
 
   add_executable(strata src/program/generate.cpp)
   target_include_directories(strata PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

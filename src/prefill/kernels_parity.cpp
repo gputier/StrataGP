@@ -11,6 +11,11 @@
 //      gr_norm: the BF16 xn, mixed in FP32, BF16 and FP16, the written R, then the next half's xn and mixed.
 //   4. FP16 saturation (B7): off, every FP16 image is __float2half_rn (+-inf past 65520); on, finite values past the
 //      range give +-65504, NaN and +-inf pass through, and every in-range value keeps its bits.
+//   5. the router (B8): route_native over a chunk against native_router_top10 token by token (ids and weights
+//      bitwise, with ties, a flat row and underflowing probabilities), route_decode's dispatch, and - reported, not
+//      judged - how often the default prompt router (precise expf) picks a different set.
+#include "strata/kernels/native_router.hpp"
+#include "strata/kernels/router_top10.hpp"
 #include "strata/prefill/kernels.hpp"
 
 #include <cuda_runtime.h>
@@ -333,6 +338,58 @@ void test_f16_sat(std::mt19937& rng) {
                 sat_seen);
     cudaFree(dx); cudaFree(dy); cudaFree(dg); cudaFree(du); cudaFree(h_off); cudaFree(h_on);
 }
+
+// ---------------------------------------------------------------- 5. the router
+void test_route(std::mt19937& rng) {
+    const int64_t T = 45, E = 512, K = 10;
+    std::vector<float> lg = normal(rng, (size_t) (T * E), 2.0f);
+    for (int64_t e = 0; e < E; ++e) lg[(size_t) (3 * E + e)] = 0.5f;                          // a flat row: ids 0-9
+    lg[(size_t) (7 * E + 40)] = lg[(size_t) (7 * E + 300)] = 9.0f;                              // a tie at the top
+    for (int64_t e = 0; e < E; ++e) lg[(size_t) (11 * E + e)] = e < 3 ? 80.0f - e : -80.0f;     // underflowing tail
+    for (int64_t e = 0; e < E; ++e) lg[(size_t) (13 * E + e)] = 1.0f + 1e-7f * (float) (e % 17); // near-ties
+    float* d_lg = dalloc<float>((size_t) (T * E));
+    int32_t *id_a = dalloc<int32_t>((size_t) (T * K)), *id_b = dalloc<int32_t>((size_t) (T * K));
+    float *w_a = dalloc<float>((size_t) (T * K)), *w_b = dalloc<float>((size_t) (T * K));
+    h2d(d_lg, lg);
+    for (int64_t t = 0; t < T; ++t) strata::kernels::native_router_top10(d_lg + t * E, id_a + t * K, w_a + t * K, g_s);
+    p::route_native(d_lg, id_b, w_b, T, g_s);
+    const std::vector<int32_t> ia = d2h(id_a, (size_t) (T * K));
+    const std::vector<float> wa = d2h(w_a, (size_t) (T * K));
+    same("route_native ids", T, ia, d2h(id_b, (size_t) (T * K)));
+    same("route_native weights", T, wa, d2h(w_b, (size_t) (T * K)));
+    for (int k = 0; k < K; ++k)
+        if (ia[(size_t) (3 * K + k)] != k) { std::fprintf(stderr, "FAIL flat row: rank %d is expert %d\n", k, ia[(size_t) (3 * K + k)]); ++g_fail; }
+    // route_decode follows the token path's switch
+    const bool was = strata::kernels::native_router_enabled();
+    strata::kernels::native_router_set_enabled(true);
+    ck(cudaMemset(id_b, 0xff, (size_t) (T * K) * 4), "memset");
+    p::route_decode(d_lg, id_b, w_b, T, E, g_s);
+    same("route_decode (native) ids", T, ia, d2h(id_b, (size_t) (T * K)));
+    same("route_decode (native) weights", T, wa, d2h(w_b, (size_t) (T * K)));
+    strata::kernels::native_router_set_enabled(false);
+    strata::kernels::router_top10(d_lg, (int) T, (int) E, (int) K, id_a, w_a, g_s);
+    p::route_decode(d_lg, id_b, w_b, T, E, g_s);
+    same("route_decode (router_top10) ids", T, d2h(id_a, (size_t) (T * K)), d2h(id_b, (size_t) (T * K)));
+    same("route_decode (router_top10) weights", T, d2h(w_a, (size_t) (T * K)), d2h(w_b, (size_t) (T * K)));
+    strata::kernels::native_router_set_enabled(was);
+    // the default prompt router against the native one: different expert sets (reported only)
+    p::route(d_lg, id_b, w_b, T, E, g_s);
+    const std::vector<int32_t> ib = d2h(id_b, (size_t) (T * K));
+    const std::vector<float> wb = d2h(w_b, (size_t) (T * K));
+    int64_t rows = 0;
+    double wmax = 0.0;
+    for (int64_t t = 0; t < T; ++t) {
+        bool diff = false;
+        for (int k = 0; k < K; ++k) {
+            diff |= ia[(size_t) (t * K + k)] != ib[(size_t) (t * K + k)];
+            wmax = std::fmax(wmax, std::fabs((double) wa[(size_t) (t * K + k)] - wb[(size_t) (t * K + k)]));
+        }
+        rows += diff;
+    }
+    std::printf("router: route_native == native_router_top10 bitwise over %lld tokens; default prompt router differs "
+                "on %lld rows (ids or order), max weight difference %.2g\n", (long long) T, (long long) rows, wmax);
+    cudaFree(d_lg); cudaFree(id_a); cudaFree(id_b); cudaFree(w_a); cudaFree(w_b);
+}
 }  // namespace
 
 int main() {
@@ -342,6 +399,7 @@ int main() {
     test_rec(rng);
     test_gr(rng);
     test_f16_sat(rng);
+    test_route(rng);
     std::printf("prefill_kernels_parity: %s\n", g_fail ? "FAILED" : "OK");
     return g_fail ? 1 : 0;
 }
