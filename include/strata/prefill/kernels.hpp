@@ -96,4 +96,9 @@ void round_f16(const float* x, float* y, int64_t n, void* stream);
 /// Expert blob -> FP16 (Q2_0 values are exact in FP16).
 void blob_dequant_f16(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream);
 
+/// B7: every FP16 image written by these kernels saturates finite values beyond the FP16 range to +-65504 (NaN and
+/// +-inf pass through) instead of rounding them to +-inf.  Off by default; STRATA_PREFILL_F16_SAT=1 turns it on
+/// before the first such kernel.  This call (tests) sets it now, synchronously, and overrides the variable.
+void set_f16_saturate(bool on);
+
 }  // namespace strata::prefill

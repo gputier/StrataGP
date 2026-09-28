@@ -6,10 +6,12 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 
 namespace strata::prefill {
 namespace {
@@ -33,7 +35,14 @@ __device__ __forceinline__ uint16_t bf(float f) {
     return (uint16_t) (u >> 16);
 }
 __device__ __forceinline__ float sigm(float x) { return 1.0f / (1.0f + __expf(-x)); }
-__device__ __forceinline__ uint16_t hf(float f) { return __half_as_ushort(__float2half_rn(f)); }
+// B7 (STRATA_PREFILL_F16_SAT=1, off by default): the FP16 images saturate finite values beyond the FP16 range to
+// +-65504 instead of rounding them to +-inf; NaN and +-inf pass through, so an FP32 overflow upstream stays visible.
+// Off, hf is __float2half_rn exactly.
+__constant__ int c_f16_sat = 0;
+__device__ __forceinline__ uint16_t hf(float f) {
+    if (c_f16_sat != 0 && fabsf(f) > 65504.0f && fabsf(f) != INFINITY) f = copysignf(65504.0f, f);
+    return __half_as_ushort(__float2half_rn(f));
+}
 // block-wide sum for blockDim.x <= 1024, result broadcast
 __device__ float block_sum(float v, float* sh) {
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
@@ -59,6 +68,18 @@ bool env_on(const char* name) {
 }
 // KernelPath::Env -> the rewrite, unless the function's STRATA_OLD_PREFILL_* variable (`env_old`, read once) is 1
 bool use_old(KernelPath p, bool env_old) { return p == KernelPath::Old || (p == KernelPath::Env && env_old); }
+// B7's flag: STRATA_PREFILL_F16_SAT=1 sets it once, on the stream of the first launch of a kernel that calls hf; the
+// prompt path's kernels are on that stream, and a later prompt starts after this one's final synchronization.
+// set_f16_saturate (the tests) sets it synchronously and wins over the variable.
+std::once_flag g_f16_once;
+std::atomic<bool> g_f16_forced{false};
+void f16_mode(void* stream) {
+    std::call_once(g_f16_once, [stream] {
+        static const int on = 1;
+        if (!g_f16_forced.load() && env_on("STRATA_PREFILL_F16_SAT"))
+            cudaMemcpyToSymbolAsync(c_f16_sat, &on, sizeof on, 0, cudaMemcpyHostToDevice, (cudaStream_t) stream);
+    });
+}
 
 // ---------------------------------------------------------------- hyper-connection
 __global__ void gr_norm_kernel(const float* __restrict__ R, const float* __restrict__ w, float eps,
@@ -613,6 +634,7 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
                uint16_t* k_pool, uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
                void* stream, const strata::kernels::KvHostPools* host, const strata::kernels::KvHostPools* stage) {
     if (T <= 0) return;
+    f16_mode(stream);
     kv_append_kernel<<<dim3((unsigned) T, 2, 8), 64, 0, (cudaStream_t) stream>>>(
         K, V, pos0, page_table, page_size, k_pool, v_pool, k_q, v_q, k_scale, v_scale,
         host ? *host : strata::kernels::KvHostPools{}, stage ? *stage : strata::kernels::KvHostPools{});
@@ -620,6 +642,7 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
 }
 void to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
+    f16_mode(stream);
     to_f16_kernel<<<(unsigned) ((n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096), 256, 0, (cudaStream_t) stream>>>(x, y, n);
     check("to_f16");
 }
@@ -644,6 +667,7 @@ void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream) {
 }
 void gr_mix(const float* xn, const float* gated, float* mixed, uint16_t* mixed16, int64_t T, void* stream,
             uint16_t* mixed_h) {
+    if (mixed_h) f16_mode(stream);
     gr_mix_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(xn, gated, mixed, mixed16, T, mixed_h);
     check("gr_mix");
 }
@@ -663,6 +687,7 @@ void gr_norm_scale(const float* R, const float* w_norm, float eps, float* rs, ui
 void gr_mix_scale(const float* R, const float* rs, const float* w_norm, const float* gated, float* mixed,
                   uint16_t* mixed16, int64_t T, void* stream, uint16_t* mixed_h) {
     if (T <= 0) return;
+    if (mixed_h) f16_mode(stream);
     gr_mix_scale_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(R, rs, w_norm, gated, mixed, mixed16, T,
                                                                              mixed_h);
     check("gr_mix_scale");
@@ -700,6 +725,7 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream, KernelPath path) {
     static const bool env_old = env_on("STRATA_OLD_PREFILL_GDN_REC");
+    f16_mode(stream);
     if (use_old(path, env_old)) {
         gdn_rec_kernel<<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T);
         check("gdn_recurrence");
@@ -724,15 +750,18 @@ void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* s
     check("blob_dequant");
 }
 void blob_dequant_f16(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream) {
+    f16_mode(stream);
     blob_dequant_kernel<true><<<blocks_for(1280LL * 640 + 2560LL * 160), 256, 0, (cudaStream_t) stream>>>(blob, gu16, down16);
     check("blob_dequant_f16");
 }
 void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream) {
     if (n <= 0) return;
+    f16_mode(stream);
     swiglu_il_kernel<<<blocks_for(n * 640), 256, 0, (cudaStream_t) stream>>>(gu, h16, n);
     check("swiglu_interleaved");
 }
 void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream) {
+    f16_mode(stream);
     swiglu_pair_kernel<<<blocks_for(n * 640), 256, 0, (cudaStream_t) stream>>>(g, u, h16, n);
     check("swiglu_pair");
 }
@@ -761,8 +790,14 @@ void split_q(const float* q_full, float* q, int64_t T, void* stream) {
     check("split_q");
 }
 void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream) {
+    f16_mode(stream);
     gate_attn_kernel<<<blocks_for(T * 24 * 256), 256, 0, (cudaStream_t) stream>>>(attn, q_full, out16, T);
     check("gate_attn");
+}
+void set_f16_saturate(bool on) {
+    g_f16_forced.store(true);
+    const int v = on ? 1 : 0;
+    if (cudaMemcpyToSymbol(c_f16_sat, &v, sizeof v) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) check("set_f16_saturate");
 }
 
 }  // namespace strata::prefill

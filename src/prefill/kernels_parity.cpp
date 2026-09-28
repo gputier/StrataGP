@@ -9,6 +9,8 @@
 //      state after the chunk, over chunk lengths from 1 and two chunks in a row; plus a loose host reference.
 //   3. the GR chain (P8): gr_norm_scale / gr_mix_scale / gr_write_norm against gr_norm / gr_mix / gr_write /
 //      gr_norm: the BF16 xn, mixed in FP32, BF16 and FP16, the written R, then the next half's xn and mixed.
+//   4. FP16 saturation (B7): off, every FP16 image is __float2half_rn (+-inf past 65520); on, finite values past the
+//      range give +-65504, NaN and +-inf pass through, and every in-range value keeps its bits.
 #include "strata/prefill/kernels.hpp"
 
 #include <cuda_runtime.h>
@@ -278,6 +280,59 @@ void test_gr(std::mt19937& rng) {
                     (void*) m16_n, (void*) mh_o, (void*) mh_n})
         cudaFree(q);
 }
+
+// ---------------------------------------------------------------- 4. FP16 saturation
+void test_f16_sat(std::mt19937& rng) {
+    const float inf = INFINITY;
+    const std::vector<float> x = {1.5f, -2.0f, 65504.0f, 65519.0f, 65520.0f, 70000.0f, -70000.0f, 1e30f, -1e30f,
+                                  inf, -inf, NAN, 6e-8f, 0.0f};
+    const std::vector<uint16_t> off = {0x3e00, 0xc000, 0x7bff, 0x7bff, 0x7c00, 0x7c00, 0xfc00, 0x7c00, 0xfc00,
+                                       0x7c00, 0xfc00, 0x0000 /* NaN, checked apart */, 0x0001, 0x0000};
+    std::vector<uint16_t> on = off;
+    on[4] = on[5] = on[7] = 0x7bff;
+    on[6] = on[8] = 0xfbff;
+    const size_t n = x.size();
+    float* dx = dalloc<float>(n);
+    uint16_t* dy = dalloc<uint16_t>(n);
+    h2d(dx, x);
+    for (int sat = 0; sat < 2; ++sat) {
+        p::set_f16_saturate(sat != 0);
+        p::to_f16(dx, dy, (int64_t) n, g_s);
+        const std::vector<uint16_t> y = d2h(dy, n);
+        const std::vector<uint16_t>& want = sat ? on : off;
+        for (size_t i = 0; i < n; ++i) {
+            const bool ok = i == 11 ? ((y[i] & 0x7c00) == 0x7c00 && (y[i] & 0x03ff) != 0) : y[i] == want[i];
+            if (!ok) { std::fprintf(stderr, "FAIL to_f16 sat %d: %g -> 0x%04x, want 0x%04x\n", sat, x[i], y[i], want[i]); ++g_fail; }
+        }
+    }
+    // another kernel sees the flag too: the shared expert's SwiGLU with products past the range
+    const int64_t rows = 4;
+    std::vector<float> gg = normal(rng, (size_t) rows * 640, 3.0f), uu = normal(rng, (size_t) rows * 640, 3.0f);
+    for (size_t i = 0; i < gg.size(); i += 5) { gg[i] = 400.0f; uu[i] = (i & 1) ? 300.0f : -300.0f; }
+    float *dg = dalloc<float>(gg.size()), *du = dalloc<float>(uu.size());
+    uint16_t *h_off = dalloc<uint16_t>(gg.size()), *h_on = dalloc<uint16_t>(gg.size());
+    h2d(dg, gg);
+    h2d(du, uu);
+    p::set_f16_saturate(false);
+    p::swiglu_pair(dg, du, h_off, rows, g_s);
+    p::set_f16_saturate(true);
+    p::swiglu_pair(dg, du, h_on, rows, g_s);
+    p::set_f16_saturate(false);
+    const std::vector<uint16_t> a = d2h(h_off, gg.size()), b = d2h(h_on, gg.size());
+    size_t sat_seen = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        const bool big = (i % 5) == 0;   // 400 * 300 = 120000
+        const uint16_t want_on = big ? (uu[i] > 0 ? 0x7bff : 0xfbff) : a[i];
+        if ((big && (a[i] & 0x7fff) != 0x7c00) || b[i] != want_on) {
+            if (g_fail < 20) std::fprintf(stderr, "FAIL swiglu_pair sat %zu: off 0x%04x on 0x%04x\n", i, a[i], b[i]);
+            ++g_fail;
+        }
+        sat_seen += big;
+    }
+    std::printf("fp16 saturation: to_f16 edge values off/on, swiglu_pair %zu saturated products, others unchanged\n",
+                sat_seen);
+    cudaFree(dx); cudaFree(dy); cudaFree(dg); cudaFree(du); cudaFree(h_off); cudaFree(h_on);
+}
 }  // namespace
 
 int main() {
@@ -286,6 +341,7 @@ int main() {
     test_conv(rng);
     test_rec(rng);
     test_gr(rng);
+    test_f16_sat(rng);
     std::printf("prefill_kernels_parity: %s\n", g_fail ? "FAILED" : "OK");
     return g_fail ? 1 : 0;
 }
