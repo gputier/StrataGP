@@ -254,7 +254,7 @@ la racine du dépôt.
 mapfile -t ARGS < <(python3 -c 'import json; print("\n".join(json.load(open("strata-<modèle>.json"))["args"]))')
 ENGINE=build/strata                  # Windows : build\strata.exe
 OLD="STRATA_OLD_RUN_SPLIT=1 STRATA_NO_THP=1 STRATA_OLD_CPU_PREFETCH=1 STRATA_OLD_IQ512=1"
-for p in p1.ids p2.ids p3.ids; do    # par exemple bench/prompts/*/…-code-agent.ids
+for p in p1.ids p2.ids p3.ids; do    # par exemple trois prompts de bench/prompts
   for run in 1 2 3; do
     for arm in old new int_corr iq_one; do
       case $arm in
