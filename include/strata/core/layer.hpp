@@ -240,6 +240,9 @@ struct QsaState {
     /// The rope positions, (n_head,) int32, all equal to the current position.  `rope_neox_apply` reads its
     /// positions from the DEVICE, so a host scalar here would be an illegal access (and uncapturable).
     int32_t* pos_dev = nullptr;
+    /// O6d: `step` and `pos_dev` are ANOTHER state's buffers (`qsa_state_share_step`), which that state's layer
+    /// uploads earlier in the same token; this layer uploads nothing.
+    bool step_shared = false;
 
     /// PINNED HOST STAGING AT FIXED ADDRESSES, and they are not an optimisation.  The uploads in `qsa_layer`
     /// copy FROM these, so a CUDA graph captures the SOURCE POINTER - and the first version of the layer filled
@@ -282,6 +285,10 @@ inline int qsa_kv_format(const QsaState& st) {
 }
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
                         const QsaState* share_rope = nullptr, int64_t ring_cells = 0);
+/// O6d: points `st`'s step and position buffers at `owner`'s, whose layer uploads them once per token for both.
+/// The twelve QSA layers derive them from the same position, so the values are the ones `st` would have uploaded;
+/// the owner's layer must run first in every token (the session's first QSA layer does).
+void qsa_state_share_step(QsaState& st, const QsaState& owner);
 /// KV streaming: the pools a reader sees (the VRAM slots) and, when streamed, make the selection's blocks resident.
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st);
 void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* ids, const int32_t* steps, int64_t n_q,

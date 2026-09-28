@@ -113,4 +113,9 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
 /// per-token step and positions), instead of a host-to-device memcpy node in the middle of a layer.
 void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream);
 
+/// O6d: two such copies in one kernel - the QSA step (`n0`) and the rope positions (`n1`), which the first QSA layer
+/// uploads once per token for all twelve.
+void copy_i32x2_from_mapped(int32_t* dst0, const int32_t* src0, int64_t n0, int32_t* dst1, const int32_t* src1,
+                            int64_t n1, void* stream);
+
 }  // namespace strata::kernels

@@ -654,6 +654,12 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     return c.used;
 }
 
+void qsa_state_share_step(QsaState& st, const QsaState& owner) {
+    st.step = owner.step;
+    st.pos_dev = owner.pos_dev;
+    st.step_shared = true;
+}
+
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     const QsaShapes s = qsa_shapes(g);
     cudaStream_t cs = (cudaStream_t) stream;
@@ -842,13 +848,18 @@ if (!w_attnk->native_data || !w_attnv->native_data || !w_attnq->native_data) {
 // local vector here would be captured as a dangling POINTER and replayed as garbage - see the note in
 // `layer.hpp`.  That is a silent failure, not a fault: the copy succeeds, the counts are wrong, and the
 // token that comes out is plausible.
-{        qsa_step_fill(st.host_step, pos, s);        for (int64_t h = 0; h < g.n_head; ++h) st.host_pos[h] = (int32_t) (pos_base + pos);
+// O6d: a state whose buffers are the first QSA layer's (`step_shared`) has them already, uploaded once this token.
+if (!st.step_shared) {        qsa_step_fill(st.host_step, pos, s);        for (int64_t h = 0; h < g.n_head; ++h) st.host_pos[h] = (int32_t) (pos_base + pos);
         int32_t* m_step = nullptr;
         int32_t* m_pos = nullptr;
+        static const bool old_step = std::getenv("STRATA_OLD_QSA_STEP") != nullptr;
         if (g_publish_kernel && cudaHostGetDevicePointer((void**) &m_step, st.host_step, 0) == cudaSuccess &&
             cudaHostGetDevicePointer((void**) &m_pos, st.host_pos, 0) == cudaSuccess) {
+            if (old_step) {
             strata::kernels::copy_i32_from_mapped(st.step, m_step, strata::kernels::kStepCount, stream);
             strata::kernels::copy_i32_from_mapped(st.pos_dev, m_pos, g.n_head, stream);
+            } else strata::kernels::copy_i32x2_from_mapped(st.step, m_step, strata::kernels::kStepCount, st.pos_dev,
+                                                           m_pos, g.n_head, stream);
         } else
         if (cudaMemcpyAsync(st.step, st.host_step, qsa_step_bytes(), cudaMemcpyHostToDevice,                            (cudaStream_t) stream) != cudaSuccess ||            cudaMemcpyAsync(st.pos_dev, st.host_pos, (size_t) g.n_head * 4, cudaMemcpyHostToDevice,                            (cudaStream_t) stream) != cudaSuccess) {            err = "qsa_layer: the step-state upload failed";            return false;        }    }
 // ---- 3. the indexer's RAW key: appended before any norm, pooled later once per block

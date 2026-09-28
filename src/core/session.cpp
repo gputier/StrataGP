@@ -94,6 +94,11 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
         if (qsa_state_init(g, max_cells, qp + (i == 0 ? 0 : first + (uint64_t) (i - 1) * rest), s.qsa_states[i],
                            i == 0 ? nullptr : &s.qsa_states[0]) == 0)
             return 0;
+    // O6d: the twelve layers' step and positions are functions of the same position, so the first QSA layer - the
+    // first one every token runs - uploads them once and the others read its buffers. STRATA_OLD_QSA_STEP=1 keeps
+    // one upload per layer (A/B).
+    if (std::getenv("STRATA_OLD_QSA_STEP") == nullptr)
+        for (int64_t i = 1; i < g.n_qsa_layers(); ++i) qsa_state_share_step(s.qsa_states[i], s.qsa_states[0]);
     qsa_buffers_init(g, max_cells, s.qsa_buf_arena, s.qsa_bufs);
 
     s.moe_arena = take(moe_buffers_bytes(g, k));

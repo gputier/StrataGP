@@ -268,6 +268,22 @@ void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* str
     check_launch("copy_i32_from_mapped");
 }
 
+__global__ void copy_i32x2_from_mapped_kernel(int32_t* __restrict__ dst0, const volatile int32_t* src0, int n0,
+                                              int32_t* __restrict__ dst1, const volatile int32_t* src1, int n1) {
+    for (int i = threadIdx.x; i < n0 + n1; i += blockDim.x) {
+        if (i < n0) dst0[i] = src0[i];
+        else dst1[i - n0] = src1[i - n0];
+    }
+}
+
+void copy_i32x2_from_mapped(int32_t* dst0, const int32_t* src0, int64_t n0, int32_t* dst1, const int32_t* src1,
+                            int64_t n1, void* stream) {
+    if (n0 < 0 || n1 < 0 || n0 + n1 <= 0) return;
+    copy_i32x2_from_mapped_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(dst0, (const volatile int32_t*) src0, (int) n0,
+                                                                        dst1, (const volatile int32_t*) src1, (int) n1);
+    check_launch("copy_i32x2_from_mapped");
+}
+
 void doorbell_ring(uint32_t* d_seq, void* stream) {
     if (d_seq == nullptr) return;
     doorbell_ring_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(d_seq);
