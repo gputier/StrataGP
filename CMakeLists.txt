@@ -470,6 +470,12 @@ if(STRATA_BUILD_TESTS)
   add_executable(conv_cache_test src/program/conv_cache_test.cpp)
   target_include_directories(conv_cache_test PRIVATE include)
   add_test(NAME conv_cache_test COMMAND conv_cache_test)
+  # issue #16: the speculative loop's persistent adaptive worker (header-only; the header includes the CUDA runtime)
+  if(STRATA_ENABLE_CUDA)
+    add_executable(round_sync_test src/program/round_sync_test.cpp)
+    target_link_libraries(round_sync_test PRIVATE CUDA::cudart)
+    add_test(NAME round_sync_test COMMAND round_sync_test)
+  endif()
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
