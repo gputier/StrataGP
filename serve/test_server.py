@@ -758,6 +758,24 @@ class RecallReasoning(unittest.TestCase):
         self.assertEqual(engine.last_ids[:len(live)], live)
         self.assertNotIn("reasoning_content", chat.answer_message("a", "b", drop_thinking=True))
 
+    def test_bench_turns(self):
+        """tools/bench_turns.py, the A/B client of the doc, against this server."""
+        import contextlib
+        import io
+        import tempfile
+        sys.path.insert(0, str(ROOT / "tools"))
+        import bench_turns
+        _, engine, base = self.make(True)
+        port = int(base.rsplit(":", 1)[1])
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bench_turns.main(["--port", str(port), "--turns", "3", "--context-chars", "600",
+                                               "--max-tokens", "100", "--json", d + "/rows.json"]), 0)
+            rows = json.loads(Path(d, "rows.json").read_text())
+        self.assertEqual([r["turn"] for r in rows], [1, 2, 3])
+        self.assertTrue(all(r["first_text_s"] is not None for r in rows))
+        self.assertLess(rows[0]["prompt_tokens"], rows[1]["prompt_tokens"])
+        self.assertIn("Still thinking", bytes(t for t in engine.last_ids if t < 256).decode())   # recalled
+
     def test_bounded(self):
         from serve.server import ReasoningRecall
         import hashlib
