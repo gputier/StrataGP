@@ -298,6 +298,12 @@ if(STRATA_ENABLE_CUDA)
   target_link_libraries(gdn_parity PRIVATE strata_kernels CUDA::cudart)
   add_test(NAME gdn_parity COMMAND gdn_parity --selftest)
 
+  # Issue #26 (O7): the decode grids sized for the device vs the 0.1.20 ones, bitwise (GPU, synthetic, no model).
+  add_executable(grids_parity src/kernels/grids_parity.cpp)
+  target_include_directories(grids_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(grids_parity PRIVATE strata_kernels CUDA::cudart)
+  add_test(NAME grids_parity COMMAND grids_parity --selftest)
+
   add_executable(s2_gemv_q8_parity src/kernels/s2_gemv_q8_parity.cpp)
   target_include_directories(s2_gemv_q8_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(s2_gemv_q8_parity PRIVATE strata_kernels CUDA::cudart)
