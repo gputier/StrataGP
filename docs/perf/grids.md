@@ -79,6 +79,9 @@ jeton (`--spec 0`, pack S2).
     jeton dans `wsum[t][4]`, sorties du groupe 0 dans `ocs[t][32]`) : une seule barrière de cluster par lancement.
     Les partiels kv et o ont chacun leur tableau : 4 barrières de bloc par jeton au lieu de 6 (5 pour un jeton
     rejoué). Mêmes valeurs écrites aux mêmes adresses, `y` du commit compris.
+  - `wsum`/`ocs` contiennent `kVerifyMaxT` jetons. L'hôte garantit `T` et `*n_keep` ≤ `kVerifyMaxT` ; au-delà
+    (appelant défectueux), le kernel s'arrête par `__trap()` au lieu de tronquer en silence (l'ancien kernel, lui,
+    lirait au-delà de `hbuf`).
 - **Vérification statique** : pour le jeton seul, la suite des opérations flottantes du PTX des deux kernels est
   identique (164 opérations, mêmes arrondis et constantes ; script de comparaison sur le PTX de `nvcc -O3`).
 - **Support sm_120 GeForce** (la question de l'audit) : le lanceur n'emploie le cluster que si
@@ -86,7 +89,18 @@ jeton (`--spec 0`, pack S2).
   compilé pour sm_80/86/89, son corps est vide) et `cudaOccupancyMaxActiveClusters` > 0. Sinon : ancien kernel. Un
   refus de `cudaLaunchKernelEx` arrête le programme avec un message qui cite `STRATA_OLD_GDN_STEP=1`.
   `grids_parity` affiche la ligne `cluster: fused_gdn_step_norm yes, gdn_step_norm_multi yes` quand le chemin
-  cluster tourne.
+  cluster tourne, et **échoue** (code de sortie 1, donc ctest rouge) si le GPU accepte les clusters mais que le
+  chemin cluster n'a pas été pris (requête de disponibilité en échec, binaire sans code sm_90+) : sinon les tests
+  du pas compareraient l'ancien kernel à lui-même et resteraient verts. `--allow-no-cluster` accepte ce repli ;
+  `--require-cluster` échoue sur tout GPU sans chemin cluster.
+- **Premier lancement dans une capture de graphe** : ctest `grids_parity_capture` (`grids_parity --capture`, un
+  processus neuf) fait le **premier** appel de chaque lanceur (`fetch_blobs`, `gather_rows`, `fused_gdn_ab`,
+  `gdn_ab_multi`, `fused_gdn_step_norm`, `gdn_step_norm_multi` verify et commit) dans une capture
+  `cudaStreamCaptureModeThreadLocal` : les requêtes uniques de `launch_grid.hpp` (`cudaGetDevice`,
+  `cudaDeviceGetAttribute`, `cudaFuncGetAttributes`, `cudaOccupancyMaxActiveClusters`) et le
+  `cudaLaunchKernelEx` en cluster sont donc capturés, comme dans le moteur. Le graphe est instancié et rejoué deux
+  fois ; ses octets sont comparés à un lancement direct, aux anciens lancements (`STRATA_OLD_*`), à l'hôte (copies)
+  et à la référence double (état du commit).
 
 ### Registres (ptxas, sm_120, `-O3`), aucun débordement
 
@@ -95,7 +109,7 @@ jeton (`--spec 0`, pack S2).
 | `gdn_ab_row_kernel` | 62 | dynamique, 15 Ko (2 560) | `gdn_ab_kernel` : 40 |
 | `gdn_ab_multi_row_kernel` | 40 | dynamique, 5 Ko | `gdn_ab_multi_kernel` : 48 |
 | `gdn_step_norm_cluster_kernel` | 128 | 1 552 o | `gdn_step_norm_kernel` : 128, 3 136 o |
-| `gdn_step_norm_multi_cluster_kernel` | 122 | 3 200 o | `gdn_step_norm_multi_kernel` : 126, 3 136 o |
+| `gdn_step_norm_multi_cluster_kernel` | 126 | 3 200 o | `gdn_step_norm_multi_kernel` : 126, 3 136 o |
 
 128 registres × 128 threads : 4 blocs par SM au plus ; les 192 blocs du pas tiennent en une vague sur la 5070
 (48 SM) comme sur la 5090.
@@ -134,9 +148,10 @@ cmake --build build -j
 
 # 1. parité : tout doit être « ok » et la dernière ligne « PASS (0 failed) »
 ./build/grids_parity
+./build/grids_parity --capture            # premiers lancements dans une capture de graphe
 #    vérifier l'en-tête : « 170 SMs, clusters yes », « copy grids: 1360 blocks »,
 #    « cluster: fused_gdn_step_norm yes, gdn_step_norm_multi yes » (sinon le chemin cluster n'a pas tourné)
-(cd build && ctest --output-on-failure -R "grids_parity|gdn_parity|elementwise_parity")
+(cd build && ctest --output-on-failure -R "grids_parity|gdn_parity|elementwise_parity")   # grids_parity et grids_parity_capture
 
 # 2. micro-banc : ancien contre nouveau, par kernel
 ./build/grids_parity --bench
@@ -184,10 +199,11 @@ lancements pour l'occupation et le débit DRAM.
   `gdn_step_norm_multi_cluster_kernel` et leurs lanceurs.
 - `src/kernels/cuda/fused_gdn.cu`, `include/strata/kernels/fused_gdn.hpp` : `gdn_ab_row_kernel`,
   `gdn_step_norm_cluster_kernel` et leurs lanceurs.
-- `src/kernels/grids_parity.cpp`, `CMakeLists.txt` : le test (ctest `grids_parity`).
+- `src/kernels/grids_parity.cpp`, `CMakeLists.txt` : le test (ctest `grids_parity` et `grids_parity_capture`).
 
 Tests lancés ici (sans GPU) : compilation complète (sm_120) sans avertissement ; `verify_kernels.cu` et
 `fused_gdn.cu` compilés aussi pour sm_86 ; `ple_reader_selftest`, `platform_memory_test`, `pool_stress`,
 `expert_multi_test`, `suffix_drafter_test`, `draft_policy_test`, `controller_test`, `conv_cache_test` : OK ;
-`pool_test` : échec attendu (pas de pack de modèle) ; `grids_parity` : échec attendu (pas de pilote CUDA) ;
+`pool_test` : échec attendu (pas de pack de modèle) ; `grids_parity` et `grids_parity_capture` : échec attendu
+(pas de pilote CUDA) ;
 `python3 serve/test_server.py` : 26 tests OK.
