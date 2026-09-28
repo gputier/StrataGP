@@ -15,6 +15,13 @@ plus bas. Les tests GPU compilent mais n'ont pas été exécutés.
 | #4, B5 : division `__fdividef` du quantificateur Q8_1 et du SwiGLU groupé | **désactivé** | `STRATA_IQ_FASTDIV=1` l'active | derniers bits modifiés |
 | #4, B5 : `native_mmvq.cu` écrit `__fdividef` explicitement | activé | aucun | PTX identique octet pour octet |
 
+**#4 n'est que partiellement traité** : l'interrupteur existe, mais il est désactivé par défaut. Dans la
+configuration par défaut, `quantize_q8_1_rows` et le SwiGLU groupé divisent toujours en IEEE (`div.rn.f32`) et
+`native_quantize_q8_1` en `div.approx.ftz.f32` : l'écart décrit par l'issue est inchangé tant que
+`STRATA_IQ_FASTDIV=1` n'est pas passé par défaut (après `iq_multi_parity` et l'A/B de bout en bout sur GPU). L'issue
+reste ouverte. La réécriture de `native_mmvq.cu` en `__fdividef` ne change rien au binaire (PTX identique) ; elle ne
+fait que rendre le contrat explicite.
+
 Les deux variables d'environnement sont lues une fois au démarrage (valeur non vide et différente de `0`). Les tests
 les basculent en cours d'exécution avec `iq_set_old_kernels(bool)` et `iq_set_fast_div(bool)` (déclarés dans
 `iq_kernels.hpp`) ; comme pour `native_mmvq_set_multi_exact`, un graphe CUDA déjà capturé garde les kernels qu'il a
@@ -141,8 +148,16 @@ tokens identiques ou une KL négligeable contre llama.cpp ; ce n'est pas mesuré
 | Test | Type | Ce qu'il vérifie |
 | --- | --- | --- |
 | `iq_multi_parity` (nouveau, ctest) | GPU, synthétique, sans modèle | (1) `iq_mmvq`, 9 formats, ncols 1..8 et 11, 67 × 2560 et 5 × 1024 : nouveau = ancien au bit près, et référence double à 1e-2 près (garde-fou) ; (2) `native_expert_grouped`, 8 formats gate/up × IQ4_NL/Q2_0 (2560 × 640) et IQ4_XS (1024 × 512), 9 groupes de 0 à 11 entrées, `cap_groups` > groupes, destinations mélangées, lignes non écrites comprises : nouveau = ancien au bit près, en division IEEE et en division rapide ; (3) `quantize_q8_1_rows` en division rapide = `native_quantize_q8_1` octet pour octet, y compris des valeurs placées à quelques ulps d'un .5 (le nombre d'int8 que la division IEEE fait bouger est affiché, sans échec) ; `--bench` ajoute les temps ancien/nouveau |
-| `iq_parity` (étendu) | GPU, fixture réelle | ncols 1..8 au lieu de 2 ; chaque colonne d'un appel multi-colonnes égale au bit près à un appel une colonne (mise en page exacte, le défaut) |
+| `iq_parity` (étendu) | GPU, fixture réelle (non reproductible ici, voir plus bas) | ncols 1..8 au lieu de 2 ; chaque colonne d'un appel multi-colonnes égale au bit près à un appel une colonne (mise en page exacte, le défaut) |
 | `native_expert_parity` (étendu) | GPU, GGUF réel | le chemin GPU exécuté avec les nouveaux et les anciens kernels : mêmes bits exigés |
+
+`iq_parity` lit des fixtures `logs/iq_fixture/<FORMAT>.bin` / `.f32` (en-tête int32 type, lignes, colonnes, puis les
+octets bruts des lignes ; en regard, les valeurs déquantifiées par gguf-py). Le script qui les produisait,
+`tools/iq_fixture.py`, cité dans l'en-tête du test depuis l'origine du dépôt, **n'est pas dans l'arbre**, et gguf-py
+ne sait pas déquantifier Q2_0. Cette validation n'est donc pas reproductible en l'état ; les vérifications qui
+couvrent #18 et qu'on peut réellement lancer sont `iq_multi_parity` (synthétique, aucune fixture) et
+`native_expert_parity` (sur le GGUF du modèle). Si une ancienne copie de `logs/iq_fixture` existe encore,
+`build/iq_parity logs/iq_fixture` reste utile (ncols 1..8).
 
 Exécuté ici (sans GPU) : compilation complète (`cmake --build build-wp`, vert) ; tests CPU `platform_memory_test`,
 `pool_stress`, `expert_multi_test`, `suffix_drafter_test`, `draft_policy_test`, `controller_test`,
@@ -160,7 +175,6 @@ cmake --build build -j
 # 2. Exactitude
 ctest --test-dir build -R iq_multi_parity --output-on-failure        # doit finir par "iq_multi_parity: 0 failures"
 build/native_expert_parity <shard1.gguf> 0 1 2 3 20 47               # "gpu decode-once vs per-entry kernels: bitwise equal" à chaque couche
-build/iq_parity logs/iq_fixture                                       # si la fixture existe (tools/iq_fixture.py) : ncols 1..8
 ctest --test-dir build --output-on-failure                            # le reste de la suite
 
 # 3. Temps des kernels seuls, ancien / nouveau (µs par appel)
@@ -197,8 +211,15 @@ Attendus :
 ## Ce qui reste
 
 - Aucune mesure GPU : ni le gain, ni l'absence de régression à une entrée par groupe (occupation 5 blocs/SM au lieu
-  de 6). Si `--bench` montre une perte à m = 1, piste : garder l'ancien kernel quand le groupe n'a qu'une entrée
-  (branche uniforme par bloc) ou borner les registres (`__launch_bounds__(256, 6)`), à mesurer.
+  de 6) ; voir le point « Occupation à m = 1 » ci-dessous.
 - `GRP_NC = 4` est un choix sur ptxas -v, pas sur une mesure ; avec `--spec` 5 à 8, un groupe de 5 à 8 entrées fait
   deux passes.
-- B5 reste opt-in tant qu'aucune comparaison de qualité n'a été faite.
+- B5 reste opt-in tant qu'aucune comparaison de qualité n'a été faite. #4 n'est donc pas résolu dans la configuration par défaut.
+- Occupation à m = 1 : les kernels groupés (`__launch_bounds__(256)`) prennent 46 à 55 registres, IQ2_XS / IQ2_S
+  débordent de 8 octets, d'où 5 blocs/SM au lieu de 6. L'hôte ne connaît pas la taille des groupes (elle est sur le
+  GPU, `cap_groups == cap_entries == n × K` dans `verify.cpp`), donc un aiguillage « une entrée → ancien kernel »
+  ne peut pas se faire au lancement ; dans le kernel, il ne changerait pas l'occupation. Rien n'a été modifié à ce
+  sujet sans mesure : lancer `iq_multi_parity --bench` (ligne m = 1) avant la fusion ; en cas de perte,
+  `STRATA_OLD_IQ_MMVQ=1` rend les anciens kernels, et `__launch_bounds__(256, 6)` est l'essai suivant.
+- `tools/iq_fixture.py` manque (voir « Tests ») : à réécrire si l'on veut rejouer `iq_parity` ; il faudrait une
+  référence Q2_0 hors gguf-py.

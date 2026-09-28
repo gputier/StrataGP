@@ -1,6 +1,10 @@
 // src/kernels/iq_parity.cpp - plan v0.3 P6: the i-quant kernels against gguf-py on real rows.
 //
-//     python tools/iq_fixture.py --out logs/iq_fixture && build/iq_parity logs/iq_fixture
+//     build/iq_parity logs/iq_fixture
+//
+// The fixtures (<dir>/<FORMAT>.bin: int32 type, rows, cols, then the raw rows; <FORMAT>.f32: gguf-py's dequant) came
+// from a tools/iq_fixture.py that is not in the tree. Without them, iq_multi_parity (synthetic) and
+// native_expert_parity (real GGUF) are the checks of these kernels that run.
 //
 // Dequant must match gguf-py's values to fp32 rounding; the MMVQ dot (q8_1 activations) must match the float
 // matrix-vector product within the activation rounding (a few 1e-3 relative), for 1 to 8 columns, every column of a
