@@ -3,6 +3,7 @@
 // The per-token arithmetic of every kernel here is transcribed from its single-token original (fused_gdn.cu,
 // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/launch_grid.hpp"
 
 #include <cuda_runtime.h>
 
@@ -307,7 +308,9 @@ __global__ void dense_steps_kernel(const int32_t* __restrict__ cells, int n, int
 void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream) {
     if (cap <= 0) return;
     if (blob_bytes % 16 != 0) { std::fprintf(stderr, "fetch_blobs: blob size must be a multiple of 16\n"); std::exit(1); }
-    fetch_blobs_kernel<<<48 * 8, 256, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst, (long long) (blob_bytes / 16));
+    // issue #26: 8 blocks per SM of THIS device (48 * 8 was the RTX 5070's); a grid-stride copy, so any grid is exact
+    fetch_blobs_kernel<<<(unsigned) (grid_sms() * 8), 256, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst,
+                                                                                         (long long) (blob_bytes / 16));
     check("fetch_blobs");
 }
 
@@ -337,12 +340,13 @@ void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const 
 
 void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int64_t n, uint8_t* dst, void* stream) {
     cudaStream_t s = (cudaStream_t) stream;
+    const unsigned blocks = (unsigned) (grid_sms() * 8);   // issue #26: this device's SMs; a grid-stride copy
     if (row_bytes % 16 == 0)
-        gather_rows_kernel<<<48 * 8, 256, 0, s>>>((const uint4*) src, row_bytes / 16, ids, n, (uint4*) dst);
+        gather_rows_kernel<<<blocks, 256, 0, s>>>((const uint4*) src, row_bytes / 16, ids, n, (uint4*) dst);
     else if (row_bytes % 4 == 0)
-        gather_rows_kernel<<<48 * 8, 256, 0, s>>>((const uint32_t*) src, row_bytes / 4, ids, n, (uint32_t*) dst);
+        gather_rows_kernel<<<blocks, 256, 0, s>>>((const uint32_t*) src, row_bytes / 4, ids, n, (uint32_t*) dst);
     else
-        gather_rows_kernel<<<48 * 8, 256, 0, s>>>(src, row_bytes, ids, n, dst);
+        gather_rows_kernel<<<blocks, 256, 0, s>>>(src, row_bytes, ids, n, dst);
     check("gather_rows");
 }
 
