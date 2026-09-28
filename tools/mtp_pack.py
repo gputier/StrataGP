@@ -13,6 +13,7 @@ Layout: dense tensors (attention, indexer, hyper-connections, shared expert, rou
     q2_0   64-element blocks, grid {-1, 0, 1, 2} x d. The scale is chosen per block to MINIMIZE squared error over
            that grid (the ggml reference sets d = max|w| and never uses the +2 level). Same format as the main
            model's experts, so Strata's CPU VNNI kernel and GPU hit kernel serve it unchanged. ~0.71 GB.
+           --q2-search wide|exact also tries negative scales (issue #52; see Q2_SEARCHES).
     q4_0   ggml reference rounding. ~1.42 GB.       q8_0   ggml reference. ~2.67 GB.
 
 This is round-to-nearest, not GSQ: the plan picks the expert format by MEASURED draft acceptance (P0.3/P6), not
@@ -55,24 +56,89 @@ def load_bf16(path: Path, shape: list[int]) -> np.ndarray:
 
 
 # ------------------------------------------------------------------------------------------------ quantizers
-def q2_0(w: np.ndarray) -> np.ndarray:
+# Q2_0 scale searches (issue #52).  The grid {-1, 0, 1, 2} x d is ASYMMETRIC, so a block whose large weights are
+# negative is better served by d < 0, which mirrors it to {-2, -1, 0, 1} x |d|; the format and every kernel
+# multiply by d as a signed number ((code - 1) * d; `s2_grouped_parity` checks the draft layer's kernel).
+#   grid   the original: d in [0.5, 1.0] x amax, 17 steps, d > 0.  The default - its output is unchanged.
+#   wide   d in [0.15, 1.0] x amax, 35 steps, both signs.
+#   exact  the scale that minimizes the block's squared error over all d of both signs (see q2_0_exact_d).
+# Synthetic 64-weight blocks, relative RMS error (tools/test_mtp_pack.py, grid / wide / exact): normal
+# 0.411 / 0.351 / 0.351, Laplace 0.485 / 0.399 / 0.399, Student t3 0.517 / 0.430 / 0.429 - the wide grid is
+# already within 0.3 % of the optimum.  CPU time per expert here: 0.8 / 1.4 / 1.8 s.  Whether the smaller
+# error buys a better draft ACCEPTANCE is what an A/B on the engine measures, hence not the default.
+Q2_SEARCHES = ("grid", "wide", "exact")
+
+
+def q2_0_exact_d(x: np.ndarray, chunk: int = 8192) -> np.ndarray:
+    """[B, 64] -> [B, 1]: the scale d (either sign) minimizing sum((q*d - x)^2) with q in {-1, 0, 1, 2}.
+
+    For a fixed assignment q the best d is sum(q*x) / sum(q^2), and the error falls by sum(q*x)^2 / sum(q^2).  The
+    optimum's q is the nearest-level rounding at its own d, and as t = 1/d grows from 0 (d > 0) that rounding
+    changes only at the thresholds x*t = +-0.5 (0 <-> +-1) and x*t = 1.5 (1 <-> 2): at most 128 events per block.
+    Sorting them and accumulating sum(q*x) and sum(q^2) visits every assignment rounding can produce, so the best
+    of them is the global optimum over d > 0; d < 0 is the same search on -x.  Any (q, d) pair is a valid block,
+    so the result never depends on d landing inside its own interval."""
+    best_gain = np.zeros((x.shape[0],), dtype=np.float64)
+    best_d = np.zeros((x.shape[0],), dtype=np.float64)
+    for lo in range(0, x.shape[0], chunk):
+        xb = x[lo:lo + chunk].astype(np.float64)
+        n = np.arange(xb.shape[0])
+        for sign in (1.0, -1.0):
+            y = xb * sign
+            ay = np.abs(y)
+            nz = ay > 0
+            t1 = np.where(nz, 0.5 / np.where(nz, ay, 1.0), np.inf)          # 0 -> +1 (y > 0) or 0 -> -1 (y < 0)
+            pos = y > 0
+            t2 = np.where(pos, 1.5 / np.where(pos, y, 1.0), np.inf)         # +1 -> +2
+            t = np.concatenate([t1, t2], axis=1)
+            dqx = np.concatenate([ay, np.where(pos, y, 0.0)], axis=1)       # the change in sum(q*y): always >= 0
+            dqq = np.concatenate([nz * 1.0, pos * 3.0], axis=1)             # the change in sum(q^2): 1, then 4-1
+            order = np.argsort(t, axis=1, kind="stable")
+            sqx = np.cumsum(np.take_along_axis(dqx, order, axis=1), axis=1)
+            sqq = np.cumsum(np.take_along_axis(dqq, order, axis=1), axis=1)
+            gain = np.where(sqq > 0, sqx * sqx / np.where(sqq > 0, sqq, 1.0), 0.0)
+            k = gain.argmax(axis=1)
+            g = gain[n, k]
+            d = sign * sqx[n, k] / np.where(sqq[n, k] > 0, sqq[n, k], 1.0)
+            better = g > best_gain[lo:lo + chunk]
+            best_gain[lo:lo + chunk] = np.where(better, g, best_gain[lo:lo + chunk])
+            best_d[lo:lo + chunk] = np.where(better, d, best_d[lo:lo + chunk])
+    return best_d.astype(np.float32)[:, None]
+
+
+def q2_0(w: np.ndarray, search: str = "grid") -> np.ndarray:
     """[..., n] float32 -> bytes of Q2_0 blocks (fp16 d, 16 bytes of 2-bit codes, code = q + 1, 4 per byte)."""
     x = w.reshape(-1, 64).astype(np.float32)
     amax = np.abs(x).max(axis=1, keepdims=True)
     best_err = np.full((x.shape[0], 1), np.inf, dtype=np.float32)
     best_d = np.zeros_like(amax)
-    # Candidate scales span amax/2 (the +2 level reaches the max) to amax (the ggml reference); 17 steps.
-    for f in np.linspace(0.5, 1.0, 17, dtype=np.float32):
-        d = amax * f
-        inv = np.where(d > 0, 1.0 / np.where(d > 0, d, 1.0), 0.0)
-        q = np.clip(np.rint(x * inv), -1, 2)
-        err = ((q * d - x) ** 2).sum(axis=1, keepdims=True)
-        better = err < best_err
-        best_err = np.where(better, err, best_err)
-        best_d = np.where(better, d, best_d)
+    if search == "exact":
+        best_d = q2_0_exact_d(x)
+    elif search == "wide":
+        for f in np.linspace(0.15, 1.0, 35, dtype=np.float32):
+            for sign in (1.0, -1.0):
+                d = amax * np.float32(f * sign)
+                inv = np.where(d != 0, 1.0 / np.where(d != 0, d, 1.0), 0.0)
+                q = np.clip(np.rint(x * inv), -1, 2)
+                err = ((q * d - x) ** 2).sum(axis=1, keepdims=True)
+                better = err < best_err
+                best_err = np.where(better, err, best_err)
+                best_d = np.where(better, d, best_d)
+    elif search == "grid":
+        # Candidate scales span amax/2 (the +2 level reaches the max) to amax (the ggml reference); 17 steps.
+        for f in np.linspace(0.5, 1.0, 17, dtype=np.float32):
+            d = amax * f
+            inv = np.where(d > 0, 1.0 / np.where(d > 0, d, 1.0), 0.0)
+            q = np.clip(np.rint(x * inv), -1, 2)
+            err = ((q * d - x) ** 2).sum(axis=1, keepdims=True)
+            better = err < best_err
+            best_err = np.where(better, err, best_err)
+            best_d = np.where(better, d, best_d)
+    else:
+        raise ValueError(f"unknown Q2_0 scale search {search!r}: {', '.join(Q2_SEARCHES)}")
     d16 = best_d.astype(np.float16)
     d = d16.astype(np.float32)                                   # quantize against the STORED scale
-    inv = np.where(d > 0, 1.0 / np.where(d > 0, d, 1.0), 0.0)
+    inv = np.where(d != 0, 1.0 / np.where(d != 0, d, 1.0), 0.0)             # d < 0 from wide / exact
     codes = (np.clip(np.rint(x * inv), -1, 2) + 1).astype(np.uint8)          # 0..3
     c = codes.reshape(-1, 16, 4)
     packed = (c[:, :, 0] | (c[:, :, 1] << 2) | (c[:, :, 2] << 4) | (c[:, :, 3] << 6)).astype(np.uint8)
@@ -137,16 +203,23 @@ def main() -> int:
     ap.add_argument("--experts", choices=sorted(QUANT), default="q2_0")
     ap.add_argument("--out", required=True)
     ap.add_argument("--check-experts", type=int, default=8, help="experts per tensor used for the error report")
+    ap.add_argument("--q2-search", choices=Q2_SEARCHES, default="grid",
+                    help="q2_0 only: the per-block scale search - grid (the default, unchanged), wide (a wider grid "
+                         "with negative scales), exact (the least-squares optimum, either sign); issue #52")
     a = ap.parse_args()
     src = Path(a.src)
     manifest = json.loads((src / "mtp-manifest.json").read_text())
     fn, qtype, block, block_bytes = QUANT[a.experts]
+    if a.experts == "q2_0":
+        fn = lambda v: q2_0(v, a.q2_search)             # noqa: E731
     w = gguf.GGUFWriter(a.out, "qwen4exp-mtp")
     w.add_string("strata.mtp.source", "Qwen/Qwen3.8-Flash-Next BF16 checkpoint, mtp.* tensors")
     w.add_string("strata.mtp.source_sha256", hashlib.sha256(
         json.dumps({t["name"]: t["sha256"] for t in manifest}, sort_keys=True).encode()).hexdigest())
     w.add_string("strata.mtp.expert_format", a.experts)
-    w.add_string("strata.mtp.expert_quantizer", "per-block MSE scale search" if a.experts == "q2_0" else "ggml reference")
+    w.add_string("strata.mtp.expert_quantizer", ("per-block MSE scale search" +
+                                                 ("" if a.q2_search == "grid" else f" ({a.q2_search}, signed scales)"))
+                 if a.experts == "q2_0" else "ggml reference")
     report = []
     for t in sorted(manifest, key=lambda t: t["name"]):
         name, shape = t["name"], t["shape"]
