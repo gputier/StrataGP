@@ -5,6 +5,8 @@
 //   1. gdn_conv (P2): the tiled conv + q/k norm and its history against the per-channel walk, over chunk lengths
 //      around the tile (1..3 tokens: the history's own entries move) and two chunks in a row; plus a loose host
 //      reference, so the two sides cannot agree on something wrong.
+//   2. gdn_recurrence (P3): 4 blocks per head + the norm pass against a block per head: y, its FP16 bits and the
+//      state after the chunk, over chunk lengths from 1 and two chunks in a row; plus a loose host reference.
 #include "strata/prefill/kernels.hpp"
 
 #include <cuda_runtime.h>
@@ -20,7 +22,7 @@
 namespace p = strata::prefill;
 
 namespace {
-constexpr int S = 128, HK = 16, C = 10240;
+constexpr int S = 128, HK = 16, HV = 48, C = 10240;
 int g_fail = 0;
 cudaStream_t g_s = nullptr;
 void ck(cudaError_t e, const char* w) {
@@ -116,12 +118,109 @@ void test_conv(std::mt19937& rng) {
                 sizeof Ts / sizeof Ts[0], worst);
     cudaFree(dw); cudaFree(qkv); cudaFree(hist_o); cudaFree(hist_n); cudaFree(h_o); cudaFree(h_n);
 }
+
+// ---------------------------------------------------------------- 2. gdn_recurrence
+// host reference of one chunk (double), state [row][head][col] updated in place
+void rec_reference(std::vector<double>& st, const std::vector<float>& h, const std::vector<float>& gate,
+                   const std::vector<float>& beta, const std::vector<float>& z, const std::vector<float>& gamma,
+                   float eps, int64_t T, std::vector<double>& y) {
+    y.assign((size_t) T * HV * S, 0.0);
+    std::vector<double> q(S), k(S), kv(S), o(S);
+    for (int64_t t = 0; t < T; ++t)
+        for (int hd = 0; hd < HV; ++hd) {
+            const int qh = hd % HK;
+            for (int i = 0; i < S; ++i) {
+                q[i] = h[(size_t) (t * C + qh * S + i)];
+                k[i] = h[(size_t) (t * C + HK * S + qh * S + i)];
+            }
+            const double g = std::exp((double) gate[(size_t) (t * HV + hd)]), b = beta[(size_t) (t * HV + hd)];
+            auto at = [&](int row, int col) -> double& { return st[((size_t) row * HV + hd) * S + col]; };
+            for (int col = 0; col < S; ++col) {
+                double a = 0.0;
+                for (int row = 0; row < S; ++row) a += at(row, col) * k[row];
+                kv[col] = a;
+            }
+            double ss = 0.0;
+            for (int col = 0; col < S; ++col) {
+                const double delta = (h[(size_t) (t * C + 2 * HK * S + hd * S + col)] - g * kv[col]) * b;
+                double a = 0.0;
+                for (int row = 0; row < S; ++row) {
+                    at(row, col) = g * at(row, col) + k[row] * delta;
+                    a += at(row, col) * q[row];
+                }
+                o[col] = a / std::sqrt((double) S);
+                ss += o[col] * o[col];
+            }
+            for (int col = 0; col < S; ++col) {
+                const double zz = z[(size_t) (t * HV * S + hd * S + col)];
+                y[(size_t) (t * HV * S + hd * S + col)] =
+                    o[col] / std::sqrt(ss / S + eps) * gamma[(size_t) col] / (1.0 + std::exp(-zz));
+            }
+        }
+}
+void test_rec(std::mt19937& rng) {
+    const float eps = 1e-6f;
+    const int64_t Tmax = 200;
+    const size_t n_state = (size_t) S * HV * S;
+    float *st_o = dalloc<float>(n_state), *st_n = dalloc<float>(n_state), *h = dalloc<float>((size_t) Tmax * C);
+    float *gate = dalloc<float>((size_t) Tmax * HV), *beta = dalloc<float>((size_t) Tmax * HV);
+    float *z = dalloc<float>((size_t) Tmax * HV * S), *gamma = dalloc<float>(S);
+    float *y_o = dalloc<float>((size_t) Tmax * HV * S), *y_n = dalloc<float>((size_t) Tmax * HV * S);
+    uint16_t *y16_o = dalloc<uint16_t>((size_t) Tmax * HV * S), *y16_n = dalloc<uint16_t>((size_t) Tmax * HV * S);
+    const std::vector<float> gm = normal(rng, S, 0.2f, 1.0f);
+    h2d(gamma, gm);
+    std::uniform_real_distribution<float> ud(0.0f, 1.0f);
+    double worst = 0.0;
+    const int64_t Ts[] = {1, 2, 5, 33, 130};
+    for (int64_t T1 : Ts) {
+        std::vector<float> st0 = normal(rng, n_state, 0.05f);
+        h2d(st_o, st0);
+        h2d(st_n, st0);
+        std::vector<double> st_ref(st0.begin(), st0.end());
+        const int64_t T2 = T1 % 7 + 3;
+        for (int64_t T : {T1, T2}) {
+            // q and k unit-norm per head (what the conv leaves), v and z free, decay gates in (0, 1]
+            std::vector<float> hh = normal(rng, (size_t) T * C, 1.0f);
+            for (int64_t t = 0; t < T; ++t)
+                for (int hd = 0; hd < 2 * HK; ++hd) {
+                    double ss = 0.0;
+                    for (int j = 0; j < S; ++j) ss += (double) hh[(size_t) (t * C + hd * S + j)] * hh[(size_t) (t * C + hd * S + j)];
+                    for (int j = 0; j < S; ++j) hh[(size_t) (t * C + hd * S + j)] = (float) (hh[(size_t) (t * C + hd * S + j)] / std::sqrt(ss));
+                }
+            std::vector<float> gt((size_t) T * HV), bt((size_t) T * HV);
+            for (auto& v : gt) v = -2.0f * ud(rng);
+            for (auto& v : bt) v = ud(rng);
+            const std::vector<float> zz = normal(rng, (size_t) T * HV * S, 1.5f);
+            h2d(h, hh); h2d(gate, gt); h2d(beta, bt); h2d(z, zz);
+            ck(cudaMemset(y_o, 0xff, (size_t) T * HV * S * 4), "memset");
+            ck(cudaMemset(y_n, 0x7f, (size_t) T * HV * S * 4), "memset");
+            ck(cudaMemset(y16_o, 0xff, (size_t) T * HV * S * 2), "memset");
+            ck(cudaMemset(y16_n, 0x7f, (size_t) T * HV * S * 2), "memset");
+            p::gdn_recurrence(st_o, h, gate, beta, z, gamma, eps, y_o, y16_o, T, g_s, p::KernelPath::Old);
+            p::gdn_recurrence(st_n, h, gate, beta, z, gamma, eps, y_n, y16_n, T, g_s, p::KernelPath::New);
+            const std::vector<float> yn = d2h(y_n, (size_t) T * HV * S);
+            same("gdn_recurrence y", T, d2h(y_o, (size_t) T * HV * S), yn);
+            same("gdn_recurrence y16", T, d2h(y16_o, (size_t) T * HV * S), d2h(y16_n, (size_t) T * HV * S));
+            same("gdn_recurrence state", T, d2h(st_o, n_state), d2h(st_n, n_state));
+            std::vector<double> yr;
+            rec_reference(st_ref, hh, gt, bt, zz, gm, eps, T, yr);
+            for (size_t i = 0; i < yr.size(); ++i)
+                worst = std::fmax(worst, std::fabs((double) yn[i] - yr[i]) / (1.0 + std::fabs(yr[i])));
+        }
+    }
+    if (!(worst < 1e-3)) { std::fprintf(stderr, "FAIL gdn_recurrence vs host reference: %.3g\n", worst); ++g_fail; }
+    std::printf("gdn_recurrence: split vs block per head bitwise over %zu chunk pairs; host reference %.2g\n",
+                sizeof Ts / sizeof Ts[0], worst);
+    cudaFree(st_o); cudaFree(st_n); cudaFree(h); cudaFree(gate); cudaFree(beta); cudaFree(z); cudaFree(gamma);
+    cudaFree(y_o); cudaFree(y_n); cudaFree(y16_o); cudaFree(y16_n);
+}
 }  // namespace
 
 int main() {
     ck(cudaStreamCreate(&g_s), "stream");   // a blocking stream: ordered with the plain cudaMemcpy/cudaMemset
     std::mt19937 rng(20260928);
     test_conv(rng);
+    test_rec(rng);
     std::printf("prefill_kernels_parity: %s\n", g_fail ? "FAILED" : "OK");
     return g_fail ? 1 : 0;
 }

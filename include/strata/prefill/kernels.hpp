@@ -37,10 +37,12 @@ void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate
 /// chunk.  Same bits.
 void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, void* stream,
               KernelPath path = KernelPath::Env);
-/// The recurrence over the chunk, block per value head, state in registers; y[t] = rmsnorm(o) * gamma * sigmoid(z)
-/// (FP32 and FP16 bits: the out projection is quantized).
+/// The recurrence over the chunk, state in registers; y[t] = rmsnorm(o) * gamma * sigmoid(z) (FP32 and FP16 bits:
+/// the out projection is quantized).  New (P3): 4 blocks per value head (32 columns each), o through y, then the
+/// norm in a second kernel; Old (STRATA_OLD_PREFILL_GDN_REC=1): a block per value head.  Same bits.
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
-                    const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream);
+                    const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream,
+                    KernelPath path = KernelPath::Env);
 
 // ---- MoE
 /// softmax over 512, top-10 (ties to the lower id), weights renormalised over the ten (the native router).
