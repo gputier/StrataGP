@@ -48,6 +48,7 @@
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/core/progress.hpp"
+#include "round_sync.hpp"
 #ifndef NOMINMAX
 #define NOMINMAX   // gguf_reader.hpp includes windows.h
 #endif
@@ -2471,6 +2472,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
         }
+        mtp.order_after(ver.commit_event());   // issue #16: the decode loop's commits are not waited for
         mem_mark("the verifier and the drafter's binding");
         ver.set_split(o.spec_split);
         // auto: the copy kernel for every pack.  DMA (the native packs' default until 0.1.13) has the host call
@@ -2548,6 +2550,7 @@ int main(int argc, char** argv) {
         }
         // plan v0.3 P6: swaps in flight - (residency index, slot) admitted when adapt_ev has completed
         std::vector<std::pair<int32_t, int32_t>> pending;
+        strata::program::ResidencyUpload res_up;
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
         auto apply_pending = [&](bool wait) {
@@ -2556,8 +2559,8 @@ int main(int argc, char** argv) {
             else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
             for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
             pending.clear();
-            if (d_res != nullptr)
-                cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+            // issue #16: asynchronous behind the swapped blobs; no window reads d_res (the loop's end waits)
+            if (d_res != nullptr) res_up.put(d_res, host_res, adapt_stream, wait);
         };
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
@@ -2601,6 +2604,7 @@ int main(int argc, char** argv) {
             for (float& v : drive.d.usage) v *= 0.7f;
             return true;
         };
+        strata::program::AdaptWorker adapt_worker;   // issue #16: one thread for every request's adaptive rounds
         // stdin is read on its own thread, so a STOP line reaches a request that is still running (the client went
         // away, or pressed Esc): the flag is checked between prompt chunks and between verify windows.
         std::atomic<bool> stop_req{false};
@@ -3215,12 +3219,11 @@ int main(int argc, char** argv) {
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
-                std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
-                bool adapt_ok = true;
+                bool adapt_ok = true;   // the adaptive tier beside the commit and the draft (as in generate)
                 if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
-                    adapt_thr = std::thread([&] { adapt_ok = adapt(); });
-                if (!ver.commit(a + 1, err)) {
-                    if (adapt_thr.joinable()) adapt_thr.join();
+                    adapt_worker.start([&] { adapt_ok = adapt(); });
+                if (!ver.commit(a + 1, err, false)) {   // issue #16: the next window and the MTP round follow it
+                    adapt_worker.wait();
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
@@ -3241,7 +3244,7 @@ int main(int argc, char** argv) {
                 ++rounds;
                 const bool drafted = eos || produced_n >= max_new ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
-                if (adapt_thr.joinable()) adapt_thr.join();
+                adapt_worker.wait();
                 if (!adapt_ok) {
                     std::printf("ERR an adaptive refill failed\n");
                     return 1;
@@ -3258,6 +3261,11 @@ int main(int argc, char** argv) {
                 x = outv[(size_t) a];
                 p += a + 1;
             }
+            if (!ver.sync_commit(err)) {   // issue #16: the session is whole again for what reads it next
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
+            }
+            res_up.sync();
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             if (!cancelled) {
                 // a prompt stopped halfway leaves the session somewhere between two chunks: nothing to continue from
@@ -3736,6 +3744,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+        if (use_mtp) mtp.order_after(ver.commit_event());   // issue #16: the loop's commits are not waited for
         mem_mark("the verifier and the drafter's binding");
         ver.set_sampling(sp);   // the CLI's own sampling (until 0.1.19 this loop was always greedy); no penalties here
         ver.set_split(o.spec_split);
@@ -3759,6 +3768,7 @@ int main(int argc, char** argv) {
         }
         // plan v0.3 P6: swaps in flight - (residency index, slot) admitted when adapt_ev has completed
         std::vector<std::pair<int32_t, int32_t>> pending;
+        strata::program::ResidencyUpload res_up;
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
         auto apply_pending = [&](bool wait) {
@@ -3767,8 +3777,8 @@ int main(int argc, char** argv) {
             else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
             for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
             pending.clear();
-            if (d_res != nullptr)
-                cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+            // issue #16: asynchronous behind the swapped blobs; no window reads d_res (the loop's end waits)
+            if (d_res != nullptr) res_up.put(d_res, host_res, adapt_stream, wait);
         };
         // Plan v0.3 P6: the VRAM tier follows the conversation.  Candidates are missing experts routed at least
         // twice (decayed); each is paired with its layer's least-routed resident expert and swapped when it was
@@ -3820,6 +3830,7 @@ int main(int argc, char** argv) {
             ms_adapt += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
             return true;
         };
+        strata::program::AdaptWorker adapt_worker;   // issue #16: one thread for the loop's adaptive rounds
         int64_t p = spec_pos;
         int32_t x = (int32_t) tok;
         std::vector<int32_t> drafts((size_t) o.spec, 0);
@@ -3902,12 +3913,11 @@ int main(int argc, char** argv) {
             }
             // plan v0.3 P6: the adaptive tier's host work (ranking, copy submission) runs on its own thread while the
             // GPU commits and drafts; it touches only the residency tables, which nothing reads until the next window
-            std::thread adapt_thr;
             bool adapt_ok = true;
             if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
-                adapt_thr = std::thread([&] { adapt_ok = adapt(); });
-            if (!ver.commit(a + 1, err)) {
-                if (adapt_thr.joinable()) adapt_thr.join();
+                adapt_worker.start([&] { adapt_ok = adapt(); });
+            if (!ver.commit(a + 1, err, false)) {   // issue #16: the next window and the MTP round follow it
+                adapt_worker.wait();
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
@@ -3923,13 +3933,13 @@ int main(int argc, char** argv) {
                 eos = o.stop_eos && std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
             }
             if (eos) {
-                if (adapt_thr.joinable()) adapt_thr.join();
+                adapt_worker.wait();
                 total_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                 break;
             }
             const bool drafted = !use_mtp || (int64_t) produced.size() >= o.max_new ||
                                  mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p);
-            if (adapt_thr.joinable()) adapt_thr.join();
+            adapt_worker.wait();
             if (!adapt_ok) return 1;
             if (!drafted) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -3944,6 +3954,12 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: position %lld, %lld tokens, %lld rounds\n", (long long) p,
                              (long long) produced.size(), (long long) rounds);
         }
+        if (!ver.sync_commit(err)) {   // issue #16: the last commit, and the last residency upload, have landed
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        res_up.sync();
+        mtp.order_after(nullptr);   // the verifier's event ends with this block
         std::printf("%-24s %lld rounds of %d, drafts accepted %lld of %lld (%.3f), %.2f tokens per round\n",
                     "speculation", (long long) rounds, o.spec, (long long) drafts_ok, (long long) drafts_total,
                     drafts_total > 0 ? (double) drafts_ok / (double) drafts_total : 0.0,
@@ -3960,10 +3976,10 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < accepted_hist.size(); ++i) std::printf(" %zu:%lld", i, (long long) accepted_hist[i]);
         std::printf("\n");
         if (rounds > 0)
-            std::printf("%-24s wait for rings %.3f  pool %.3f  host %.3f  commit %.3f ms/round; CPU experts %.2f "
+            std::printf("%-24s wait for rings %.3f  pool %.3f  host %.3f  %s %.3f ms/round; CPU experts %.2f "
                         "distinct / %.2f routed per layer\n",
                         "verify window", ver.ms_wait / rounds, ver.ms_pool / rounds, ver.ms_host / rounds,
-                        ver.ms_commit / rounds,
+                        ver.commits_async > 0 ? "commit launch" : "commit", ver.ms_commit / rounds,
                         (double) (drive.d.multi_misses - misses0) / (double) (rounds * g.n_layers),
                         (double) (drive.d.multi_entries - entries0) / (double) (rounds * g.n_layers));
         if (rounds > 0)

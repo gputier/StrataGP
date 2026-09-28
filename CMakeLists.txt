@@ -198,6 +198,7 @@ if(STRATA_ENABLE_CUDA)
                           src/kernels/cuda/dequant_bf16.cu
                           src/kernels/cuda/qsa_select.cu
                           src/kernels/cuda/verify_kernels.cu
+                          src/kernels/cuda/mtp_chain.cu
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
@@ -391,6 +392,11 @@ if(STRATA_ENABLE_CUDA)
   target_include_directories(cvec_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(cvec_parity PRIVATE strata_kernels CUDA::cudart)
   add_test(NAME cvec_parity COMMAND cvec_parity)
+  # Issue #16: the MTP draft chain as one WHILE-node graph vs the host loop it replaces (GPU, synthetic, no model).
+  add_executable(mtp_chain_parity src/kernels/mtp_chain_parity.cpp)
+  target_include_directories(mtp_chain_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(mtp_chain_parity PRIVATE strata_kernels CUDA::cudart)
+  add_test(NAME mtp_chain_parity COMMAND mtp_chain_parity)
 
   # Plan v0.3 P3: native MMVQ for 1..8 tokens (bitwise selftest + --bench timing); synthetic data, no model.
   if(STRATA_BUILD_TESTS AND STRATA_HAVE_MICRO)
@@ -469,6 +475,12 @@ if(STRATA_BUILD_TESTS)
   add_executable(conv_cache_test src/program/conv_cache_test.cpp)
   target_include_directories(conv_cache_test PRIVATE include)
   add_test(NAME conv_cache_test COMMAND conv_cache_test)
+  # issue #16: the speculative loop's persistent adaptive worker (header-only; the header includes the CUDA runtime)
+  if(STRATA_ENABLE_CUDA)
+    add_executable(round_sync_test src/program/round_sync_test.cpp)
+    target_link_libraries(round_sync_test PRIVATE CUDA::cudart)
+    add_test(NAME round_sync_test COMMAND round_sync_test)
+  endif()
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp

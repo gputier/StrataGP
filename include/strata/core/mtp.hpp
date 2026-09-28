@@ -53,6 +53,9 @@ public:
     /// KV streaming: refill the ring of the drafter's window from its host copy for a sequence that continues at
     /// `upto` (a conversation-cache resume). No-op unless the drafter's K/V is a ring.
     void kv_restore(int64_t upto);
+    /// Issue #16: the round's first launch waits for `ev` on the device (the verify commit, which the host no
+    /// longer waits for).  A never-recorded event is no wait.
+    void order_after(cudaEvent_t ev) { after_ev_ = ev; }
     /// The main model's embedding and head, and the verify window's final residuals (T rows, hc*n_embd each).
     bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err);
 
@@ -77,8 +80,17 @@ private:
     bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err);
     bool capture_prefill(int T, std::string& err);
     bool capture_round(int T, std::string& err);
+    bool record_round(int T, std::string& err);
     bool capture_step(int j, std::string& err);
+    bool capture_chain(int T, std::string& err);
     cudaGraphExec_t step_exec_[9] = {};
+    // issue #16: the round and its whole draft chain as one graph (a WHILE node over the step after the round),
+    // unless STRATA_OLD_MTP_CHAIN=1 or the driver refuses it; then the round's graph and one graph and one
+    // synchronization per step, as before.  STRATA_MTP_CHAIN_CHECK=N runs both for the first N rounds and compares.
+    cudaGraphExec_t chain_exec_[9] = {};
+    bool chain_off_ = false;
+    int64_t chain_checks_ = 0, chain_diffs_ = 0;
+    cudaEvent_t after_ev_ = nullptr;
     const float* f32(const char* name) const;
     const uint16_t* bf16(const char* name) const;
     const void* q8(const char* name) const;
@@ -110,6 +122,7 @@ private:
     int32_t *h_pos_ = nullptr, *m_pos_ = nullptr, *h_row_ = nullptr, *m_row_ = nullptr;
     int32_t *h_out_ = nullptr, *m_out_ = nullptr;
     float *h_prob_ = nullptr, *m_prob_ = nullptr;   // each draft's probability under the draft layer
+    int32_t *h_chain_ = nullptr, *m_chain_ = nullptr;   // the chain graph: [limit, min_p bits, drafts made]
     // the draft head: the main head's rows for a token subset (rt/draft_vocab.bin), or the whole head
     uint8_t* dhead_ = nullptr;
     int32_t* dvocab_ = nullptr;
@@ -120,6 +133,7 @@ private:
     float* probs_ = nullptr;
     // device
     int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *row_ = nullptr, *ident_ = nullptr;
+    int32_t* chain_ctl_ = nullptr;   // the chain graph's step counter j
     float *Rin_ = nullptr, *R_ = nullptr, *emb_ = nullptr, *en_ = nullptr, *e2_ = nullptr, *hn_ = nullptr, *h2_ = nullptr;
     float *mixed_ = nullptr, *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *bo_ = nullptr;
     float* xn_ = nullptr;
