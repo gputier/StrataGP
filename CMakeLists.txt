@@ -343,6 +343,14 @@ if(STRATA_ENABLE_CUDA)
   target_link_libraries(s_gemv_q8k_parity PRIVATE strata_kernels CUDA::cudart)
   add_test(NAME s_gemv_q8k_parity COMMAND s_gemv_q8k_parity --selftest)
 
+  # issue #53: the opt-in BF16 GDN state against FP32 (bit-exact by construction, then the drift over 4096 tokens);
+  # --cpu-drift is the same drift on a CPU emulation, which runs without a GPU
+  add_executable(gdn_state_bf16_parity src/kernels/gdn_state_bf16_parity.cpp)
+  target_include_directories(gdn_state_bf16_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(gdn_state_bf16_parity PRIVATE strata_kernels CUDA::cudart)
+  add_test(NAME gdn_state_bf16_parity COMMAND gdn_state_bf16_parity --selftest)
+  add_test(NAME gdn_state_bf16_drift_cpu COMMAND gdn_state_bf16_parity --cpu-drift)
+
   add_executable(qsa_parity src/kernels/qsa_parity.cpp)
   target_include_directories(qsa_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(qsa_parity PRIVATE strata_kernels CUDA::cudart)
