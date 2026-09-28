@@ -179,7 +179,13 @@ void run_case(const Case& c, cudaStream_t s, mmq::Context& ctx) {
     ck(cudaMalloc(&dY, ny * 4), "malloc Y");
     const float sentinel = 1234.5f;
     std::vector<float> fill(ny, sentinel);
-    auto reset_y = [&] { ck(cudaMemcpy(dY, fill.data(), ny * 4, cudaMemcpyHostToDevice), "reset Y"); };
+    // the uploads run on the legacy stream from pageable memory and `s` is non-blocking: a pageable copy may
+    // return before its last chunk lands, so the device is drained before anything is launched on `s`
+    auto reset_y = [&] {
+        ck(cudaMemcpy(dY, fill.data(), ny * 4, cudaMemcpyHostToDevice), "reset Y");
+        ck(cudaDeviceSynchronize(), "reset Y sync");
+    };
+    ck(cudaDeviceSynchronize(), "upload sync");
 
     const int64_t scratch_elems = c.scratch_bytes ? (int64_t) (c.scratch_bytes / 2) : (32ll << 20);
     Gemm gm;
@@ -266,6 +272,13 @@ void declined(cudaStream_t s, mmq::Context& ctx) {
     if (!tiny.init(s, 4096, err)) { std::fprintf(stderr, "%s\n", err.c_str()); std::exit(2); }
     tiny.set_mmq(&ctx);
     expect(!tiny.native_mmq(nullptr, dX, GGML_TYPE_Q8_0, dY, dY, 1, 1, 256), "a scratch below one row: declined");
+    // the reason of a decline is reported (the prompt path logs it)
+    const char* why = nullptr;
+    expect(!gm.native_mmq(nullptr, dX, GGML_TYPE_IQ1_M, dY, dY, 1, 1, 256, 0, 0.0f, &why) && why != nullptr &&
+               std::strstr(why, "type") != nullptr, "IQ1_M: the reason names the type");
+    why = nullptr;
+    expect(!tiny.native_mmq(nullptr, dX, GGML_TYPE_Q8_0, dY, dY, 1, 1, 256, 0, 0.0f, &why) && why != nullptr &&
+               std::strstr(why, "scratch") != nullptr, "a scratch below one row: the reason names the scratch");
     ck(cudaStreamSynchronize(s), "declined");
     cudaFree(dY);
     cudaFree(dX);
