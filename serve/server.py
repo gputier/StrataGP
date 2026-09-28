@@ -545,6 +545,76 @@ class Detokenizer:
         return delta
 
 
+class ReasoningRecall:
+    """Issue #34, OPT-IN (--recall-reasoning, "recall_reasoning": true in the config, STRATA_RECALL_REASONING=1): the
+    reasoning of recent answers, given back to clients that send an answer back without it.
+
+    The template renders every past answer as `<think>\\nREASONING\\n</think>\\n\\nANSWER`.  Most clients
+    (chat.py before, the web app, OpenAI SDK clients) return only the answer, so the turn is rendered with an empty
+    `<think>` block: the prompt stops matching what the engine wrote about 70 characters into the answer, the
+    engine falls back to the checkpoint before the answer's header, and every turn reads the previous answer again.
+    With this on, an answer sent back without reasoning gets the reasoning this server wrote for it, and the
+    prompt continues the engine's live sequence.  It changes the prompt such clients produce (their past turns now
+    carry their reasoning, as the template intends; the context fills faster), hence opt-in.
+
+    An answer is found by a hash of the conversation up to and including it (roles, trimmed contents, tool calls -
+    never the reasoning itself), so the same short answer in another conversation is not given this one's
+    reasoning, and an edited earlier turn simply finds nothing.  Bounded to `max_entries` answers and `max_chars`
+    characters of reasoning, least recently used first out."""
+
+    def __init__(self, max_entries: int = 1024, max_chars: int = 16_000_000):
+        self.max_entries, self.max_chars = max_entries, max_chars
+        self.table: collections.OrderedDict[bytes, str] = collections.OrderedDict()
+        self.chars = 0
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def _feed(h, m: dict):
+        calls = []
+        for c in m.get("tool_calls") or []:
+            fn = c.get("function", c) if isinstance(c, dict) else {}
+            calls.append([fn.get("name"), fn.get("arguments")])
+        content = m.get("content")
+        b = json.dumps([m.get("role"), content.strip() if isinstance(content, str) else content, calls],
+                       sort_keys=True, ensure_ascii=False, default=str).encode()
+        h.update(len(b).to_bytes(8, "little"))
+        h.update(b)
+
+    def fill(self, messages: list[dict]) -> tuple[list[dict], object]:
+        """-> (messages with the reasoning restored where it is known, the conversation's hash state)."""
+        h, out = hashlib.sha256(), []
+        for m in messages:
+            if m.get("role") == "assistant" and not (m.get("reasoning_content") or "").strip():
+                k = h.copy()
+                self._feed(k, m)
+                key = k.digest()
+                with self.lock:
+                    r = self.table.get(key)
+                    if r is not None:
+                        self.table.move_to_end(key)
+                if r:
+                    m = dict(m, reasoning_content=r)
+            self._feed(h, m)
+            out.append(m)
+        return out, h
+
+    def remember(self, state, content: str, calls: list, reasoning: str):
+        """The answer written after the conversation `state` (fill's hash): its reasoning, for the next turn."""
+        if state is None or not reasoning.strip():
+            return
+        k = state.copy()
+        self._feed(k, {"role": "assistant", "content": content,
+                       "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
+        key = k.digest()
+        with self.lock:
+            old = self.table.pop(key, None)
+            self.chars -= len(old) if old else 0
+            self.table[key] = reasoning
+            self.chars += len(reasoning)
+            while self.table and (len(self.table) > self.max_entries or self.chars > self.max_chars):
+                self.chars -= len(self.table.popitem(last=False)[1])
+
+
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
@@ -576,6 +646,9 @@ class Service:
                 self.prompts = PromptEncoder(tokenizer)
             except ImportError:                          # no `regex` module: the byte tokenizer's tests
                 pass
+        self.recall = None                               # ReasoningRecall (issue #34, --recall-reasoning)
+        self.recall_ctx = threading.local()              # the current request's conversation hash, for recall
+        self.last_level = None                           # (thinking level, messages) of the last prompt (issue #33)
 
     def set_shared(self, defaults) -> dict:
         """The Chat settings every client gets for what it leaves out; {} / None = clients use their own again."""
@@ -670,9 +743,26 @@ class Service:
                 return full
         return ids
 
+    def _level_note(self, messages, kwargs):
+        """Issue #33: the thinking level is written into the system block at the very start of the prompt, so changing
+        it in the middle of a conversation (chat.py's /think, the web app's setting, a client alternating levels)
+        makes the engine read the whole conversation again.  Said in the server window when it happens."""
+        level = "none" if kwargs.get("enable_thinking") is False else str(kwargs.get("reasoning_effort") or "xhigh")
+        last, self.last_level = self.last_level, (level, messages)
+        if last is None or last[0] == level or len(last[1]) < 2 or len(messages) <= len(last[1]):
+            return
+        if all(a.get("role") == b.get("role") and a.get("content") == b.get("content")
+               for a, b in zip(messages, last[1])):
+            print(f"[strata] the thinking level changed ({last[0]} -> {level}) in the middle of a conversation: it is "
+                  "written at the start of the prompt, so the whole conversation is read again this time", flush=True)
+
     def prepare(self, messages, tools, kwargs, max_new=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context."""
+        self.recall_ctx.state = None
+        if self.recall is not None:
+            messages, self.recall_ctx.state = self.recall.fill(messages)
+        self._level_note(messages, kwargs)
         prompt = self.template.render(messages, tools=tools, **kwargs)
         ids = self.encode_prompt(prompt)
         self.embeddings.path = None
@@ -772,6 +862,8 @@ class Service:
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb = getattr(self.embeddings, "path", None)
+        recall = getattr(self.recall_ctx, "state", None) if self.recall is not None else None
+        said = ([], [], [])                             # content, reasoning, tool calls: what the recall keeps
         with self.status_lock:
             self.status["queued"] += 1
         try:
@@ -804,6 +896,8 @@ class Service:
                             break
                         raw_ids.append(t)
                         evs = parser.feed(detok.push(t))
+                        if recall is not None:
+                            self._said(said, evs)
                         self._note(n, evs)
                         last_print = self._progress(last_print)
                         for ev in evs:
@@ -863,9 +957,23 @@ class Service:
                     if os.environ.get("STRATA_DEBUG") and raw_ids:
                         print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
                 self.status["busy"] = False
-        for ev in parser.finish():
+        tail = parser.finish()
+        if recall is not None:
+            self._said(said, tail)
+            self.recall.remember(recall, "".join(said[0]), said[2], "".join(said[1]))
+        for ev in tail:
             yield "event", ev
         yield "done", {"finish": finish, "completion_tokens": n}
+
+    @staticmethod
+    def _said(said, evs):
+        for ev in evs:
+            if ev.kind == "content":
+                said[0].append(ev.text)
+            elif ev.kind == "reasoning":
+                said[1].append(ev.text)
+            elif ev.kind == "tool_call":
+                said[2].append(ev.call)
 
 
 def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
@@ -1543,6 +1651,10 @@ def main() -> int:
     ap.add_argument("--mcp-config", help="a JSON file with MCP servers in Claude Desktop's format ({\"mcpServers\": "
                                          "{...}}); the web app's chat can use their tools (also \"mcp_servers\" in "
                                          "the config)")
+    ap.add_argument("--recall-reasoning", action="store_true",
+                    help="give past answers back their reasoning when a client omits it, so the engine continues its "
+                         "live sequence instead of reading the last answer again (changes those clients' prompts; also "
+                         "\"recall_reasoning\": true in the config or STRATA_RECALL_REASONING=1)")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
     if a.gpu is not None:
@@ -1596,6 +1708,9 @@ def main() -> int:
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     svc.api_key = a.api_key or cfg.get("api_key", "")
     svc.gpu_index = cfg.get("gpu") or 0                 # the Monitor reads the card the engine runs on (issue #51)
+    if a.recall_reasoning or cfg.get("recall_reasoning") is True or os.environ.get("STRATA_RECALL_REASONING") == "1":
+        svc.recall = ReasoningRecall()                  # issue #34
+        print("[strata] past answers get their reasoning back when a client omits it (recall_reasoning)", flush=True)
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
         try:

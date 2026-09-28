@@ -645,6 +645,130 @@ class IncrementalPrompts(unittest.TestCase):
             del os.environ["STRATA_OLD_PROMPT_ENCODE"]
 
 
+class ThinkingLevelNote(unittest.TestCase):
+    """Issue #33: a thinking level changed in the middle of a conversation is said in the server window."""
+
+    def test_note(self):
+        import contextlib
+        import io
+        tok = ByteTokenizer()
+        svc = Service(RecordingPrompt(tok, "</think>\n\nok", max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        conv = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            svc.prepare(conv[:1], None, {"reasoning_effort": "medium"})
+            svc.prepare(conv + [{"role": "user", "content": "more"}], None, {"reasoning_effort": "medium"})
+            self.assertNotIn("thinking level changed", out.getvalue())
+            svc.prepare(conv + [{"role": "user", "content": "more"}, {"role": "assistant", "content": "ok"},
+                                {"role": "user", "content": "again"}], None, {"reasoning_effort": "low"})
+            self.assertIn("thinking level changed (medium -> low)", out.getvalue())
+            out.truncate(0)
+            svc.prepare([{"role": "user", "content": "another conversation"}], None, {"enable_thinking": False})
+            self.assertNotIn("thinking level changed", out.getvalue())
+
+
+class RecallReasoning(unittest.TestCase):
+    """Issue #34: with --recall-reasoning a client that returns only the answer still continues the engine's live
+    sequence; without it, the prompt diverges right after <think> (the old behaviour, unchanged by default)."""
+
+    SCRIPT = "Let me think.\nStill thinking.\n</think>\n\nThe answer is 4."
+
+    def make(self, recall, script=None):
+        from serve.server import ReasoningRecall
+        tok = ByteTokenizer()
+        engine = RecordingPrompt(tok, script or self.SCRIPT, max_context=CTX)
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        if recall:
+            svc.recall = ReasoningRecall()
+        httpd = serve(svc, port=0)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        return svc, engine, f"http://127.0.0.1:{httpd.server_address[1]}"
+
+    def chat(self, base, body):
+        req = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+
+    def two_turns(self, recall):
+        svc, engine, base = self.make(recall)
+        msgs = [{"role": "user", "content": "2+2?"}]
+        b = self.chat(base, {"model": "m", "max_tokens": 200, "messages": msgs})
+        live = engine.last_ids + list(engine.script)       # what the engine holds after turn 1
+        msg = b["choices"][0]["message"]
+        self.assertEqual(msg["content"], "The answer is 4.")
+        msgs += [{"role": "assistant", "content": msg["content"]}, {"role": "user", "content": "and 3+3?"}]
+        self.chat(base, {"model": "m", "max_tokens": 200, "messages": msgs})
+        return svc, engine, live
+
+    def test_live_prefix_with_recall(self):
+        _, engine, live = self.two_turns(True)
+        self.assertEqual(engine.last_ids[:len(live)], live)
+
+    def test_default_is_unchanged(self):
+        svc, engine, live = self.two_turns(False)
+        self.assertIsNone(svc.recall)
+        self.assertNotEqual(engine.last_ids[:len(live)], live)
+        text = bytes(t for t in engine.last_ids if t < 256).decode()
+        self.assertIn("<think>\n\n</think>\n\nThe answer is 4.", text)
+
+    def test_other_conversation_gets_nothing(self):
+        svc, engine, base = self.make(True)
+        self.chat(base, {"model": "m", "max_tokens": 200, "messages": [{"role": "user", "content": "2+2?"}]})
+        self.chat(base, {"model": "m", "max_tokens": 200, "messages": [
+            {"role": "user", "content": "something else"}, {"role": "assistant", "content": "The answer is 4."},
+            {"role": "user", "content": "ok"}]})
+        text = bytes(t for t in engine.last_ids if t < 256).decode()
+        self.assertNotIn("Still thinking", text)
+
+    def test_client_reasoning_wins_and_tool_calls(self):
+        script = ("Need the tool.\n</think>\n\n<tool_call>\n<function=add>\n<parameter=a>\n2\n</parameter>\n"
+                  "</function>\n</tool_call>")
+        svc, engine, base = self.make(True, script)
+        tools = [{"type": "function", "function": {"name": "add", "parameters": {
+            "type": "object", "properties": {"a": {"type": "integer"}}}}}]
+        msgs = [{"role": "user", "content": "add"}]
+        b = self.chat(base, {"model": "m", "max_tokens": 300, "messages": msgs, "tools": tools})
+        live = engine.last_ids + list(engine.script)
+        call = b["choices"][0]["message"]["tool_calls"][0]
+        msgs += [{"role": "assistant", "content": None, "tool_calls": [call]},
+                 {"role": "tool", "tool_call_id": call["id"], "content": "4"}]
+        self.chat(base, {"model": "m", "max_tokens": 300, "messages": msgs, "tools": tools})
+        self.assertEqual(engine.last_ids[:len(live)], live)
+        msgs[1] = dict(msgs[1], reasoning_content="My own words.")          # a client that sends its own
+        self.chat(base, {"model": "m", "max_tokens": 300, "messages": msgs, "tools": tools})
+        text = bytes(t for t in engine.last_ids if t < 256).decode()
+        self.assertIn("My own words.", text)
+        self.assertNotIn("Need the tool.", text)
+
+    def test_chat_py_sends_its_reasoning_back(self):
+        sys.path.insert(0, str(ROOT))
+        import chat
+        _, engine, base = self.make(False)                 # a default server: chat.py alone is enough
+        url = base + "/v1/chat/completions"
+        msgs = [{"role": "user", "content": "2+2?"}]
+        parts = list(chat.stream(url, msgs, "high", 200))
+        live = engine.last_ids + list(engine.script)
+        msgs.append(chat.answer_message("".join(p[1] for p in parts), "".join(p[0] for p in parts)))
+        self.assertEqual(msgs[-1]["reasoning_content"], "Let me think.\nStill thinking.\n")
+        msgs.append({"role": "user", "content": "and 3+3?"})
+        list(chat.stream(url, msgs, "high", 200))
+        self.assertEqual(engine.last_ids[:len(live)], live)
+        self.assertNotIn("reasoning_content", chat.answer_message("a", "b", drop_thinking=True))
+
+    def test_bounded(self):
+        from serve.server import ReasoningRecall
+        import hashlib
+        r = ReasoningRecall(max_entries=3, max_chars=100)
+        for i in range(10):
+            h = hashlib.sha256(str(i).encode())
+            r.remember(h, f"answer {i}", [], "x" * 30)
+        self.assertLessEqual(len(r.table), 3)
+        self.assertLessEqual(r.chars, 100)
+
+
 class VisionCache(unittest.TestCase):
     """Issue #35: an image already encoded is found by its raw bytes, before any conversion, and a request with one
     image links its cached embeddings instead of copying them."""
