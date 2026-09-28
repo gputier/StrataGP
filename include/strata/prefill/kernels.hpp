@@ -11,6 +11,10 @@
 
 namespace strata::prefill {
 
+/// Which of two equivalent kernels a function runs (docs/perf/prefill-kernels.md).  `Env` is the rewrite unless the
+/// function's STRATA_OLD_PREFILL_* variable is 1; the parity test names `Old` and `New` explicitly.
+enum class KernelPath { Env, Old, New };
+
 // ---- hyper-connection (n_embd 2560, hc 4, hc_lr 320)
 /// xn[t, c*2560 + d] = R[t,c,d] * rsqrt(mean_d R[t,c,:]^2 + eps) * w_norm[c*2560 + d]; also its BF16 image.
 void gr_norm(const float* R, const float* w_norm, float eps, float* xn, uint16_t* xn16, int64_t T, void* stream);
@@ -23,21 +27,43 @@ void gr_mix(const float* xn, const float* gated, float* mixed, uint16_t* mixed16
 void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64_t T, void* stream);
 /// R[t, c, :] = e[t, :] for all four streams (the embedding broadcast).
 void gr_broadcast(const float* e, float* R, int64_t T, void* stream);
+/// The chain without the FP32 image of xn (P8), bit for bit the values of the three above: gr_norm_scale writes the
+/// BF16 image and the scale rs[t*4 + c] = rsqrt(mean_d R[t,c,:]^2 + eps) of each row, gr_mix_scale recomputes
+/// xn = R * rs * w_norm (R unchanged since), and gr_write_norm is gr_write followed by gr_norm_scale of the written
+/// rows with the next half's norm weight (one read of R instead of two).
+void gr_norm_scale(const float* R, const float* w_norm, float eps, float* rs, uint16_t* xn16, int64_t T, void* stream);
+void gr_mix_scale(const float* R, const float* rs, const float* w_norm, const float* gated, float* mixed,
+                  uint16_t* mixed16, int64_t T, void* stream, uint16_t* mixed_h = nullptr);
+void gr_write_norm(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
+                   float* rs, uint16_t* xn16, int64_t T, void* stream);
+/// STRATA_OLD_PREFILL_GR=1: the prompt path keeps gr_norm / gr_mix / gr_write and the FP32 xn buffer.
+bool gr_old_path();
 
 // ---- GDN (state 128, 16 k heads, 48 v heads, 10240 conv channels, 4 taps)
 /// gate[t,h] = softplus(ab[t,h] + dt[h]) * ssm_a[h];  beta[t,h] = sigmoid(ab[t, 48 + h])  (ab: [T, 96])
 void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate, float* beta, int64_t T, void* stream);
 /// The 4-tap causal conv + SiLU over the chunk (history [C][3] in, updated to the chunk's last three inputs), then
-/// the L2 norm of the q and k heads of every token.  h: [T, C].
-void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, void* stream);
-/// The recurrence over the chunk, block per value head, state in registers; y[t] = rmsnorm(o) * gamma * sigmoid(z)
-/// (FP32 and FP16 bits: the out projection is quantized).
+/// the L2 norm of the q and k heads of every token.  h: [T, C].  New (P2): a thread per (channel, token) with the
+/// norm in the same kernel, then the history; Old (STRATA_OLD_PREFILL_GDN_CONV=1): a thread per channel walks the
+/// chunk.  Same bits.
+void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, void* stream,
+              KernelPath path = KernelPath::Env);
+/// The recurrence over the chunk, state in registers; y[t] = rmsnorm(o) * gamma * sigmoid(z) (FP32 and FP16 bits:
+/// the out projection is quantized).  New (P3): 4 blocks per value head (32 columns each), o through y, then the
+/// norm in a second kernel; Old (STRATA_OLD_PREFILL_GDN_REC=1): a block per value head.  Same bits.
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
-                    const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream);
+                    const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream,
+                    KernelPath path = KernelPath::Env);
 
 // ---- MoE
 /// softmax over 512, top-10 (ties to the lower id), weights renormalised over the ten (the native router).
+/// STRATA_PREFILL_ROUTE_DECODE=1 (B8): route_decode instead.
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream);
+/// The token path's router over the chunk (core/layer.cpp's choice): route_native with --native-router and 512
+/// experts, else router_top10.
+void route_decode(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream);
+/// native_router_top10's arithmetic (--use_fast_math, src/prefill/route_native.cu), a warp per token; 512 experts.
+void route_native(const float* logits, int32_t* ids, float* weights, int64_t T, void* stream);
 /// Expert blob (Strata pack layout, Q2_0) -> BF16 matrices: gate/up interleaved [1280, 2560], down [2560, 640].
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream);
 /// h16[n, r] = fp16(silu(gu[n, 2r]) * gu[n, 2r + 1])   (the interleaved expert gate/up)
@@ -75,5 +101,10 @@ void to_bf16(const float* x, uint16_t* y, int64_t n, void* stream);
 void round_f16(const float* x, float* y, int64_t n, void* stream);
 /// Expert blob -> FP16 (Q2_0 values are exact in FP16).
 void blob_dequant_f16(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream);
+
+/// B7: every FP16 image written by these kernels saturates finite values beyond the FP16 range to +-65504 (NaN and
+/// +-inf pass through) instead of rounding them to +-inf.  Off by default; STRATA_PREFILL_F16_SAT=1 turns it on
+/// before the first such kernel.  This call (tests) sets it now, synchronously, and overrides the variable.
+void set_f16_saturate(bool on);
 
 }  // namespace strata::prefill

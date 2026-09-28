@@ -264,10 +264,20 @@ if(STRATA_ENABLE_CUDA)
   add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
   target_include_directories(strata_prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(strata_prefill PUBLIC strata_engine CUDA::cublas CUDA::cudart)
+  # B8 (STRATA_PREFILL_ROUTE_DECODE=1): the token path's native router over a prompt chunk, with its --use_fast_math
+  target_sources(strata_prefill PRIVATE src/prefill/route_native.cu)
+  set_source_files_properties(src/prefill/route_native.cu PROPERTIES COMPILE_OPTIONS "--use_fast_math")
 
   add_executable(strata src/program/generate.cpp)
   target_include_directories(strata PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec CUDA::cudart)
+
+  # docs/perf/prefill-kernels.md: the rewritten prompt kernels against the ones they replace, bitwise (GPU, synthetic,
+  # no model).
+  add_executable(prefill_kernels_parity src/prefill/kernels_parity.cpp)
+  target_include_directories(prefill_kernels_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(prefill_kernels_parity PRIVATE strata_prefill CUDA::cudart)
+  add_test(NAME prefill_kernels_parity COMMAND prefill_kernels_parity)
 
   add_executable(dequant_s2_parity src/kernels/dequant_s2_parity.cpp)
   # The tests are HOST C++ files that call cudaMalloc/cudaMemcpy themselves, so they need the toolkit headers
