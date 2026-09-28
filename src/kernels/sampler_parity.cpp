@@ -1197,6 +1197,86 @@ int main(int argc, char** argv) {
         bad += wrong + (tied == 0);
     }
 
+    // ---- fixture 18: THE DEFAULT PATH'S AUTOMATIC FALLBACKS (issue #20).  (a) A stream under graph capture
+    // (ThreadLocal mode) gets the one-block kernel, penalty bitmap in dynamic shared memory, inside the graph: the
+    // capture must succeed and the replayed graph (twice) must pick the mirror's tokens; the same stream uncaptured
+    // then takes the split path (its scratch is first allocated after the capture) and picks the same.  (b) More
+    // rows than a split launch takes (64) fall back to one block; exactly 64 stay split.
+    {
+        int wrong = 0, draws = 0;
+        const int H = 64;
+        auto compare = [&](const char* what, const std::vector<int>& got, const std::vector<SelList>& lists, int k,
+                           const strata::kernels::SamplerParams& p) {
+            for (size_t t = 0; t < got.size(); ++t) {
+                const int want = mirror_pick(lists[t], k, p, (int) t);
+                ++draws;
+                if (got[t] != want) {
+                    if (wrong < 8) std::printf("    %s row %zu: want %d got %d\n", what, t, want, got[t]);
+                    ++wrong;
+                }
+            }
+        };
+        auto make = [&](int nv, int T, unsigned seed, std::vector<float>& l, std::vector<int>& hist) {
+            std::mt19937 rng(seed);
+            std::normal_distribution<float> g(0.0f, 1.5f);
+            l.assign((size_t) nv * T, 0.0f);
+            for (auto& v : l) v = std::floor(g(rng) * 2.0f) / 2.0f;
+            hist.assign((size_t) T * H, 0);
+            for (auto& h : hist) h = (int) (rng() % (unsigned) nv);
+        };
+        {
+            const int nv = 248320, T = 3;
+            std::vector<float> l;
+            std::vector<int> hist;
+            make(nv, T, 1800u, l, hist);
+            strata::kernels::SamplerParams p;
+            p.top_k = 20; p.top_p = 0.9f; p.temperature = 2.5f; p.seed = 18; p.counter = 77;
+            p.penalty_last_n = H; p.penalty_repeat = 1.25f; p.penalty_freq = 0.25f; p.penalty_present = 0.5f;
+            const int k = sampled_k(p.top_k, nv);
+            std::vector<SelList> lists;
+            for (int t = 0; t < T; ++t)
+                lists.push_back(mirror_select(l.data() + (size_t) t * nv, nv, window_of(hist, H, t, H), p, k));
+            DeviceRows rows(l, T, hist, H);
+            cudaStream_t cs = nullptr;
+            check(cudaStreamCreate(&cs), "fixture 18 stream");
+            check(cudaMemset(rows.o, 0xFF, (size_t) T * sizeof(int)), "fixture 18 fill");
+            cudaGraph_t graph = nullptr;
+            cudaGraphExec_t exec = nullptr;
+            check(cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal), "begin capture");
+            strata::kernels::sample_tokens(rows.l, T, nv, rows.h, H, p, rows.o, cs);
+            check(cudaStreamEndCapture(cs, &graph), "end capture");
+            check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+            for (int replay = 0; replay < 2; ++replay) {
+                check(cudaMemset(rows.o, 0xFF, (size_t) T * sizeof(int)), "fixture 18 refill");
+                check(cudaGraphLaunch(exec, cs), "graph launch");
+                check(cudaStreamSynchronize(cs), "graph sync");
+                std::vector<int> got((size_t) T);
+                check(cudaMemcpy(got.data(), rows.o, got.size() * sizeof(int), cudaMemcpyDeviceToHost), "back");
+                compare("captured graph", got, lists, k, p);
+            }
+            cudaGraphExecDestroy(exec);
+            cudaGraphDestroy(graph);
+            compare("same stream, uncaptured", rows.sample(p, cs), lists, k, p);
+            cudaStreamDestroy(cs);
+        }
+        for (int T : {64, 70}) {
+            const int nv = 512;
+            std::vector<float> l;
+            std::vector<int> hist;
+            make(nv, T, 1810u + (unsigned) T, l, hist);
+            strata::kernels::SamplerParams p;
+            p.top_k = 64; p.top_p = 1.0f; p.temperature = 2.5f; p.seed = 18; p.counter = (uint64_t) T;
+            const int k = sampled_k(p.top_k, nv);
+            std::vector<SelList> lists;
+            for (int t = 0; t < T; ++t) lists.push_back(mirror_select(l.data() + (size_t) t * nv, nv, {}, p, k));
+            DeviceRows rows(l, T, hist, 0);
+            compare(T > 64 ? "70 rows (one block)" : "64 rows (split)", rows.sample(p, nullptr), lists, k, p);
+        }
+        std::printf("  %-34s %s (%d of %d draws differ)\n", "fallbacks: graph capture, row cap",
+                    wrong ? "*** WRONG ***" : "matches", wrong, draws);
+        bad += wrong;
+    }
+
     std::printf("\nsampler: %d failures\n", bad);
     if (bad) return 1;
     if (selftest) std::printf("sampler_parity OK\n");
