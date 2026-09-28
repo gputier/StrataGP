@@ -613,10 +613,13 @@ if(STRATA_BUILD_TESTS)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     add_subdirectory(tests)
   endif()
-  # issue #51: tools/routing_locality.py on synthetic routing traces (Python 3 + numpy)
+  # issue #51: tools/routing_locality.py on synthetic routing traces; issue #53: tools/logits_kl.py on synthetic
+  # logits dumps (Python 3 + numpy)
   find_program(STRATA_PYTHON3 NAMES python3 python)
   if(STRATA_PYTHON3)
     add_test(NAME routing_locality_test COMMAND ${STRATA_PYTHON3} -m unittest tools.test_routing_locality
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME logits_kl_test COMMAND ${STRATA_PYTHON3} -m unittest tools.test_logits_kl
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
   endif()
 endif()
