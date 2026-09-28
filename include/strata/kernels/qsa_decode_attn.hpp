@@ -32,6 +32,20 @@ struct QsaAttnPools {
     const int32_t* page_table = nullptr;
 };
 
+/// The chunk kernel (O6c, #23).  The default starts the chunk's V rows as `cp.async` copies into shared memory as
+/// soon as the page table has resolved them, preloads each warp's K rows, and waits for V only after QK and the
+/// softmax; its arithmetic is the previous kernel's, expression for expression, so the output is bitwise the same.
+///   kQsaAttnOld      the previous kernel, one load in flight per warp (A/B: STRATA_OLD_QSA_ATTN=1)
+///   kQsaAttnChunk32  the prefetching kernel over 32 cells per block: twice the blocks, but a different split of the
+///                    softmax, so NOT bitwise equal - opt-in (STRATA_QSA_CHUNK=32)
+/// A cell whose page did not resolve (page table < 0: KV streaming overflow, `kv_stream.hpp` ctl[3]) is masked with
+/// weight 0 in every variant instead of being read from before the pool (B14, #12).
+enum QsaAttnVariant : int { kQsaAttnPrefetch = 0, kQsaAttnOld = 1, kQsaAttnChunk32 = 2 };
+/// Read from the environment on first use.  The scratch size depends on it: a test that switches variants sizes
+/// its scratch for kQsaAttnChunk32 (the largest); the engine never switches.
+int qsa_decode_attn_variant();
+void qsa_decode_attn_set_variant(int variant);
+
 /// Scratch floats for `cap` selected cells: partial accumulators, maxima and sums.
 uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s);
 
