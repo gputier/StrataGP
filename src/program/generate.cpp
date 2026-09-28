@@ -1749,30 +1749,55 @@ int main(int argc, char** argv) {
     int64_t prefilled = 0;
     if (!profile.empty() && srcp != nullptr) {
         const int64_t want = std::min<int64_t>((int64_t) profile.size(), xcache.slots());
+        // issue #48: the fills are queued on one stream and waited for once - a blocking copy per slot (4,105 on a
+        // 12 GB card, ~16,000 on a 32 GB one) left the copy engine idle between slots.  STRATA_OLD_PROFILE_FILL=1
+        // keeps the blocking copies (the A/B; the slots hold the same bytes either way)
+        cudaStream_t fill_stream = nullptr;
+        if (std::getenv("STRATA_OLD_PROFILE_FILL") == nullptr &&
+            cudaStreamCreateWithFlags(&fill_stream, cudaStreamNonBlocking) != cudaSuccess) {
+            (void) cudaGetLastError();
+            fill_stream = nullptr;
+        }
+        const Clock::time_point tf = Clock::now();
         for (int64_t i = 0; i < want; ++i) {
             const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
             if (slot == strata::core::kNotResident) break;
             const uint8_t* b = srcp->blob(profile[(size_t) i].first, profile[(size_t) i].second);
-            if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
-                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first))) {
+            const int64_t bytes = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
+            if (b == nullptr || !(fill_stream != nullptr ? xcache.fill_slot(slot, b, fill_stream, err, bytes)
+                                                         : xcache.fill_slot_blocking(slot, b, err, bytes))) {
                 std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
                              (long long) i, err.c_str());
                 return 1;
             }
             ++prefilled;
         }
-        // **AND ONE SLOT IS READ BACK AND COMPARED.**  A residency table that is right about indices and wrong
+        if (fill_stream != nullptr) {
+            const cudaError_t e = cudaStreamSynchronize(fill_stream);
+            cudaStreamDestroy(fill_stream);
+            if (e != cudaSuccess) {
+                std::fprintf(stderr, "strata generate: the profile fill failed: %s\n", cudaGetErrorString(e));
+                return 1;
+            }
+        }
+        const double fill_ms = std::chrono::duration<double, std::milli>(Clock::now() - tf).count();
+        // **AND SLOTS ARE READ BACK AND COMPARED.**  A residency table that is right about indices and wrong
         // about bytes produces a plausible token, which is this project's most expensive failure mode; the
-        // cache's own `verify_slot` is the check and it costs one 1.38 MB D2H at startup.
-        if (prefilled > 0 && !xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
-                                srcp->blob(profile[0].first, profile[0].second), err,
-                                (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[0].first))) {
-            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-            return 1;
+        // cache's own `verify_slot` is the check and it costs one 1.38 MB D2H at startup per slot: the first slot,
+        // and (issue #48: the fills are asynchronous now) the last one filled.  (Only the first was ever read back,
+        // not every slot as issue #48 has it.)
+        for (const int64_t v : {int64_t(0), prefilled - 1}) {
+            if (prefilled == 0) break;
+            const auto& pr = profile[(size_t) v];
+            if (!xcache.verify_slot(xcache.slot_of(pr.first, pr.second), srcp->blob(pr.first, pr.second), err,
+                                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(pr.first))) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
         }
         mem_mark("the profile fill");
-        std::fprintf(stderr, "strata generate: pre-filled %lld of %lld slots from the profile; slot 0 verified\n",
-                     (long long) prefilled, (long long) want);
+        std::fprintf(stderr, "strata generate: pre-filled %lld of %lld slots from the profile in %.0f ms; the first and "
+                             "the last verified\n", (long long) prefilled, (long long) want, fill_ms);
     }
 
     Drive drive;
