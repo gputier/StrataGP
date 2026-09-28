@@ -665,6 +665,17 @@ struct CkptPool {
         }
         return std::shared_ptr<uint8_t>(b.first, [this, pinned = b.second](uint8_t* p) { free_list.emplace_back(p, pinned); });
     }
+    /// Frees the idle buffers beyond `keep`: once checkpoints are dropped (a new conversation, a control-vector
+    /// switch) their ~118 MB each would otherwise stay pinned for the server's lifetime.  Every copy into or out of
+    /// a buffer has been waited for when its checkpoint is dropped.
+    void trim(size_t keep) {
+        while (free_list.size() > keep) {
+            const auto [p, pinned] = free_list.back();
+            free_list.pop_back();
+            if (pinned) cudaFreeHost(p);
+            else delete[] p;
+        }
+    }
 };
 
 uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull) {
@@ -1770,6 +1781,15 @@ int main(int argc, char** argv) {
             cudaStreamCreateWithFlags(&fill_stream, cudaStreamNonBlocking) != cudaSuccess) {
             (void) cudaGetLastError();
             fill_stream = nullptr;
+        }
+        // a non-blocking stream is not ordered after the legacy stream: the arena's zeroing `cudaMemset` in
+        // `ExpertCache::open` (queued on stream 0, not waited for when `--expert-cache N` is fixed or the auto
+        // loop leaves through its attempt cap) could otherwise land on top of the copies below
+        if (fill_stream != nullptr && cudaDeviceSynchronize() != cudaSuccess) {
+            std::fprintf(stderr, "strata generate: the profile fill failed: %s\n",
+                         cudaGetErrorString(cudaGetLastError()));
+            cudaStreamDestroy(fill_stream);
+            return 1;
         }
         const Clock::time_point tf = Clock::now();
         for (int64_t i = 0; i < want; ++i) {
@@ -3047,6 +3067,7 @@ int main(int argc, char** argv) {
             checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& c) {
                              return (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
                          }), checks.end());
+            ckpt_pool.trim(1);   // pinned RAM follows the live checkpoints (one spare for the next save)
             live_ok = false;   // until this request has finished, the session is in between
             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
             if (resume == 0) {
