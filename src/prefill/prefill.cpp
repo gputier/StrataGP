@@ -699,18 +699,22 @@ namespace {
 // STRATA_PREFILL_TIMING=1: the prompt path's GPU time by phase.  Events are recorded on the compute stream in order;
 // the time between two consecutive marks is charged to the phase of the first, so a gap where the GPU waits (for the
 // host's expert grouping, or for an expert's copy) lands on the phase that was waiting.  Events are reused: the marks
-// are folded at every MoE layer's host sync, after which all of them have completed.
+// are folded at every MoE layer's host sync, after which all of them have completed.  "dense proj" is every native
+// (GGUF) projection - GDN, QSA and the shared expert - out of the phase it sits in (what --prefill-dense-mmq changes);
+// issue #41: every chunk's time is also kept per phase, for the QSA attention's share as the context grows.
 enum PfPhase { kPfStart, kPfHc, kPfGdn, kPfQsa, kPfQsaIdx, kPfQsaSel, kPfQsaAttn, kPfRouter, kPfHostGroup, kPfGather,
-               kPfWaitCopy, kPfDequant, kPfGemmGU, kPfGemmD, kPfCombine, kPfPle, kPfCount };
+               kPfWaitCopy, kPfDequant, kPfGemmGU, kPfGemmD, kPfCombine, kPfPle, kPfDense, kPfCount };
 const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa proj", "qsa indexer", "qsa select",
                                         "qsa attn", "router+shared", "host grouping", "gather", "wait copy", "dequant",
-                                        "gemm gate/up", "gemm down", "combine", "ple"};
+                                        "gemm gate/up", "gemm down", "combine", "ple", "dense proj"};
 struct PfTimer {
     bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
     std::vector<cudaEvent_t> ev;
-    std::vector<int> ph;
+    std::vector<int> ph, ck;
     size_t used = 0;
+    int chunk = 0;                     // the chunk the next marks belong to
     double ms[kPfCount] = {};
+    std::vector<double> by_chunk;      // [chunk * kPfCount + phase]
     void mark(int phase, cudaStream_t s) {
         if (!on) return;
         if (used == ev.size()) {
@@ -718,8 +722,10 @@ struct PfTimer {
             cudaEventCreate(&e);
             ev.push_back(e);
             ph.push_back(0);
+            ck.push_back(0);
         }
         ph[used] = phase;
+        ck[used] = chunk;
         cudaEventRecord(ev[used], s);
         ++used;
     }
@@ -728,10 +734,16 @@ struct PfTimer {
         if (!on || used < 2) return;
         for (size_t i = 0; i + 1 < used; ++i) {
             float t = 0.0f;
-            if (cudaEventElapsedTime(&t, ev[i], ev[i + 1]) == cudaSuccess) ms[ph[i]] += t;
+            if (cudaEventElapsedTime(&t, ev[i], ev[i + 1]) == cudaSuccess) {
+                ms[ph[i]] += t;
+                const size_t at = (size_t) ck[i] * kPfCount + (size_t) ph[i];
+                if (by_chunk.size() <= at) by_chunk.resize(((size_t) ck[i] + 1) * kPfCount, 0.0);
+                by_chunk[at] += t;
+            }
         }
         std::swap(ev[0], ev[used - 1]);
         std::swap(ph[0], ph[used - 1]);
+        std::swap(ck[0], ck[used - 1]);
         used = 1;
     }
     ~PfTimer() {
@@ -792,7 +804,16 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
         const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
         ++stats_.chunks;
+        pt.chunk = (int) (c0 / m.T);
         pt.mark(kPfStart, cs);
+        // a native projection, timed as "dense proj" inside the phase `back` it belongs to
+        auto proj = [&](const core::WeightRef* w, const float* X32, const uint16_t* X, float* Y, const std::string& name,
+                        int back) {
+            pt.mark(kPfDense, cs);
+            const bool ok = native_proj(m.gemm, w, X32, X, Y, T, name, err);
+            pt.mark(back, cs);
+            return ok;
+        };
         // ---- embeddings, broadcast to the four streams
         for (int64_t t = 0; t < T; ++t) {
             const float* row = embd_rows ? embd_rows[p0 + t] : nullptr;
@@ -972,14 +993,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     pt.mark(kPfGdn, cs);
                     float* state = ss.gdn_state + (size_t) gdn_index * gdn_floats;
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                    if (!native_proj(m.gemm, wqkv, m.mixed, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wg, m.mixed, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
+                    if (!proj(wqkv, m.mixed, m.mixed_h, m.qkv, v.name("attn_qkv.weight"), kPfGdn)) return false;
+                    if (!proj(wg, m.mixed, m.mixed_h, m.z, v.name("attn_gate.weight"), kPfGdn)) return false;
                     if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV)) return false;
                     if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV)) return false;
                     gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
                     gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
                     gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs);
-                    if (!native_proj(m.gemm, wo, m.y, m.y_h, m.bo, T, v.name("ssm_out.weight"), err)) return false;
+                    if (!proj(wo, m.y, m.y_h, m.bo, v.name("ssm_out.weight"), kPfGdn)) return false;
                     ++gdn_index;
                 } else if (half == 0) {
                     // ======================= QSA =======================
@@ -993,9 +1014,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                           *wikn = need(v, "indexer.k_norm.weight", err);
                     if (!wq || !wk || !wv || !wo || !wik || !wiq || !wqn || !wkn || !wiqn || !wikn) return false;
                     pt.mark(kPfQsa, cs);
-                    if (!native_proj(m.gemm, wk, m.mixed, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wv, m.mixed, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wq, m.mixed, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
+                    if (!proj(wk, m.mixed, m.mixed_h, m.Kc, v.name("attn_k.weight"), kPfQsa)) return false;
+                    if (!proj(wv, m.mixed, m.mixed_h, m.Vc, v.name("attn_v.weight"), kPfQsa)) return false;
+                    if (!proj(wq, m.mixed, m.mixed_h, m.Qf, v.name("attn_q.weight"), kPfQsa)) return false;
                     if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err)) return false;
                     rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, m.cs);
@@ -1121,7 +1142,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (st.kv_q4) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
                     pt.mark(kPfQsa, cs);
                     gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs);
-                    if (!native_proj(m.gemm, wo, nullptr, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;
+                    if (!proj(wo, nullptr, m.attn_h, m.bo, v.name("attn_output.weight"), kPfQsa)) return false;
                     ++qsa_index;
                 } else {
                     // ======================= MoE =======================
@@ -1135,10 +1156,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
                     // the shared expert and its scalar gate
-                    if (!native_proj(m.gemm, wsg, m.mixed, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wsu, m.mixed, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
+                    if (!proj(wsg, m.mixed, m.mixed_h, m.sgate, v.name("ffn_gate_shexp.weight"), kPfRouter)) return false;
+                    if (!proj(wsu, m.mixed, m.mixed_h, m.sup, v.name("ffn_up_shexp.weight"), kPfRouter)) return false;
                     swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
-                    if (!native_proj(m.gemm, wsd, nullptr, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
+                    if (!proj(wsd, nullptr, m.sh_h, m.shared, v.name("ffn_down_shexp.weight"), kPfRouter)) return false;
                     if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
                     m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
                     // group the (token, k) pairs by expert on the host
@@ -1438,6 +1459,25 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         }
         std::fprintf(stderr, "strata prefill timing: %lld tokens, GPU timeline %.0f ms, wall %.0f ms, host staging %.0f ms:%s\n",
                      (long long) n, total, ms_since(t_start), stats_.ms_experts_host, line.c_str());
+        // issue #41: the QSA attention (the decode kernel, attn_batch queries per launch) against the dense projections,
+        // over the prompt and per chunk - a chunk attends to every position before it, so its share grows with depth
+        auto shares = [&](const double* v, double tot, const char* what) {
+            const double attn = v[kPfQsaAttn], sel = v[kPfQsaIdx] + v[kPfQsaSel], dense = v[kPfDense];
+            auto pc = [tot](double x) { return tot > 0 ? 100.0 * x / tot : 0.0; };
+            std::fprintf(stderr, "strata prefill timing: %s GPU %.0f ms: qsa attn %.0f ms (%.1f%%), qsa indexer+select %.0f "
+                         "ms (%.1f%%), dense proj %.0f ms (%.1f%%)\n", what, tot, attn, pc(attn), sel, pc(sel), dense, pc(dense));
+        };
+        shares(pt.ms, total, "prompt,");
+        const size_t chunks = pt.by_chunk.size() / kPfCount;
+        for (size_t c = 0; chunks > 1 && c < chunks; ++c) {
+            const double* v = pt.by_chunk.data() + c * kPfCount;
+            double tot = 0.0;
+            for (int i = 0; i < kPfCount; ++i) tot += v[i];
+            const long long a = (long long) (pos0 + (int64_t) c * m.T), b = std::min<long long>(pos0 + n, a + m.T);
+            char what[96];
+            std::snprintf(what, sizeof what, "chunk %zu, positions %lld-%lld,", c, a, b - 1);
+            shares(v, tot, what);
+        }
     }
     if (std::getenv("STRATA_STATE_HASH_GDN") != nullptr) {   // debug: the GDN states as the prompt path leaves them
         cudaStreamSynchronize(m.cs);
