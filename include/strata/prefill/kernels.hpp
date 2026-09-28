@@ -27,6 +27,17 @@ void gr_mix(const float* xn, const float* gated, float* mixed, uint16_t* mixed16
 void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64_t T, void* stream);
 /// R[t, c, :] = e[t, :] for all four streams (the embedding broadcast).
 void gr_broadcast(const float* e, float* R, int64_t T, void* stream);
+/// The chain without the FP32 image of xn (P8), bit for bit the values of the three above: gr_norm_scale writes the
+/// BF16 image and the scale rs[t*4 + c] = rsqrt(mean_d R[t,c,:]^2 + eps) of each row, gr_mix_scale recomputes
+/// xn = R * rs * w_norm (R unchanged since), and gr_write_norm is gr_write followed by gr_norm_scale of the written
+/// rows with the next half's norm weight (one read of R instead of two).
+void gr_norm_scale(const float* R, const float* w_norm, float eps, float* rs, uint16_t* xn16, int64_t T, void* stream);
+void gr_mix_scale(const float* R, const float* rs, const float* w_norm, const float* gated, float* mixed,
+                  uint16_t* mixed16, int64_t T, void* stream, uint16_t* mixed_h = nullptr);
+void gr_write_norm(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
+                   float* rs, uint16_t* xn16, int64_t T, void* stream);
+/// STRATA_OLD_PREFILL_GR=1: the prompt path keeps gr_norm / gr_mix / gr_write and the FP32 xn buffer.
+bool gr_old_path();
 
 // ---- GDN (state 128, 16 k heads, 48 v heads, 10240 conv channels, 4 taps)
 /// gate[t,h] = softplus(ab[t,h] + dt[h]) * ssm_a[h];  beta[t,h] = sigmoid(ab[t, 48 + h])  (ab: [T, 96])

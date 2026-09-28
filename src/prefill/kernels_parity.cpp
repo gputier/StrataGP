@@ -7,6 +7,8 @@
 //      reference, so the two sides cannot agree on something wrong.
 //   2. gdn_recurrence (P3): 4 blocks per head + the norm pass against a block per head: y, its FP16 bits and the
 //      state after the chunk, over chunk lengths from 1 and two chunks in a row; plus a loose host reference.
+//   3. the GR chain (P8): gr_norm_scale / gr_mix_scale / gr_write_norm against gr_norm / gr_mix / gr_write /
+//      gr_norm: the BF16 xn, mixed in FP32, BF16 and FP16, the written R, then the next half's xn and mixed.
 #include "strata/prefill/kernels.hpp"
 
 #include <cuda_runtime.h>
@@ -22,7 +24,7 @@
 namespace p = strata::prefill;
 
 namespace {
-constexpr int S = 128, HK = 16, HV = 48, C = 10240;
+constexpr int S = 128, HK = 16, HV = 48, C = 10240, N = 2560, D = 4 * N;
 int g_fail = 0;
 cudaStream_t g_s = nullptr;
 void ck(cudaError_t e, const char* w) {
@@ -214,6 +216,68 @@ void test_rec(std::mt19937& rng) {
     cudaFree(st_o); cudaFree(st_n); cudaFree(h); cudaFree(gate); cudaFree(beta); cudaFree(z); cudaFree(gamma);
     cudaFree(y_o); cudaFree(y_n); cudaFree(y16_o); cudaFree(y16_n);
 }
+
+// ---------------------------------------------------------------- 3. the GR chain
+void test_gr(std::mt19937& rng) {
+    const float eps = 1e-6f;
+    const int64_t Tmax = 70;
+    const size_t nD = (size_t) Tmax * D, nN = (size_t) Tmax * N;
+    float *R_o = dalloc<float>(nD), *R_n = dalloc<float>(nD), *xn = dalloc<float>(nD), *rs = dalloc<float>((size_t) Tmax * 4);
+    uint16_t *x16_o = dalloc<uint16_t>(nD), *x16_n = dalloc<uint16_t>(nD);
+    float *gated = dalloc<float>(nD), *bo = dalloc<float>(nN), *inj = dalloc<float>((size_t) Tmax * 4);
+    float *w0 = dalloc<float>(D), *w1 = dalloc<float>(D), *mix_o = dalloc<float>(nN), *mix_n = dalloc<float>(nN);
+    uint16_t *m16_o = dalloc<uint16_t>(nN), *m16_n = dalloc<uint16_t>(nN), *mh_o = dalloc<uint16_t>(nN), *mh_n = dalloc<uint16_t>(nN);
+    h2d(w0, normal(rng, D, 0.1f, 1.0f));
+    h2d(w1, normal(rng, D, 0.1f, 1.0f));
+    for (int64_t T : {(int64_t) 1, (int64_t) 3, (int64_t) 64, Tmax}) {
+        std::vector<float> R = normal(rng, (size_t) T * D, 1.0f);
+        for (size_t i = 0; i < R.size(); i += 1001) R[i] *= 50.0f;   // outliers, as the residual stream has
+        h2d(R_o, R);
+        h2d(R_n, R);
+        h2d(gated, normal(rng, (size_t) T * D, 2.0f));
+        h2d(bo, normal(rng, (size_t) T * N, 1.0f));
+        h2d(inj, normal(rng, (size_t) T * 4, 2.0f));
+        auto fill = [&](int side) {
+            const int b = side ? 0x7f : 0xff;
+            ck(cudaMemset(side ? x16_n : x16_o, b, (size_t) T * D * 2), "memset");
+            ck(cudaMemset(side ? mix_n : mix_o, b, (size_t) T * N * 4), "memset");
+            ck(cudaMemset(side ? m16_n : m16_o, b, (size_t) T * N * 2), "memset");
+            ck(cudaMemset(side ? mh_n : mh_o, b, (size_t) T * N * 2), "memset");
+        };
+        auto cmp = [&](const char* stage) {
+            char what[96];
+            std::snprintf(what, sizeof what, "gr %s xn16", stage);
+            same(what, T, d2h(x16_o, (size_t) T * D), d2h(x16_n, (size_t) T * D));
+            std::snprintf(what, sizeof what, "gr %s mixed", stage);
+            same(what, T, d2h(mix_o, (size_t) T * N), d2h(mix_n, (size_t) T * N));
+            std::snprintf(what, sizeof what, "gr %s mixed16", stage);
+            same(what, T, d2h(m16_o, (size_t) T * N), d2h(m16_n, (size_t) T * N));
+            std::snprintf(what, sizeof what, "gr %s mixed_h", stage);
+            same(what, T, d2h(mh_o, (size_t) T * N), d2h(mh_n, (size_t) T * N));
+        };
+        // the first half: norm + mix
+        fill(0); fill(1);
+        p::gr_norm(R_o, w0, eps, xn, x16_o, T, g_s);
+        p::gr_mix(xn, gated, mix_o, m16_o, T, g_s, mh_o);
+        p::gr_norm_scale(R_n, w0, eps, rs, x16_n, T, g_s);
+        p::gr_mix_scale(R_n, rs, w0, gated, mix_n, m16_n, T, g_s, mh_n);
+        cmp("norm+mix");
+        // its write, then the next half's norm + mix
+        fill(0); fill(1);
+        p::gr_write(R_o, bo, inj, 4, T, g_s);
+        p::gr_norm(R_o, w1, eps, xn, x16_o, T, g_s);
+        p::gr_mix(xn, gated, mix_o, m16_o, T, g_s, mh_o);
+        p::gr_write_norm(R_n, bo, inj, 4, w1, eps, rs, x16_n, T, g_s);
+        p::gr_mix_scale(R_n, rs, w1, gated, mix_n, m16_n, T, g_s, mh_n);
+        same("gr write R", T, d2h(R_o, (size_t) T * D), d2h(R_n, (size_t) T * D));
+        cmp("write+norm+mix");
+    }
+    std::printf("gr chain: row scales and the fused write+norm vs gr_norm/gr_mix/gr_write, bitwise\n");
+    for (void* q : {(void*) R_o, (void*) R_n, (void*) xn, (void*) rs, (void*) x16_o, (void*) x16_n, (void*) gated,
+                    (void*) bo, (void*) inj, (void*) w0, (void*) w1, (void*) mix_o, (void*) mix_n, (void*) m16_o,
+                    (void*) m16_n, (void*) mh_o, (void*) mh_n})
+        cudaFree(q);
+}
 }  // namespace
 
 int main() {
@@ -221,6 +285,7 @@ int main() {
     std::mt19937 rng(20260928);
     test_conv(rng);
     test_rec(rng);
+    test_gr(rng);
     std::printf("prefill_kernels_parity: %s\n", g_fail ? "FAILED" : "OK");
     return g_fail ? 1 : 0;
 }

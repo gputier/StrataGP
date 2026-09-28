@@ -499,7 +499,8 @@ bool Prefill::carve(size_t T, void* alloc) {
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     bool ok = true;
-    m.emb = o.take<float>(T * N, ok); m.R = o.take<float>(T * D, ok); m.xn = o.take<float>(T * D, ok);
+    // xn: the FP32 image of the GR norm, or only its per-row scales (P8, gr_old_path() off)
+    m.emb = o.take<float>(T * N, ok); m.R = o.take<float>(T * D, ok); m.xn = o.take<float>(gr_old_path() ? T * D : T * HC, ok);
     m.xn16 = o.take<uint16_t>(T * D, ok); m.lo = o.take<float>(T * LR, ok); m.lo16 = o.take<uint16_t>(T * LR, ok);
     m.gated = o.take<float>(T * D, ok); m.inj = o.take<float>(T * HC, ok);
     m.mixed = o.take<float>(T * N, ok); m.mixed_bf = o.take<uint16_t>(T * N, ok);
@@ -609,7 +610,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
     o.take<uint8_t>(GEMM_WS, ok);
     auto f = [&](size_t n) { o.take<float>(n, ok); };
-    f(T * N); f(T * D); f(T * D); o.take<uint16_t>(T * D, ok); f(T * LR); o.take<uint16_t>(T * LR, ok);
+    f(T * N); f(T * D); f(gr_old_path() ? T * D : T * HC); o.take<uint16_t>(T * D, ok); f(T * LR); o.take<uint16_t>(T * LR, ok);
     f(T * D); f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok); f(T * N);
     o.take<int32_t>(T * strata::kernels::kStepCount, ok);
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
@@ -795,6 +796,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         cudaMemcpyHostToDevice, m.cs);
 
         int64_t qsa_index = 0, gdn_index = 0;
+        const bool old_gr = gr_old_path();
+        bool norm_ready = false;   // P8: this half's GR norm (xn16, the row scales in m.xn) came with the last write
         // step 3: this chunk's stream - every non-resident expert of every layer, layer by layer in id order (entry
         // k lands in ring slot k % ring); a copy is issued once the entry `ring` before it is consumed (its slot's
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
@@ -916,12 +919,15 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                       *wu = need(v, su.c_str(), err), *wi = need(v, si.c_str(), err);
                 if (!wn || !wd || !wu || !wi) return false;
                 pt.mark(kPfHc, cs);
-                gr_norm(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs);
+                if (old_gr) gr_norm(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs);
+                else if (!norm_ready) gr_norm_scale(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs);
+                norm_ready = false;
                 if (!bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err)) return false;
                 gr_silu(m.lo, m.lo16, T, m.cs);
                 if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err)) return false;
                 if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err)) return false;
-                gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h);
+                if (old_gr) gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h);
+                else gr_mix_scale(m.R, m.xn, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h);
 
                 if (half == 0 && !core::is_qsa_layer(g, l)) {
                     // ======================= GDN =======================
@@ -1333,8 +1339,18 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         }
                     }
                 }
-                // ---- the hyper-connection write of this half
-                gr_write(m.R, m.bo, m.inj, HC, T, m.cs);
+                // ---- the hyper-connection write of this half, and with it the next half's norm when nothing else
+                // writes R in between (not after a layer the control vector covers, not before the PLE block of layer 1)
+                const core::WeightRef* wn_next = nullptr;
+                if (!old_gr && half == 0) wn_next = v.get("hc_ffn_norm.weight");
+                else if (!old_gr && l + 1 < g.n_layers && !strata::kernels::cvec().covers(l) && !(l + 1 == 1 && ple_on))
+                    wn_next = core::LayerView(*m.wt, l + 1).get("hc_attn_norm.weight");
+                if (wn_next != nullptr) {
+                    gr_write_norm(m.R, m.bo, m.inj, HC, (const float*) wn_next->data, EPS, m.xn, m.xn16, T, m.cs);
+                    norm_ready = true;
+                } else {
+                    gr_write(m.R, m.bo, m.inj, HC, T, m.cs);
+                }
                 if (half == 1 && strata::kernels::cvec().covers(l))   // --control-vector-scaled
                     strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
             }

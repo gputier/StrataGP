@@ -111,6 +111,67 @@ __global__ void gr_broadcast_kernel(const float* __restrict__ e, float* __restri
     const int64_t t = i / D, d = i % N;
     R[i] = e[t * N + d];
 }
+// P8: the chain without the FP32 image of xn.  gr_norm_kernel's arithmetic, keeping the row's scale instead of
+// xn; gr_mix_scale_kernel recomputes xn = (R * rs) * w, the value gr_norm_kernel stores.  256 threads a row.
+__global__ void gr_norm_scale_kernel(const float* __restrict__ R, const float* __restrict__ w, float eps,
+                                     float* __restrict__ rsc, uint16_t* __restrict__ xn16) {
+    __shared__ float sh[32];
+    const int64_t row = blockIdx.x;                 // t * 4 + c
+    const int c = (int) (row % HC);
+    const float* r = R + row * N;
+    float ss = 0.0f;
+    for (int d = threadIdx.x; d < N; d += blockDim.x) ss += r[d] * r[d];
+    const float rs = rsqrtf(block_sum(ss, sh) / (float) N + eps);
+    if (threadIdx.x == 0) rsc[row] = rs;
+    for (int d = threadIdx.x; d < N; d += blockDim.x) xn16[row * N + d] = bf(r[d] * rs * w[c * N + d]);
+}
+__global__ void gr_mix_scale_kernel(const float* __restrict__ R, const float* __restrict__ rsc,
+                                    const float* __restrict__ w, const float* __restrict__ g, float* __restrict__ mixed,
+                                    uint16_t* __restrict__ mixed16, int64_t T, uint16_t* __restrict__ mixed_h) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * N) return;
+    const int64_t t = i / N, d = i % N;
+    float s = 0.0f;
+#pragma unroll
+    for (int c = 0; c < HC; ++c) {
+        const int64_t j = t * D + c * N + d;
+        s = fmaf(R[j] * rsc[t * HC + c] * w[c * N + d], sigm(g[j]), s);
+    }
+    s /= (float) HC;
+    mixed[i] = s;
+    if (mixed16) mixed16[i] = bf(s);
+    if (mixed_h) mixed_h[i] = hf(s);
+}
+// gr_write_kernel's update of a row, kept in registers, then gr_norm_scale_kernel of it (same thread-to-d map, so
+// the same sum of squares): the next half's norm without reading R again.  256 threads a row.
+constexpr int GR_THREADS = 256;
+__global__ void __launch_bounds__(GR_THREADS) gr_write_norm_kernel(float* __restrict__ R, const float* __restrict__ bo,
+                                                                   const float* __restrict__ inj, int64_t inj_ld,
+                                                                   const float* __restrict__ w, float eps,
+                                                                   float* __restrict__ rsc,
+                                                                   uint16_t* __restrict__ xn16) {
+    __shared__ float sh[32];
+    const int64_t row = blockIdx.x, t = row / HC;
+    const int c = (int) (row % HC);
+    float* r = R + row * N;
+    const float f = 2.0f * sigm(inj[t * inj_ld + c] / (float) HC);
+    float v[N / GR_THREADS];
+    float ss = 0.0f;
+#pragma unroll
+    for (int k = 0; k < N / GR_THREADS; ++k) {
+        const int d = threadIdx.x + k * GR_THREADS;
+        v[k] = fmaf(bo[t * N + d], f, r[d]);
+        r[d] = v[k];
+        ss += v[k] * v[k];
+    }
+    const float rs = rsqrtf(block_sum(ss, sh) / (float) N + eps);
+    if (threadIdx.x == 0) rsc[row] = rs;
+#pragma unroll
+    for (int k = 0; k < N / GR_THREADS; ++k) {
+        const int d = threadIdx.x + k * GR_THREADS;
+        xn16[row * N + d] = bf(v[k] * rs * w[c * N + d]);
+    }
+}
 
 // ---------------------------------------------------------------- GDN
 __global__ void gdn_gates_kernel(const float* __restrict__ ab, const float* __restrict__ dt,
@@ -593,6 +654,29 @@ void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64
 void gr_broadcast(const float* e, float* R, int64_t T, void* stream) {
     gr_broadcast_kernel<<<blocks_for(T * D), 256, 0, (cudaStream_t) stream>>>(e, R, T);
     check("gr_broadcast");
+}
+void gr_norm_scale(const float* R, const float* w_norm, float eps, float* rs, uint16_t* xn16, int64_t T, void* stream) {
+    if (T <= 0) return;
+    gr_norm_scale_kernel<<<(unsigned) (T * HC), GR_THREADS, 0, (cudaStream_t) stream>>>(R, w_norm, eps, rs, xn16);
+    check("gr_norm_scale");
+}
+void gr_mix_scale(const float* R, const float* rs, const float* w_norm, const float* gated, float* mixed,
+                  uint16_t* mixed16, int64_t T, void* stream, uint16_t* mixed_h) {
+    if (T <= 0) return;
+    gr_mix_scale_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(R, rs, w_norm, gated, mixed, mixed16, T,
+                                                                             mixed_h);
+    check("gr_mix_scale");
+}
+void gr_write_norm(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
+                   float* rs, uint16_t* xn16, int64_t T, void* stream) {
+    if (T <= 0) return;
+    gr_write_norm_kernel<<<(unsigned) (T * HC), GR_THREADS, 0, (cudaStream_t) stream>>>(R, bo, inj, inj_ld, w_norm_next,
+                                                                                      eps, rs, xn16);
+    check("gr_write_norm");
+}
+bool gr_old_path() {
+    static const bool v = env_on("STRATA_OLD_PREFILL_GR");
+    return v;
 }
 void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate, float* beta, int64_t T, void* stream) {
     gdn_gates_kernel<<<blocks_for(T * HV), 256, 0, (cudaStream_t) stream>>>(ab, dt, ssm_a, gate, beta, T);
