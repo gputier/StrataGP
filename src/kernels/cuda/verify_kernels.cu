@@ -112,6 +112,87 @@ __global__ void __launch_bounds__(256) gdn_ab_multi_kernel(const float* __restri
     }
 }
 
+// Issue #26 (O7): the same rows, one per block of four warps (96 blocks instead of 12).  All 128 threads stage the
+// row's weights in shared memory at once (4 chunks of 8 each at most), then warp w runs tokens w and w + 4: each
+// (lane, token) chain is the kernel's above - same chunks in the same order, same fmaf sequence, same butterfly and
+// epilogue - so gate and beta are bitwise its own.
+constexpr int ABM_THREADS = 128;
+constexpr int ABM_LOADS = 4;                      // n_embd <= 4 * 128 * 8 = 4096
+static_assert(kVerifyMaxT <= 2 * (ABM_THREADS / 32), "gdn_ab_multi_row_kernel runs two tokens per warp");
+
+__device__ __forceinline__ void ab_multi_out(float a, bool is_beta, int r, int t, int h_v, const float* __restrict__ dt,
+                                             const float* __restrict__ ssm_a, float* __restrict__ gate,
+                                             float* __restrict__ beta) {
+    for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+    if ((threadIdx.x & 31) != 0) return;
+    if (is_beta) {
+        beta[(size_t) t * h_v + r] = 1.0f / (1.0f + __expf(-a));
+    } else {
+        const float v = a + dt[r];
+        const float sp = v > 20.0f ? v : log1pf(__expf(v));
+        gate[(size_t) t * h_v + r] = sp * ssm_a[r];
+    }
+}
+
+__global__ void __launch_bounds__(ABM_THREADS) gdn_ab_multi_row_kernel(const float* __restrict__ x,
+                                                                       const uint16_t* __restrict__ wa,
+                                                                       const uint16_t* __restrict__ wb,
+                                                                       const float* __restrict__ dt,
+                                                                       const float* __restrict__ ssm_a,
+                                                                       float* __restrict__ gate,
+                                                                       float* __restrict__ beta, int n, int h_v,
+                                                                       int T) {
+    extern __shared__ uint4 abm_w[];              // the row: n/8 chunks of 8 bf16
+    const int n8 = n / 8;
+    const int row = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const bool is_beta = row >= h_v;
+    const int r = is_beta ? row - h_v : row;
+    const uint4* w4 = reinterpret_cast<const uint4*>((is_beta ? wb : wa) + (size_t) r * n);
+    uint4 wv[ABM_LOADS];
+#pragma unroll
+    for (int u = 0; u < ABM_LOADS; ++u) {
+        const int j = (int) threadIdx.x + u * ABM_THREADS;
+        if (j < n8) wv[u] = __ldg(w4 + j);
+    }
+#pragma unroll
+    for (int u = 0; u < ABM_LOADS; ++u) {
+        const int j = (int) threadIdx.x + u * ABM_THREADS;
+        if (j < n8) abm_w[j] = wv[u];
+    }
+    __syncthreads();
+    const int t0 = warp, t1 = warp + ABM_THREADS / 32;
+    if (t0 >= T) return;
+    const bool two = t1 < T;
+    const float* x0 = x + (size_t) t0 * n;
+    const float* x1 = x + (size_t) (two ? t1 : t0) * n;
+    float acc0 = 0.0f, acc1 = 0.0f;
+    for (int j = lane; j < n8; j += 32) {
+        const uint4 wv = abm_w[j];
+        {
+            const float4 xa = *reinterpret_cast<const float4*>(x0 + j * 8);
+            const float4 xb = *reinterpret_cast<const float4*>(x0 + j * 8 + 4);
+            float a = acc0;
+            a = fmaf(__uint_as_float(wv.x << 16), xa.x, a); a = fmaf(__uint_as_float(wv.x & 0xffff0000u), xa.y, a);
+            a = fmaf(__uint_as_float(wv.y << 16), xa.z, a); a = fmaf(__uint_as_float(wv.y & 0xffff0000u), xa.w, a);
+            a = fmaf(__uint_as_float(wv.z << 16), xb.x, a); a = fmaf(__uint_as_float(wv.z & 0xffff0000u), xb.y, a);
+            a = fmaf(__uint_as_float(wv.w << 16), xb.z, a); a = fmaf(__uint_as_float(wv.w & 0xffff0000u), xb.w, a);
+            acc0 = a;
+        }
+        if (two) {
+            const float4 xa = *reinterpret_cast<const float4*>(x1 + j * 8);
+            const float4 xb = *reinterpret_cast<const float4*>(x1 + j * 8 + 4);
+            float a = acc1;
+            a = fmaf(__uint_as_float(wv.x << 16), xa.x, a); a = fmaf(__uint_as_float(wv.x & 0xffff0000u), xa.y, a);
+            a = fmaf(__uint_as_float(wv.y << 16), xa.z, a); a = fmaf(__uint_as_float(wv.y & 0xffff0000u), xa.w, a);
+            a = fmaf(__uint_as_float(wv.z << 16), xb.x, a); a = fmaf(__uint_as_float(wv.z & 0xffff0000u), xb.y, a);
+            a = fmaf(__uint_as_float(wv.w << 16), xb.z, a); a = fmaf(__uint_as_float(wv.w & 0xffff0000u), xb.w, a);
+            acc1 = a;
+        }
+    }
+    ab_multi_out(acc0, is_beta, r, t0, h_v, dt, ssm_a, gate, beta);
+    if (two) ab_multi_out(acc1, is_beta, r, t1, h_v, dt, ssm_a, gate, beta);
+}
+
 __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __restrict__ state,
                                                                      const float* __restrict__ hbuf, int C,
                                                                      const float* __restrict__ gate,
@@ -407,8 +488,12 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
         std::fprintf(stderr, "gdn_ab_multi: invalid arguments\n");
         std::exit(1);
     }
-    gdn_ab_multi_kernel<<<(unsigned) ((2 * h_v + 7) / 8), 256, 0, (cudaStream_t) stream>>>(
-        x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
+    if (old_gdn_ab().on() || n_embd > ABM_LOADS * ABM_THREADS * 8)
+        gdn_ab_multi_kernel<<<(unsigned) ((2 * h_v + 7) / 8), 256, 0, (cudaStream_t) stream>>>(
+            x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
+    else
+        gdn_ab_multi_row_kernel<<<(unsigned) (2 * h_v), ABM_THREADS, (size_t) (n_embd / 8) * 16, (cudaStream_t) stream>>>(
+            x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
     check("gdn_ab_multi");
 }
 

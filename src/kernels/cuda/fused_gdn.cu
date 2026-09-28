@@ -1,5 +1,6 @@
 // src/kernels/cuda/fused_gdn.cu - see include/strata/kernels/fused_gdn.hpp.
 #include "strata/kernels/fused_gdn.hpp"
+#include "strata/kernels/launch_grid.hpp"
 
 #include <cuda_runtime.h>
 
@@ -122,6 +123,67 @@ __global__ void __launch_bounds__(256) gdn_ab_kernel(const float* __restrict__ x
     }
 }
 
+// Issue #26 (O7): the same rows, one per block of four warps.  The kernel above puts its 96 rows on 12 blocks (12
+// SMs of a 170-SM RTX 5090) and each lane walks its 10 chunks of 8 with a DRAM round trip every few of them.  Here
+// all 128 threads load the row and x into shared memory at once (4 chunks each at most, every load in flight
+// together), then warp 0 runs the chain above unchanged - same lane per chunk, same chunk order, same fmaf
+// sequence, same butterfly, same epilogue - so gate and beta are bitwise the warp-per-row kernel's.
+constexpr int AB_THREADS = 128;
+constexpr int AB_LOADS = 4;                       // chunks of 8 per thread: n_embd <= 4 * 128 * 8 = 4096
+
+__global__ void __launch_bounds__(AB_THREADS) gdn_ab_row_kernel(const float* __restrict__ x,
+                                                                const uint16_t* __restrict__ wa,
+                                                                const uint16_t* __restrict__ wb,
+                                                                const float* __restrict__ dt,
+                                                                const float* __restrict__ ssm_a,
+                                                                float* __restrict__ gate, float* __restrict__ beta,
+                                                                int n, int h_v) {
+    extern __shared__ uint4 ab_smem[];            // [n/8 weight chunks][n/8 x lows][n/8 x highs], 48 B per chunk
+    const int n8 = n / 8;
+    uint4* ws = ab_smem;
+    float4* xls = reinterpret_cast<float4*>(ab_smem + n8);
+    float4* xhs = xls + n8;
+    const int row = blockIdx.x;
+    const bool is_beta = row >= h_v;
+    const int r = is_beta ? row - h_v : row;
+    const uint4* w4 = reinterpret_cast<const uint4*>((is_beta ? wb : wa) + (size_t) r * n);
+    const float4* x4 = reinterpret_cast<const float4*>(x);
+    uint4 wv[AB_LOADS];
+    float4 xl[AB_LOADS], xh[AB_LOADS];
+#pragma unroll
+    for (int u = 0; u < AB_LOADS; ++u) {
+        const int j = (int) threadIdx.x + u * AB_THREADS;
+        if (j < n8) { wv[u] = __ldg(w4 + j); xl[u] = __ldg(x4 + 2 * j); xh[u] = __ldg(x4 + 2 * j + 1); }
+    }
+#pragma unroll
+    for (int u = 0; u < AB_LOADS; ++u) {
+        const int j = (int) threadIdx.x + u * AB_THREADS;
+        if (j < n8) { ws[j] = wv[u]; xls[j] = xl[u]; xhs[j] = xh[u]; }
+    }
+    __syncthreads();
+    if (threadIdx.x >= 32) return;
+    const int lane = threadIdx.x;
+    float acc = 0.0f;
+    for (int j = lane; j < n8; j += 32) {
+        const uint4 wv = ws[j];
+        const float4 xa = xls[j];
+        const float4 xb = xhs[j];
+        acc = fmaf(__uint_as_float(wv.x << 16), xa.x, acc); acc = fmaf(__uint_as_float(wv.x & 0xffff0000u), xa.y, acc);
+        acc = fmaf(__uint_as_float(wv.y << 16), xa.z, acc); acc = fmaf(__uint_as_float(wv.y & 0xffff0000u), xa.w, acc);
+        acc = fmaf(__uint_as_float(wv.z << 16), xb.x, acc); acc = fmaf(__uint_as_float(wv.z & 0xffff0000u), xb.y, acc);
+        acc = fmaf(__uint_as_float(wv.w << 16), xb.z, acc); acc = fmaf(__uint_as_float(wv.w & 0xffff0000u), xb.w, acc);
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (lane != 0) return;
+    if (is_beta) {
+        beta[r] = 1.0f / (1.0f + __expf(-acc));
+    } else {
+        const float v = acc + dt[r];
+        const float sp = v > 20.0f ? v : log1pf(__expf(v));
+        gate[r] = sp * ssm_a[r];
+    }
+}
+
 }  // namespace
 
 void fused_gdn_conv_l2(float* history, const float* qkv, const float* conv_w, float* h, int channels, int qk_heads,
@@ -141,8 +203,12 @@ void fused_gdn_ab(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
         std::fprintf(stderr, "fused_gdn_ab: invalid arguments\n");
         std::exit(1);
     }
-    gdn_ab_kernel<<<(unsigned) ((2 * h_v + 7) / 8), 256, 0, (cudaStream_t) stream>>>(x, w_alpha, w_beta, dt, ssm_a, gate,
-                                                                                     beta, n_embd, h_v);
+    if (old_gdn_ab().on() || n_embd > AB_LOADS * AB_THREADS * 8)
+        gdn_ab_kernel<<<(unsigned) ((2 * h_v + 7) / 8), 256, 0, (cudaStream_t) stream>>>(x, w_alpha, w_beta, dt, ssm_a,
+                                                                                         gate, beta, n_embd, h_v);
+    else
+        gdn_ab_row_kernel<<<(unsigned) (2 * h_v), AB_THREADS, (size_t) (n_embd / 8) * 48, (cudaStream_t) stream>>>(
+            x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::fprintf(stderr, "fused_gdn_ab: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }
