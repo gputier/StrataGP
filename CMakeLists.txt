@@ -348,6 +348,12 @@ if(STRATA_ENABLE_CUDA)
   target_link_libraries(qsa_parity PRIVATE strata_kernels CUDA::cudart)
   add_test(NAME qsa_parity COMMAND qsa_parity --selftest)
 
+  # Issue #40: the prompt path's chunked indexer append vs the per-cell kernel, bitwise (GPU, synthetic, no model).
+  add_executable(qsa_indexer_chunk_parity src/kernels/qsa_indexer_chunk_parity.cpp)
+  target_include_directories(qsa_indexer_chunk_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(qsa_indexer_chunk_parity PRIVATE strata_kernels CUDA::cudart)
+  add_test(NAME qsa_indexer_chunk_parity COMMAND qsa_indexer_chunk_parity)
+
   # ---- P2.S4: the PLE n-gram hash, the IQ4_NL table read, and the PLE block ----
   # `ngram.cpp` is host-only but lives in `strata_kernels` because `ple.cu` shares its geometry constants, and
   # splitting them across two libraries would only add a layer.

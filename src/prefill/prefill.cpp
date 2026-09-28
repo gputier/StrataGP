@@ -989,7 +989,17 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     // a query reads completed blocks (final once completed) and `dead` for its own tail block
                     const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                     pt.mark(kPfQsaIdx, cs);
-                    for (int64_t t = 0; t < T; ++t) {
+                    // issue #40: the chunk's cells p0.. in two launches (the same buffers as the per-cell loop, bit
+                    // for bit: qsa_indexer_chunk_parity); STRATA_OLD_IDX_APPEND=1 keeps the loop (the A/B)
+                    static const bool idx_per_cell = std::getenv("STRATA_OLD_IDX_APPEND") != nullptr;
+                    if (!idx_per_cell) {
+                        try {
+                            strata::kernels::native_qsa_indexer_append_chunk(m.idx_raw, T, p0, 0, (const float*) wikn->data,
+                                                                             EPS, ib, s, st.max_cells,
+                                                                             (float) strata::kernels::qsa_freq_base(), m.cs);
+                        } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
+                    }
+                    for (int64_t t = 0; idx_per_cell && t < T; ++t) {
                         const int32_t* step_t = m.steps_dev + t * strata::kernels::kStepCount;
                         try {
                             strata::kernels::native_qsa_indexer_append(m.idx_raw + t * 128, step_t + strata::kernels::kStepPos, 0,
