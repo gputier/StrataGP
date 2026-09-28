@@ -36,6 +36,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 namespace strata::core {
 namespace { bool g_shared_early = true; bool g_fused_gr = false; bool g_fast_attn = true; bool g_publish_kernel = true; bool g_fused_gdn = true; bool g_fast_select = true; }
@@ -537,7 +538,7 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
 }
 
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
-                        const QsaState* share_rope, int64_t ring_cells) {
+                        const QsaState* share_rope, int64_t ring_cells, bool with_rope) {
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
     const int64_t pages = p.pages;
@@ -583,9 +584,11 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     if (share_rope != nullptr) {
         st.cos_tab = share_rope->cos_tab;
         st.sin_tab = share_rope->sin_tab;
-    } else {
+    } else if (with_rope) {
         st.cos_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));
         st.sin_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));
+    } else {
+        st.cos_tab = st.sin_tab = nullptr;   // E4: nothing will read it (qsa_rope_table_needed)
     }
     st.step = c.take<int32_t>((uint64_t) strata::kernels::kStepCount);
     st.attention_status = c.take<int32_t>(1);
@@ -632,7 +635,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     // THE ROPE TABLE IS BUILT ON THE HOST IN FLOAT64 and uploaded once, because the reference computes its
     // frequencies in float64 and reproducing that on device means double-precision `pow`/`cos` that need not
     // agree with the host's libm.  A table shorter than the sequence would have the rotation read past it.
-    if (share_rope == nullptr) {
+    if (share_rope == nullptr && with_rope) {
         std::vector<float> hc((size_t) max_cells * (s.n_rot / 2)), hs((size_t) max_cells * (s.n_rot / 2));
         strata::kernels::build_rope_table((int) s.n_rot, strata::kernels::qsa_freq_base(), (int) max_cells,
                                           hc.data(), hs.data());
@@ -652,6 +655,11 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     }
     cudaDeviceSynchronize();
     return c.used;
+}
+
+bool qsa_rope_table_needed() {
+    static const bool keep = std::getenv("STRATA_OLD_ROPE_TABLE") != nullptr;
+    return keep || !strata::kernels::native_rope_enabled() || !strata::kernels::native_qsa_indexer_enabled();
 }
 
 void qsa_state_share_step(QsaState& st, const QsaState& owner) {
@@ -822,6 +830,7 @@ const auto normalize_rotate = [&](float* data, const WeightRef* norm, int rows, 
         if (native_qsa_enabled()) native_qsa_rms_norm_weighted(data, (const float*) norm->data, data, cols, rows, RMS_EPS, stream);
         else rms_norm_weighted(data, (const float*) norm->data, rows, cols, RMS_EPS, stream);
         if (native_rope_enabled()) native_rope_apply(data, data, rows, cols, (int) s.n_rot, (float) qsa_freq_base(), st.pos_dev, stream);
+        else if (st.cos_tab == nullptr) throw std::runtime_error("no RoPE table (E4: the session was sized without one)");
         else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, st.cos_tab, st.sin_tab, st.pos_dev, stream);
         return true;
     } catch (const std::exception& error) {
@@ -883,6 +892,9 @@ if (st.kv_q4) {
         native_qsa_indexer_append(b.idx_raw, st.step + kStepPos, pos_base,
             (const float*) w_ikn->data, RMS_EPS, ib, s, st.max_cells, (float) qsa_freq_base(), stream);
     } catch (const std::exception& error) { err = v.name("native_indexer") + ": " + error.what(); return false; }
+} else if (st.cos_tab == nullptr) {
+    err = v.name("indexer") + ": no RoPE table (E4: the session was sized without one)";
+    return false;
 } else indexer_key_append(b.idx_raw, st.pos_dev, pos_base, (const float*) w_ikn->data, RMS_EPS, ib, s,
                           st.cos_tab, st.sin_tab, stream);    }
 // ---- 6. the query projection, and the HALF-SPLIT into q and gate.

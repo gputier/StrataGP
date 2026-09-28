@@ -283,8 +283,15 @@ bool qsa_kv_q4();
 inline int qsa_kv_format(const QsaState& st) {
     return st.kv_q4 ? strata::kernels::kKvQ4 : st.kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
 }
+/// `with_rope = false` with no `share_rope` leaves the state without a table (E4: `qsa_rope_table_needed`); size it
+/// with `qsa_state_bytes(..., false)`.
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
-                        const QsaState* share_rope = nullptr, int64_t ring_cells = 0);
+                        const QsaState* share_rope = nullptr, int64_t ring_cells = 0, bool with_rope = true);
+/// E4: whether anything will read the float64-built RoPE table - the table rotation (`--native-rope` off) or the
+/// canonical indexer (`--native-qsa-indexer` off). `--native` turns both off, and the table is 64 MiB at 262K.
+/// Decided from the switches, so it must be asked after they are set and before the session is sized;
+/// `STRATA_OLD_ROPE_TABLE=1` keeps the table regardless (A/B).
+bool qsa_rope_table_needed();
 /// O6d: points `st`'s step and position buffers at `owner`'s, whose layer uploads them once per token for both.
 /// The twelve QSA layers derive them from the same position, so the values are the ones `st` would have uploaded;
 /// the owner's layer must run first in every token (the session's first QSA layer does).
