@@ -41,16 +41,15 @@ __device__ __forceinline__ float warp_max(float value) {
     for (int mask = 16; mask; mask >>= 1) value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, mask, 32));
     return value;
 }
-__launch_bounds__(256, 1)
-__global__ void route(const float* __restrict__ logits, int32_t* __restrict__ ids,
-                      float* __restrict__ weights) {
-    // Preserve the pinned 32x8 block geometry; only row zero is active here.
-    if (threadIdx.y != 0) return;
-    const int lane = threadIdx.x;
+// One token's routing by one warp.  `route` and `route_multi` both run exactly this body, so a batched row is
+// bitwise a single-token call (#19); SYNC keeps the single-token kernel's barrier where it was.
+template <bool SYNC>
+__device__ __forceinline__ void route_warp(const float* __restrict__ logits, int32_t* __restrict__ ids,
+                                           float* __restrict__ weights, const int lane) {
     float values[16];
 #pragma unroll
     for (int i = 0; i < 16; ++i) values[i] = logits[lane + i * 32];
-    __syncthreads();
+    if constexpr (SYNC) __syncthreads();
     float maximum = -INFINITY;
 #pragma unroll
     for (int i = 0; i < 16; ++i) maximum = max(maximum, values[i]);
@@ -94,6 +93,22 @@ __global__ void route(const float* __restrict__ logits, int32_t* __restrict__ id
     const float inverse_selected_sum = 1.0f / selected_sum;
     if (lane < 10) weights[lane] = selected * inverse_selected_sum;
 }
+__launch_bounds__(256, 1)
+__global__ void route(const float* __restrict__ logits, int32_t* __restrict__ ids,
+                      float* __restrict__ weights) {
+    // Preserve the pinned 32x8 block geometry; only row zero is active here.
+    if (threadIdx.y != 0) return;
+    route_warp<true>(logits, ids, weights, threadIdx.x);
+}
+// The verify window's tokens in one launch: the same 32x8 block, every row a token.  Warps share nothing (the
+// single-token kernel's barrier only ever held its one warp), so row r is `route` on row r's logits.
+__launch_bounds__(256, 1)
+__global__ void route_multi(const float* __restrict__ logits, int32_t* __restrict__ ids,
+                            float* __restrict__ weights, int n_tok) {
+    const int row = int(blockIdx.x) * int(blockDim.y) + int(threadIdx.y);
+    if (row >= n_tok) return;
+    route_warp<false>(logits + size_t(row) * 512, ids + size_t(row) * 10, weights + size_t(row) * 10, threadIdx.x);
+}
 bool valid(const void* p, size_t bytes) {
     const auto address = reinterpret_cast<uintptr_t>(p);
     return p && address % 4 == 0 && bytes <= UINTPTR_MAX - address;
@@ -111,6 +126,16 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, void
         || overlap(ids, 10 * 4, weights, 10 * 4))
         throw std::invalid_argument("native router requires a stream, aligned spans, and disjoint outputs");
     route<<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream) {
+    const size_t nl = size_t(n_tok > 0 ? n_tok : 0) * 512 * 4, nk = size_t(n_tok > 0 ? n_tok : 0) * 10 * 4;
+    if (!stream || n_tok < 1 || n_tok > 64 || !valid(logits, nl) || !valid(ids, nk) || !valid(weights, nk)
+        || overlap(logits, nl, ids, nk) || overlap(logits, nl, weights, nk) || overlap(ids, nk, weights, nk))
+        throw std::invalid_argument("native router (multi) requires a stream, 1..64 rows, aligned spans, and disjoint outputs");
+    route_multi<<<unsigned((n_tok + 7) / 8), dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(
+        logits, ids, weights, n_tok);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

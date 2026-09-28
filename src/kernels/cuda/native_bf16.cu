@@ -70,6 +70,61 @@ __global__ void bf16_f32_mmvf_kernel(const float* __restrict__ x, const uint16_t
     if (t == 0) y[blockIdx.x] = acc;
 }
 
+// The verify window's per-token loop in one launch (#19): one block per output row, as above, and one
+// accumulator per column.  Each accumulator sees exactly the single-column kernel's operations in its order -
+// the same thread owns the same pairs, the two FMAs per pair are the same explicit __fmaf_rn, then the same
+// warp and block reductions - so every column is bitwise `bf16_f32_mmvf_kernel` on that column alone.  What
+// changes is that the weight row is read once for all the columns instead of once per launch.
+template <int BLOCK_SIZE>
+__global__ void bf16_f32_mmvf_multi_kernel(const float* __restrict__ x, int64_t x_stride,
+                                          const uint16_t* __restrict__ w, float* __restrict__ y, int64_t y_stride,
+                                          int n_in, int n_tok) {
+    const int t = threadIdx.x;
+    const uint16_t* row = w + (size_t) blockIdx.x * n_in;
+    const uint32_t* weights2 = reinterpret_cast<const uint32_t*>(row);
+    __shared__ float partials[kMmvfMaxCols][32];
+    if constexpr (BLOCK_SIZE > 32) {
+        if (t < 32) {
+#pragma unroll
+            for (int j = 0; j < kMmvfMaxCols; ++j) partials[j][t] = 0.0f;
+        }
+        __syncthreads();
+    }
+    float acc[kMmvfMaxCols];
+#pragma unroll
+    for (int j = 0; j < kMmvfMaxCols; ++j) acc[j] = 0.0f;
+    for (int pair = t; pair < n_in / 2; pair += BLOCK_SIZE) {
+        const uint32_t weight = weights2[pair];
+        const float w_lo = f32_from_bf16((uint16_t) weight), w_hi = f32_from_bf16((uint16_t) (weight >> 16));
+#pragma unroll
+        for (int j = 0; j < kMmvfMaxCols; ++j) {
+            if (j < n_tok) {
+                const float2 input = reinterpret_cast<const float2*>(x + (size_t) j * x_stride)[pair];
+                acc[j] = __fmaf_rn(w_lo, input.x, acc[j]);
+                acc[j] = __fmaf_rn(w_hi, input.y, acc[j]);
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < kMmvfMaxCols; ++j) acc[j] = mmvf_warp_sum(acc[j]);
+    if constexpr (BLOCK_SIZE > 32) {
+        if ((t & 31) == 0) {
+#pragma unroll
+            for (int j = 0; j < kMmvfMaxCols; ++j) partials[j][t / 32] = acc[j];
+        }
+        __syncthreads();
+        if (t < 32) {
+#pragma unroll
+            for (int j = 0; j < kMmvfMaxCols; ++j) acc[j] = mmvf_warp_sum(partials[j][t]);
+        }
+    }
+    if (t == 0) {
+#pragma unroll
+        for (int j = 0; j < kMmvfMaxCols; ++j)
+            if (j < n_tok) y[(size_t) j * y_stride + blockIdx.x] = acc[j];
+    }
+}
+
 int mmvf_block_size(int64_t n_in) {
     int best = 32;
     int64_t best_iterations = (n_in + 63) / 64;
@@ -112,6 +167,37 @@ void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,
     const cudaError_t result = cudaGetLastError();
     if (result != cudaSuccess)
         throw std::runtime_error(std::string("bf16_gemv_fp32_mmvf launch: ") + cudaGetErrorString(result));
+}
+
+void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t x_stride, const uint16_t* w, float* y, int64_t y_stride,
+                               int64_t n_in, int64_t n_out, int n_tok, void* stream) {
+    if (n_in <= 0 || (n_in & 1) != 0 || n_in > std::numeric_limits<int>::max() ||
+        n_out <= 0 || n_out > std::numeric_limits<int>::max() || n_tok < 1 || n_tok > kMmvfMaxCols ||
+        (n_tok > 1 && (x_stride < n_in || (x_stride & 1) != 0 || y_stride < n_out)))
+        throw std::invalid_argument("bf16_gemv_fp32_mmvf_multi: require positive even n_in, positive n_out, "
+                                    "1..8 columns and even strides that do not overlap the columns");
+    if (x == nullptr || w == nullptr || y == nullptr ||
+        (reinterpret_cast<uintptr_t>(x) & 7u) != 0 ||
+        (reinterpret_cast<uintptr_t>(w) & 3u) != 0 ||
+        (reinterpret_cast<uintptr_t>(y) & 3u) != 0)
+        throw std::invalid_argument("bf16_gemv_fp32_mmvf_multi: null or misaligned pointer");
+    const cudaStream_t st = (cudaStream_t) stream;
+#define STRATA_MMVF_MULTI_CASE(N) case N: \
+    bf16_f32_mmvf_multi_kernel<N><<<(unsigned) n_out, N, 0, st>>>(x, x_stride, w, y, y_stride, (int) n_in, n_tok); break
+    switch (mmvf_block_size(n_in)) {
+        STRATA_MMVF_MULTI_CASE(32);
+        STRATA_MMVF_MULTI_CASE(64);
+        STRATA_MMVF_MULTI_CASE(96);
+        STRATA_MMVF_MULTI_CASE(128);
+        STRATA_MMVF_MULTI_CASE(160);
+        STRATA_MMVF_MULTI_CASE(192);
+        STRATA_MMVF_MULTI_CASE(224);
+        STRATA_MMVF_MULTI_CASE(256);
+    }
+#undef STRATA_MMVF_MULTI_CASE
+    const cudaError_t result = cudaGetLastError();
+    if (result != cudaSuccess)
+        throw std::runtime_error(std::string("bf16_gemv_fp32_mmvf_multi launch: ") + cudaGetErrorString(result));
 }
 
 
