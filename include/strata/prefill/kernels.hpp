@@ -11,6 +11,10 @@
 
 namespace strata::prefill {
 
+/// Which of two equivalent kernels a function runs (docs/perf/prefill-kernels.md).  `Env` is the rewrite unless the
+/// function's STRATA_OLD_PREFILL_* variable is 1; the parity test names `Old` and `New` explicitly.
+enum class KernelPath { Env, Old, New };
+
 // ---- hyper-connection (n_embd 2560, hc 4, hc_lr 320)
 /// xn[t, c*2560 + d] = R[t,c,d] * rsqrt(mean_d R[t,c,:]^2 + eps) * w_norm[c*2560 + d]; also its BF16 image.
 void gr_norm(const float* R, const float* w_norm, float eps, float* xn, uint16_t* xn16, int64_t T, void* stream);
@@ -28,8 +32,11 @@ void gr_broadcast(const float* e, float* R, int64_t T, void* stream);
 /// gate[t,h] = softplus(ab[t,h] + dt[h]) * ssm_a[h];  beta[t,h] = sigmoid(ab[t, 48 + h])  (ab: [T, 96])
 void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate, float* beta, int64_t T, void* stream);
 /// The 4-tap causal conv + SiLU over the chunk (history [C][3] in, updated to the chunk's last three inputs), then
-/// the L2 norm of the q and k heads of every token.  h: [T, C].
-void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, void* stream);
+/// the L2 norm of the q and k heads of every token.  h: [T, C].  New (P2): a thread per (channel, token) with the
+/// norm in the same kernel, then the history; Old (STRATA_OLD_PREFILL_GDN_CONV=1): a thread per channel walks the
+/// chunk.  Same bits.
+void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, void* stream,
+              KernelPath path = KernelPath::Env);
 /// The recurrence over the chunk, block per value head, state in registers; y[t] = rmsnorm(o) * gamma * sigmoid(z)
 /// (FP32 and FP16 bits: the out projection is quantized).
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,

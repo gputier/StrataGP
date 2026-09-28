@@ -53,6 +53,12 @@ void check(const char* what) {
     if (e != cudaSuccess) { std::fprintf(stderr, "prefill %s: %s\n", what, cudaGetErrorString(e)); std::exit(1); }
 }
 unsigned blocks_for(int64_t n, int t = 256) { return (unsigned) ((n + t - 1) / t); }
+bool env_on(const char* name) {
+    const char* v = std::getenv(name);
+    return v != nullptr && std::atoi(v) != 0;
+}
+// KernelPath::Env -> the rewrite, unless the function's STRATA_OLD_PREFILL_* variable (`env_old`, read once) is 1
+bool use_old(KernelPath p, bool env_old) { return p == KernelPath::Old || (p == KernelPath::Env && env_old); }
 
 // ---------------------------------------------------------------- hyper-connection
 __global__ void gr_norm_kernel(const float* __restrict__ R, const float* __restrict__ w, float eps,
@@ -144,6 +150,63 @@ __global__ void gdn_l2_kernel(float* __restrict__ h, float eps) {
     __syncthreads();
     const float ss = part[0] + part[1] + part[2] + part[3];
     x[threadIdx.x] = v * rsqrtf(ss + eps);
+}
+// P2: the conv is a 4-tap FIR, so output t needs only inputs t-3..t (the history below t = 0): block per (head of
+// 128 channels, CONV_TB tokens), a thread per channel, the tile's inputs loaded once, then the L2 norm of the 32 q/k
+// heads in the same block.  The arithmetic is gdn_conv_kernel's and gdn_l2_kernel's, in their order (same bits);
+// the history is written by gdn_conv_hist_kernel after every block has read it.
+constexpr int CONV_TB = 16;
+__global__ void __launch_bounds__(S) gdn_conv_tile_kernel(const float* __restrict__ hist, const float* __restrict__ qkv,
+                                                          const float* __restrict__ w, float* __restrict__ h, int64_t T,
+                                                          float eps) {
+    __shared__ float part[CONV_TB][4];
+    const int head = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int c = head * S + threadIdx.x;
+    const int64_t t0 = (int64_t) blockIdx.y * CONV_TB;
+    float x[CONV_TB + 3];   // inputs t0-3 .. t0+CONV_TB-1
+#pragma unroll
+    for (int j = 0; j < CONV_TB + 3; ++j) {
+        const int64_t t = t0 + j - 3;
+        x[j] = t < 0 ? hist[c * 3 + 3 + t] : (t < T ? qkv[t * C + c] : 0.0f);
+    }
+    const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
+    float o[CONV_TB];
+#pragma unroll
+    for (int j = 0; j < CONV_TB; ++j) {
+        const float v0 = x[j], v1 = x[j + 1], v2 = x[j + 2], xt = x[j + 3];
+        const float s = v0 * w0 + v1 * w1 + v2 * w2 + xt * w3;
+        o[j] = s / (1.0f + __expf(-s));
+    }
+    if (head < 2 * HK) {   // block-uniform: the q and k heads
+#pragma unroll
+        for (int j = 0; j < CONV_TB; ++j) {
+            const float v = o[j];
+            const float sq = warp_sum(v * v);
+            if (lane == 0) part[j][warp] = sq;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int j = 0; j < CONV_TB; ++j) {
+            const float ss = part[j][0] + part[j][1] + part[j][2] + part[j][3];
+            o[j] = o[j] * rsqrtf(ss + eps);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < CONV_TB; ++j)
+        if (t0 + j < T) h[(t0 + j) * C + c] = o[j];
+}
+// the chunk's last three inputs (the history's own older entries when T < 3), after gdn_conv_tile_kernel
+__global__ void gdn_conv_hist_kernel(float* __restrict__ hist, const float* __restrict__ qkv, int64_t T) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    float v[3];
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int64_t t = T - 3 + j;
+        v[j] = t >= 0 ? qkv[t * C + c] : hist[c * 3 + 3 + t];
+    }
+#pragma unroll
+    for (int j = 0; j < 3; ++j) hist[c * 3 + j] = v[j];
 }
 constexpr int RG = 4, RPG = S / RG;
 __global__ void __launch_bounds__(S * RG) gdn_rec_kernel(float* __restrict__ state, const float* __restrict__ h,
@@ -447,9 +510,19 @@ void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate
     gdn_gates_kernel<<<blocks_for(T * HV), 256, 0, (cudaStream_t) stream>>>(ab, dt, ssm_a, gate, beta, T);
     check("gdn_gates");
 }
-void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, void* stream) {
-    gdn_conv_kernel<<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, conv_w, h, T);
-    gdn_l2_kernel<<<dim3(2 * HK, (unsigned) T), S, 0, (cudaStream_t) stream>>>(h, eps);
+void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, void* stream,
+              KernelPath path) {
+    static const bool env_old = env_on("STRATA_OLD_PREFILL_GDN_CONV");
+    if (use_old(path, env_old)) {
+        gdn_conv_kernel<<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, conv_w, h, T);
+        gdn_l2_kernel<<<dim3(2 * HK, (unsigned) T), S, 0, (cudaStream_t) stream>>>(h, eps);
+        check("gdn_conv");
+        return;
+    }
+    if (T <= 0) return;
+    gdn_conv_tile_kernel<<<dim3(C / S, (unsigned) ((T + CONV_TB - 1) / CONV_TB)), S, 0, (cudaStream_t) stream>>>(
+        history, qkv, conv_w, h, T, eps);
+    gdn_conv_hist_kernel<<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, T);
     check("gdn_conv");
 }
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
