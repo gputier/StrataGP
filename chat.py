@@ -6,6 +6,12 @@
 Type a message and press Enter.  /image <path> attaches a picture to your next message (when the server was set up
 with images), /think <none|low|medium|high> sets how long the model thinks first, /reset starts a new conversation,
 /quit leaves.  Standard library only.
+
+Each answer goes back to the server with its reasoning (`reasoning_content`), as the model's template renders past
+turns: the next prompt then continues what the engine already holds, instead of making it read the last answer again
+(issue #34).  --drop-thinking sends the answers alone, as before.  Changing the thinking level with /think in the
+middle of a conversation makes the next answer read the whole conversation again (issue #33): the level is written
+at the very start of the prompt.
 """
 from __future__ import annotations
 
@@ -32,6 +38,14 @@ def stream(url, messages, think, max_tokens):
             yield d.get("reasoning_content") or "", d.get("content") or ""
 
 
+def answer_message(content: str, reasoning: str, drop_thinking: bool = False) -> dict:
+    """The answer as it goes back next turn: with its reasoning unless --drop-thinking (issue #34)."""
+    msg = {"role": "assistant", "content": content}
+    if reasoning and not drop_thinking:
+        msg["reasoning_content"] = reasoning
+    return msg
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", type=int, default=8080)
@@ -40,6 +54,8 @@ def main() -> int:
                     help="how long the model thinks before answering (none = answer directly)")
     ap.add_argument("--no-think", action="store_true", help="same as --think none")
     ap.add_argument("--max-tokens", type=int, default=4096)
+    ap.add_argument("--drop-thinking", action="store_true",
+                    help="send past answers back without their reasoning (the engine then reads each answer again)")
     a = ap.parse_args()
     url = f"http://{a.host}:{a.port}/v1/chat/completions"
     gray, reset = ("\033[90m", "\033[0m") if sys.stdout.isatty() else ("", "")
@@ -62,8 +78,10 @@ def main() -> int:
         if user.startswith("/think"):
             level = user[6:].strip().lower()
             if level in ("none", "low", "medium", "high"):
+                again = bool(messages) and level != think
                 think = level
-                print(f"(thinking: {think})")
+                print(f"(thinking: {think}" + (" - the level is written at the start of the prompt, so the next "
+                                               "answer first reads the whole conversation again)" if again else ")"))
             else:
                 print("(usage: /think none|low|medium|high)")
             continue
@@ -84,7 +102,7 @@ def main() -> int:
             pending = []
         else:
             messages.append({"role": "user", "content": user})
-        answer, n, t0 = [], 0, time.time()
+        answer, thought, n, t0 = [], [], 0, time.time()
         print("model> ", end="", flush=True)
         try:
             in_think = False
@@ -94,6 +112,7 @@ def main() -> int:
                         print(gray, end="")
                         in_think = True
                     print(reasoning, end="", flush=True)
+                    thought.append(reasoning)
                 if content:
                     if in_think:
                         print(reset + "\n", end="")
@@ -109,7 +128,7 @@ def main() -> int:
             continue
         dt = time.time() - t0
         print(f"\n{gray}[{n} chunks in {dt:.1f} s]{reset}")
-        messages.append({"role": "assistant", "content": "".join(answer)})
+        messages.append(answer_message("".join(answer), "".join(thought), a.drop_thinking))
 
 
 if __name__ == "__main__":

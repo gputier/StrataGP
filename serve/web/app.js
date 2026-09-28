@@ -927,6 +927,8 @@ $("s-share").onclick = () => $("s-share").setAttribute("aria-checked", String($(
 $("s-reset").onclick = () => loadDrawer(DEFAULTS);
 $("s-apply").onclick = async () => {
   const sel = [...$("s-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
+  // issue #33: the level is written at the start of the prompt, so a new one makes the engine read the chat again
+  const reread = messages.length > 0 && (sel ? sel.dataset.v : "high") !== settings.thinking;
   settings = {thinking: sel ? sel.dataset.v : "high", temperature: +$("s-temp").value, top_p: +$("s-topp").value,
               top_k: +$("s-topk").value, max: $("s-max").value.trim(), seed: $("s-seed").value.trim(),
               show: $("s-show").getAttribute("aria-checked") === "true",
@@ -935,6 +937,8 @@ $("s-apply").onclick = async () => {
   store.set("sampling", settings);
   const share = $("s-share").getAttribute("aria-checked") === "true";
   openDrawer(false);
+  if (reread) toast("warn", "Thinking level changed", "The next answer first re-reads the whole chat: the level is " +
+                    "written at the start of the prompt. Start a new chat to avoid it.", 6000);
   if (share || sharedOn) {
     try {
       await saveShared(share, settings);
