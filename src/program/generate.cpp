@@ -30,6 +30,7 @@
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_gdn.hpp"
+#include "strata/kernels/fused_gdn.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
@@ -210,6 +211,7 @@ struct Options {
     bool no_fast_attn = false;         ///< plan v0.3 P3 A/B: gather + one-block-per-head QSA attention
     bool no_publish_kernel = false;    ///< plan v0.3 P3 A/B: memcpy nodes for the doorbell and QSA step
     bool no_fused_gdn = false;         ///< plan v0.3 P3 A/B: llama.cpp-layout GDN step + separate out norm
+    bool gdn_state_bf16 = false;       ///< issue #53 (S5), opt-in: the GDN recurrent state stored as BF16
     bool no_fast_select = false;       ///< plan v0.3 P7 A/B: FP64 row scores + bit-serial cell top-k
     /// Plan v0.3 P4: `--expert-cache auto` sizes the VRAM tier from what is free after the weights, the session
     /// and the KV state, minus this reserve for the graphs, the hit scratch and the head.
@@ -366,6 +368,9 @@ void usage() {
                  "  --cvec-dir per-layer|single:L  each layer's own direction (default) or layer L's everywhere (project)\n"
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
+                 "  --gdn-state-bf16     opt-in (#53): keep the GDN recurrent state in BF16 (FP32 arithmetic, rounded\n"
+                 "                       at each store): half its traffic, some drift on long sequences. Needs the\n"
+                 "                       fused native GDN step (--native, not --no-fused-gdn)\n"
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
                  "                       the largest chunk up to 8192 whose buffers the expert cache can lend\n"
                  "  --no-pool            skip the CPU expert pool (the GPU-only floor)\n"
@@ -650,13 +655,54 @@ ConvStateSizes conv_state_sizes(const strata::core::ModelGeometry& g) {
     return z;
 }
 
+/// Issue #53: with the BF16 state (`--gdn-state-bf16`) a GDN layer's slice is [BF16 state | unused half | conv
+/// history], and a checkpoint keeps only the two live runs, all the states then all the histories (~61 MB instead
+/// of ~118).  `run` = the state bytes kept per layer, `slice` = the layer's stride in `gdn_state`.
+struct GdnRuns {
+    size_t slice = 0, run = 0, conv = 0;
+    bool packed = false;
+};
+
+GdnRuns gdn_runs(const strata::core::ModelGeometry& g) {
+    GdnRuns r;
+    const size_t st = (size_t) g.ssm_state_size * (size_t) g.ssm_v_heads * (size_t) g.ssm_state_size * sizeof(float);
+    r.conv = (size_t) g.ssm_conv_channels * (size_t) (g.ssm_d_conv - 1) * sizeof(float);
+    r.slice = st + r.conv;
+    r.packed = strata::kernels::gdn_state_bf16_enabled();
+    r.run = r.packed ? st / 2 : st;
+    return r;
+}
+
+/// The GDN state into a checkpoint's bytes: all of it, or the BF16 runs.
+bool gdn_state_to_host(uint8_t* h, const float* dev, const strata::core::ModelGeometry& g) {
+    const GdnRuns r = gdn_runs(g);
+    const size_t n = (size_t) g.n_gdn_layers();
+    if (!r.packed) return cudaMemcpy(h, dev, n * r.slice, cudaMemcpyDeviceToHost) == cudaSuccess;
+    const uint8_t* d = (const uint8_t*) dev;
+    return cudaMemcpy2D(h, r.run, d, r.slice, r.run, n, cudaMemcpyDeviceToHost) == cudaSuccess &&
+           cudaMemcpy2D(h + n * r.run, r.conv, d + (r.slice - r.conv), r.slice, r.conv, n, cudaMemcpyDeviceToHost) ==
+               cudaSuccess;
+}
+
+/// And back.
+bool gdn_state_to_device(float* dev, const uint8_t* h, const strata::core::ModelGeometry& g) {
+    const GdnRuns r = gdn_runs(g);
+    const size_t n = (size_t) g.n_gdn_layers();
+    if (!r.packed) return cudaMemcpy(dev, h, n * r.slice, cudaMemcpyHostToDevice) == cudaSuccess;
+    uint8_t* d = (uint8_t*) dev;
+    return cudaMemcpy2D(d, r.slice, h, r.run, r.run, n, cudaMemcpyHostToDevice) == cudaSuccess &&
+           cudaMemcpy2D(d + (r.slice - r.conv), r.slice, h + n * r.run, r.conv, r.conv, n, cudaMemcpyHostToDevice) ==
+               cudaSuccess;
+}
+
 /// Copies the running state out.  The caller has synchronized the device.
 bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
     const ConvStateSizes z = conv_state_sizes(g);
-    c.gdn.resize(z.gdn);
+    const GdnRuns r = gdn_runs(g);
+    c.gdn.resize((size_t) g.n_gdn_layers() * (r.run + r.conv));
     c.ple.resize(ss.ple_hist != nullptr ? z.ple : 0);
     c.tails.resize(z.tail * (size_t) g.n_qsa_layers());
-    if (cudaMemcpy(c.gdn.data(), ss.gdn_state, z.gdn, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+    if (!gdn_state_to_host(c.gdn.data(), ss.gdn_state, g)) return false;
     if (!c.ple.empty() && cudaMemcpy(c.ple.data(), ss.ple_hist, z.ple, cudaMemcpyDeviceToHost) != cudaSuccess)
         return false;
     for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
@@ -669,8 +715,10 @@ bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, co
 /// Puts a checkpoint's running state back; the positional cells below it are the caller's to guarantee.
 bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
     const ConvStateSizes z = conv_state_sizes(g);
-    if (c.gdn.size() != z.gdn || c.tails.size() != z.tail * (size_t) g.n_qsa_layers()) return false;
-    if (cudaMemcpy(ss.gdn_state, c.gdn.data(), z.gdn, cudaMemcpyHostToDevice) != cudaSuccess) return false;
+    const GdnRuns r = gdn_runs(g);
+    if (c.gdn.size() != (size_t) g.n_gdn_layers() * (r.run + r.conv) || c.tails.size() != z.tail * (size_t) g.n_qsa_layers())
+        return false;
+    if (!gdn_state_to_device(ss.gdn_state, c.gdn.data(), g)) return false;
     if (!c.ple.empty() && cudaMemcpy(ss.ple_hist, c.ple.data(), z.ple, cudaMemcpyHostToDevice) != cudaSuccess)
         return false;
     for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
@@ -980,6 +1028,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-fast-attn") o.no_fast_attn = true;
         else if (a == "--no-publish-kernel") o.no_publish_kernel = true;
         else if (a == "--no-fused-gdn") o.no_fused_gdn = true;
+        else if (a == "--gdn-state-bf16") o.gdn_state_bf16 = true;
         else if (a == "--no-fast-select") o.no_fast_select = true;
         else {
             // An unknown flag is an ERROR and not a warning: a typo'd `--max-neww` that silently generated 16
@@ -1226,6 +1275,15 @@ int main(int argc, char** argv) {
     strata::kernels::shared_expert_set_native_bf16(o.native_bf16_extra);
     strata::kernels::native_moe_combine_set_enabled(o.native_moe_combine);
     strata::kernels::native_gdn_set_enabled(o.native_gdn);
+    // #53: the BF16 state is known to the fused native step, the verify/commit kernels and the prompt path only
+    if (o.gdn_state_bf16 && (!o.native_gdn || o.no_fused_gdn)) {
+        std::fprintf(stderr, "strata generate: --gdn-state-bf16 needs the fused native GDN step (--native or "
+                             "--native-gdn, without --no-fused-gdn)\n");
+        return 2;
+    }
+    strata::kernels::gdn_state_bf16_set_enabled(o.gdn_state_bf16);
+    if (o.gdn_state_bf16)
+        std::fprintf(stderr, "strata generate: GDN state in BF16 (opt-in, #53): FP32 arithmetic, rounded at each store\n");
     strata::kernels::native_router_set_enabled(o.native_router);
     strata::kernels::native_qsa_set_enabled(o.native_qsa);
     strata::kernels::native_qsa_indexer_set_enabled(o.native_qsa_indexer);

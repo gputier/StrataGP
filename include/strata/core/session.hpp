@@ -32,6 +32,9 @@ struct SessionState {
 
     GdnBuffers gdn;                 ///< the 36 GDN layers share one set of scratch; their STATE is per layer
     float* gdn_state = nullptr;     ///< (n_gdn_layers, gdn_state_floats)
+    /// One layer's recurrent state in FP32: the slice `gdn` was carved with, which `gdn_point_at` leaves behind.
+    /// The prompt path widens a BF16 state into it (issue #53, `--gdn-state-bf16`); nothing else touches it.
+    float* gdn_wide = nullptr;
 
     QsaState* qsa_states = nullptr;      ///< one per QSA layer
     void* qsa_state_arena = nullptr;

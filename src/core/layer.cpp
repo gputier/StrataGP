@@ -300,6 +300,11 @@ st_begin(layer, 12, stream);
     GdnShapes gs{g.ssm_state_size, g.ssm_k_heads, g.ssm_v_heads};
     // Plan v0.3 P3: with the native contract the step and the output norm are one kernel (after the z GEMV).
     const bool fused_gdn = g_fused_gdn && native_gdn_enabled() && g.ssm_state_size == 128;
+    // #53: only the fused step reads a BF16 state; the other two would take its bits for FP32
+    if (!fused_gdn && gdn_state_bf16_enabled()) {
+        err = v.name("gdn_step") + ": --gdn-state-bf16 needs the fused native GDN step";
+        return false;
+    }
     if (!fused_gdn) try {
         if (native_gdn_enabled()) native_gdn_step(b.state, b.h, b.h + qk, b.h + 2 * qk, b.gate, b.beta, b.o, gs, stream);
         else gdn_step(b.state, b.h, b.h + qk, b.h + 2 * qk, b.gate, b.beta, b.o, gs, stream);

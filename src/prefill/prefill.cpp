@@ -9,6 +9,7 @@
 #include "strata/kernels/ple.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/fused_gdn.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/kv_stream.hpp"
@@ -940,7 +941,13 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV)) return false;
                     gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
                     gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
-                    gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs);
+                    // #53 (--gdn-state-bf16): the chunk runs in FP32 on a widened copy, rounded back once at its end
+                    const bool st16 = strata::kernels::gdn_state_bf16_enabled();
+                    const int64_t st_n = (int64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                    if (st16) strata::kernels::gdn_state_widen((const uint16_t*) state, ss.gdn_wide, st_n, m.cs);
+                    gdn_recurrence(st16 ? ss.gdn_wide : state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS,
+                                   m.y, m.y_h, T, m.cs);
+                    if (st16) strata::kernels::gdn_state_narrow(ss.gdn_wide, (uint16_t*) state, st_n, m.cs);
                     if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err)) return false;
                     ++gdn_index;
                 } else if (half == 0) {
