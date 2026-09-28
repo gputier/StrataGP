@@ -158,9 +158,29 @@ int main(int argc, char** argv) {
                     best[path] = std::fmin(best[path], now_ms() - t0);
                 }
             const double gb = (double) E * eb / 1e9;
-            std::printf("%-8s %3d %8.2f GB/s %7.2f GB/s %7.2f GB/s %+7.1f%%\n", ggml_type_name((ggml_type) type), nt,
+            std::printf("%-8s %3d %8.2f GB/s %7.2f GB/s %7.2f GB/s %+7.1f%%", ggml_type_name((ggml_type) type), nt,
                         gb / (best[2] * 1e-3), gb / (best[1] * 1e-3), gb / (best[0] * 1e-3),
                         100.0 * (best[2] / best[0] - 1.0));
+            if (nt == 1) {
+                // what the engine runs for a single token (native_gu_rows): ggml-cpu's own vec_dot
+                const auto* tc = ggml_get_type_traits_cpu((ggml_type) type);
+                double bg = 1e30;
+                for (int rep = 0; rep < 7; ++rep) {
+                    const double t0 = now_ms();
+                    for (int e = 0; e < E; ++e) {
+                        const uint8_t* wb = w.data() + (size_t) e * eb;
+                        for (int r = 0; r < ROWS; ++r) {
+                            float g = 0.f, u = 0.f;
+                            tc->vec_dot(N, &g, 0, wb + (size_t) r * rb, 0, act[0], 0, 1);
+                            tc->vec_dot(N, &u, 0, wb + (size_t) (ROWS + r) * rb, 0, act[0], 0, 1);
+                            ff[(size_t) r] = (g / (1.f + std::exp(-g))) * u;
+                        }
+                    }
+                    bg = std::fmin(bg, now_ms() - t0);
+                }
+                std::printf("   (ggml vec_dot, one token: %.2f GB/s)", gb / (bg * 1e-3));
+            }
+            std::printf("\n");
         }
     }
     cpu::iq512_set_path(0);

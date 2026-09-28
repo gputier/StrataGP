@@ -241,7 +241,9 @@ private:
     struct SplitBufMulti {
         alignas(64) float ff[MAXT][FF];
         ActQ a2[MAXT];
-        alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // plan v0.3 P6: native down activations
+        // plan v0.3 P6: native down activations.  O8d (#30): one line more than kNativeHBytes apart, so tokens t and
+        // t + 4 are not exactly 4 KB apart (the same L1 set) as they were
+        alignas(64) uint8_t hq[MAXT][kNativeHBytes + 64];
     };
     const NativeFmt* nfmt_ = nullptr;
     std::vector<SplitBufMulti> split_multi_;
