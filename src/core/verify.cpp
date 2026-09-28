@@ -52,7 +52,8 @@ const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
 
 // #19 / #44: the window's per-token launches batched (router, indexer projections, shared expert, combination),
 // each token bitwise the loop it replaces.  STRATA_OLD_WINDOW=1 records the loops again, STRATA_OLD_WINDOW_<PART>=1
-// one part (ROUTE, INDEXER, SHARED, COMBINE), for an A/B on the GPU.  Read once: a captured window keeps its choice.
+// one part (ROUTE, INDEXER, QSA, SHARED, COMBINE), for an A/B on the GPU.  Read once: a captured window keeps its
+// choice.
 bool env_on(const char* name) {
     const char* e = std::getenv(name);
     return e != nullptr && *e != '\0' && *e != '0';
@@ -60,6 +61,7 @@ bool env_on(const char* name) {
 const bool g_old_window = env_on("STRATA_OLD_WINDOW");
 const bool g_old_route = g_old_window || env_on("STRATA_OLD_WINDOW_ROUTE");
 const bool g_old_indexer = g_old_window || env_on("STRATA_OLD_WINDOW_INDEXER");
+const bool g_old_qsa = g_old_window || env_on("STRATA_OLD_WINDOW_QSA");   // the q split, norm, rotation and gate
 const bool g_old_shared = g_old_window || env_on("STRATA_OLD_WINDOW_SHARED");
 const bool g_old_combine = g_old_window || env_on("STRATA_OLD_WINDOW_COMBINE");
 // #44 (HYPOTHESIS, opt-in): the CPU only writes y_miss and the GPU reads its CPU rows once, so write-combined
@@ -490,15 +492,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                               (float) qsa_freq_base(), cs);
                 native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD),
                             n, cs);
-                for (int t = tb; t < te; ++t) {
+                // #19: the group's n * NH query heads are rows of one pitch in qfull_ and in qcur_, and the norm, the
+                // rotation (a position per row: pos_ holds NH per token) and the FWHT are all per row - so one copy
+                // node and one launch each, bitwise the per-token ones
+                const int q_tok = g_old_qsa ? 1 : n;
+                for (int t = tb; t < te; t += q_tok) {
                     float* qc = qcur_ + t * NH * HD;
                     if (cudaMemcpy2DAsync(qc, (size_t) HD * 4, qfull_ + t * NH * 2 * HD, (size_t) HD * 2 * 4,
-                                          (size_t) HD * 4, (size_t) NH, cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+                                          (size_t) HD * 4, (size_t) (q_tok * NH), cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
                         err = "verify: the q/gate split failed";
                         return false;
                     }
-                    norm_rope(qc, wqn, (int) NH, (int) HD, pos_ + t * NH);
-                    if (st.kv_q4) fwht256_inplace_cuda(qc, NH, cs);   // <Hq, Hk> = <q, k>
+                    norm_rope(qc, wqn, (int) (q_tok * NH), (int) HD, pos_ + t * NH);
+                    if (st.kv_q4) fwht256_inplace_cuda(qc, (int64_t) q_tok * NH, cs);   // <Hq, Hk> = <q, k>
                 }
                 if (!g_old_indexer)   // #19: every column first; each token's norm and rotation touch only its own
                     bf16_gemv_fp32_mmvf_multi(xm, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID, N,
@@ -519,12 +525,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_,
                                       s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
                 if (st.kv_q4) fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t) n * NH, cs);   // back: H^-1 = H
-                for (int t = tb; t < te; ++t) {
-                    if (native_qsa_enabled())
+                for (int t = tb; t < te; t += q_tok) {   // #19: elementwise over heads, so n * NH heads at once
+                    if (native_qsa_enabled()) {
                         native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD,
-                                              (int) NH, (int) HD, cs);
-                    else
-                        qsa_gate_apply_f32(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, s, attn32_ + t * NH * HD, cs);
+                                              (int) (q_tok * NH), (int) HD, cs);
+                    } else {
+                        QsaShapes sg = s;
+                        sg.n_head = s.n_head * q_tok;
+                        qsa_gate_apply_f32(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, sg, attn32_ + t * NH * HD, cs);
+                    }
                 }
                 native_quantize_q8_1(attn32_ + tb * NH * HD, xq_, (int) (NH * HD), n, cs);
                 native_mmvq(wo->native_type, wo->native_data, xq_, bo_ + tb * N, (int) (NH * HD), (int) N, n, cs);

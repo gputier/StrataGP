@@ -12,14 +12,21 @@
 //   4. shared_expert_multi_batched     vs shared_expert_multi (native and BF16 gate): the gated output and the
 //                                      Q8_1 of the SwiGLU; then deferred gate + window combine vs the old chain
 //                                      end to end, for both combine kernels
+//   5. the QSA query rows              the q/gate split copy, norm, rotation, FWHT and output gate over a group's
+//                                      heads in one call each vs per token (native and legacy kernels)
 
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/native_moe.hpp"
+#include "strata/kernels/native_qsa.hpp"
+#include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/native_router.hpp"
+#include "strata/kernels/qsa.hpp"
+#include "strata/kernels/rope.hpp"
 #include "strata/kernels/router_top10.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/shared_expert.hpp"
@@ -345,6 +352,69 @@ void test_shared(std::mt19937& rng) {
     cudaFree(gate); cudaFree(upb); cudaFree(g1); cudaFree(g2); cudaFree(s1); cudaFree(s2);
 }
 
+// ---------------------------------------------------------------- 5. the QSA query rows and the output gate
+// The window now treats a group's n * NH query heads as rows of one pitch: one q/gate split copy, one norm, one
+// rotation (a position per row), one FWHT and one output gate.  Each kernel is per row (or per element), so the
+// batched call must equal the per-token calls bit for bit - native and legacy variants both.
+void test_qsa_rows(std::mt19937& rng) {
+    std::printf("the QSA query rows (split, norm, rotation, FWHT) and the output gate, a group vs per token\n");
+    const k::QsaShapes s = k::qsa_real_shapes();
+    const int NH = (int) s.n_head, HD = (int) s.head_dim, NR = (int) s.n_rot, MAXT = 8, MAXPOS = 4096;
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> qfull((size_t) MAXT * NH * 2 * HD), attn((size_t) MAXT * NH * HD), wn((size_t) HD);
+    for (auto& v : qfull) v = nd(rng) * 2.0f;
+    for (auto& v : attn) v = nd(rng);
+    for (auto& v : wn) v = 1.0f + 0.1f * nd(rng);
+    std::vector<int32_t> pos((size_t) MAXT * NH);
+    for (int t = 0; t < MAXT; ++t)
+        for (int h = 0; h < NH; ++h) pos[(size_t) (t * NH + h)] = 1000 + 37 * t;
+    std::vector<float> cos_tab((size_t) MAXPOS * (NR / 2)), sin_tab((size_t) MAXPOS * (NR / 2));
+    k::build_rope_table(NR, k::qsa_freq_base(), MAXPOS, cos_tab.data(), sin_tab.data());
+    float *dq = dalloc<float>(qfull.size()), *da = dalloc<float>(attn.size()), *dwn = dalloc<float>(wn.size());
+    float *dcos = dalloc<float>(cos_tab.size()), *dsin = dalloc<float>(sin_tab.size());
+    int32_t* dpos = dalloc<int32_t>(pos.size());
+    up(dq, qfull); up(da, attn); up(dwn, wn); up(dcos, cos_tab); up(dsin, sin_tab); up(dpos, pos);
+    const size_t qn = (size_t) MAXT * NH * HD;
+    float *q1 = dalloc<float>(qn), *q2 = dalloc<float>(qn), *g1 = dalloc<float>(qn), *g2 = dalloc<float>(qn);
+    // the rows of `rows_tok` tokens starting at token t, exactly as the window records them
+    auto rows = [&](float* qc, float* gc, int t, int rows_tok, bool native) {
+        const int r = rows_tok * NH;
+        ck(cudaMemcpy2DAsync(qc + (size_t) t * NH * HD, (size_t) HD * 4, dq + (size_t) t * NH * 2 * HD, (size_t) HD * 2 * 4,
+                             (size_t) HD * 4, (size_t) r, cudaMemcpyDeviceToDevice, g_cs), "split");
+        float* x = qc + (size_t) t * NH * HD;
+        if (native) {
+            k::native_qsa_rms_norm_weighted(x, dwn, x, HD, r, k::qsa_rms_eps(), g_cs);
+            k::native_rope_apply(x, x, r, HD, NR, (float) k::qsa_freq_base(), dpos + t * NH, g_cs);
+        } else {
+            k::rms_norm_weighted(x, dwn, r, HD, k::qsa_rms_eps(), g_cs);
+            k::rope_neox_apply(x, x, r, HD, NR, dcos, dsin, dpos + t * NH, g_cs);
+        }
+        k::fwht256_inplace_cuda(x, r, g_cs);
+        if (native) {
+            k::native_qsa_gate_apply(da + (size_t) t * NH * HD, dq + (size_t) t * NH * 2 * HD, gc + (size_t) t * NH * HD, r,
+                                     HD, g_cs);
+        } else {
+            k::QsaShapes sg = s;
+            sg.n_head = s.n_head * rows_tok;
+            k::qsa_gate_apply_f32(da + (size_t) t * NH * HD, dq + (size_t) t * NH * 2 * HD, sg, gc + (size_t) t * NH * HD,
+                                  g_cs);
+        }
+    };
+    for (int native = 0; native < 2; ++native) {
+        bool ok = true;
+        for (int n : {1, 2, 5, 8}) {
+            for (float* p : {q1, q2, g1, g2}) ck(cudaMemset(p, 0, qn * 4), "m");
+            const int tb = n == 8 ? 0 : 1;   // a group need not start at token 0 (the split window's B)
+            for (int t = tb; t < tb + n && t < MAXT; ++t) rows(q1, g1, t, 1, native != 0);
+            rows(q2, g2, tb, std::min(n, MAXT - tb), native != 0);
+            ok = ok && same(down(q1, qn), down(q2, qn)) && same(down(g1, qn), down(g2, qn));
+        }
+        check(ok, std::string(native ? "native" : "legacy") + " norm/rotation/FWHT and output gate, groups of 1..8");
+    }
+    cudaFree(dq); cudaFree(da); cudaFree(dwn); cudaFree(dcos); cudaFree(dsin); cudaFree(dpos);
+    cudaFree(q1); cudaFree(q2); cudaFree(g1); cudaFree(g2);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -357,6 +427,7 @@ int main(int argc, char** argv) {
         test_router(rng);
         test_combine(rng);
         test_shared(rng);
+        test_qsa_rows(rng);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "window_batch_parity: %s\n", e.what());
         return 2;
