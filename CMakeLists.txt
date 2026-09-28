@@ -311,6 +311,12 @@ if(STRATA_ENABLE_CUDA)
   target_link_libraries(fused_gr_parity PRIVATE strata_kernels CUDA::cudart)
   add_test(NAME fused_gr_parity COMMAND fused_gr_parity --selftest)
 
+  # issue #8: block scores, block top-k and split-K decode attention (FP16/INT8/Q4_0 pools) against float64
+  add_executable(qsa_decode_parity src/kernels/qsa_decode_parity.cpp)
+  target_include_directories(qsa_decode_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(qsa_decode_parity PRIVATE strata_kernels CUDA::cudart)
+  add_test(NAME qsa_decode_parity COMMAND qsa_decode_parity --selftest)
+
   add_executable(s2_gemv_q8_parity src/kernels/s2_gemv_q8_parity.cpp)
   target_include_directories(s2_gemv_q8_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(s2_gemv_q8_parity PRIVATE strata_kernels CUDA::cudart)
