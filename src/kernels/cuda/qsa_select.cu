@@ -1,6 +1,7 @@
 // src/kernels/cuda/qsa_select.cu - see include/strata/kernels/qsa_select.hpp.
 #include "strata/kernels/qsa_select.hpp"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <atomic>
@@ -23,8 +24,23 @@ __device__ __forceinline__ uint32_t order_key(float s) {
     return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
 }
 
-__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_kernel(const float* __restrict__ pooled,
-                                                                        const float* __restrict__ dead,
+// Four dimensions of a key row for one lane: the fp32 row, or (O6, #21) its fp16 shadow widened exactly.
+__device__ __forceinline__ float4 key4(const float* key, int lane) {
+    return *reinterpret_cast<const float4*>(key + lane * 4);
+}
+__device__ __forceinline__ float4 key4(const uint16_t* key, int lane) {
+    const uint2 raw = *reinterpret_cast<const uint2*>(key + lane * 4);
+    return make_float4(__half2float(__ushort_as_half((unsigned short) (raw.x & 0xffffu))),
+                       __half2float(__ushort_as_half((unsigned short) (raw.x >> 16))),
+                       __half2float(__ushort_as_half((unsigned short) (raw.y & 0xffffu))),
+                       __half2float(__ushort_as_half((unsigned short) (raw.y >> 16))));
+}
+
+// `KEY` float: the fp32 keys.  `KEY` uint16_t: the fp16 shadow (256 B per block instead of 512), the same arithmetic
+// on the widened values - so its scores are exactly the fp32 path's on keys rounded to fp16.
+template <typename KEY>
+__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_kernel(const KEY* __restrict__ pooled,
+                                                                        const KEY* __restrict__ dead,
                                                                         const float* __restrict__ q_idx,
                                                                         const int32_t* __restrict__ steps,
                                                                         int64_t max_blocks, float* __restrict__ out) {
@@ -34,8 +50,8 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_kernel(const fl
     const int64_t b = (int64_t) blockIdx.x * SCORE_WARPS + (threadIdx.x >> 5);
     if (b > n_bid || b >= max_blocks) return;
     const int lane = threadIdx.x & 31;
-    const float* key = (b == n_bid) ? dead : pooled + b * IDX_DIM;
-    const float4 k4 = *reinterpret_cast<const float4*>(key + lane * 4);
+    const KEY* key = (b == n_bid) ? dead : pooled + b * IDX_DIM;
+    const float4 k4 = key4(key, lane);
     const float* q = q_idx + qi * IDX_HEADS * IDX_DIM + lane * 4;
     float score = 0.0f;
 #pragma unroll
@@ -316,20 +332,40 @@ __global__ void __launch_bounds__(TOPK2_T) block_topk2_kernel(const float* __res
 
 std::atomic<int> g_topk_old{-1};   // STRATA_OLD_TOPK, read once unless a test sets it
 
+void launch_scores_check(const QsaShapes& s, int64_t nq, const char* who) {
+    if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || nq > 65535) {
+        std::fprintf(stderr, "%s: unsupported indexer geometry\n", who);
+        std::exit(1);
+    }
+}
+
 }  // namespace
 
 void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
                       int64_t max_blocks, const QsaShapes& s, float* scores, void* stream) {
     if (nq <= 0) return;
-    if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || nq > 65535) {
-        std::fprintf(stderr, "qsa_block_scores: unsupported indexer geometry\n");
+    launch_scores_check(s, nq, "qsa_block_scores");
+    const dim3 grid((unsigned) ((max_blocks + SCORE_WARPS - 1) / SCORE_WARPS), (unsigned) nq);
+    block_scores_kernel<float><<<grid, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(pooled, dead, q_idx, steps,
+                                                                                     max_blocks, scores);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores: %s\n", cudaGetErrorString(e)); std::exit(1); }
+}
+
+void qsa_block_scores_f16(const uint16_t* pooled16, const uint16_t* dead16, const float* q_idx, const int32_t* steps,
+                          int64_t nq, int64_t max_blocks, const QsaShapes& s, float* scores, void* stream) {
+    if (nq <= 0) return;
+    launch_scores_check(s, nq, "qsa_block_scores_f16");
+    if (pooled16 == nullptr || dead16 == nullptr || reinterpret_cast<uintptr_t>(pooled16) % 8 != 0 ||
+        reinterpret_cast<uintptr_t>(dead16) % 8 != 0) {
+        std::fprintf(stderr, "qsa_block_scores_f16: the fp16 shadow is not allocated or not 8-byte aligned\n");
         std::exit(1);
     }
     const dim3 grid((unsigned) ((max_blocks + SCORE_WARPS - 1) / SCORE_WARPS), (unsigned) nq);
-    block_scores_kernel<<<grid, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(pooled, dead, q_idx, steps, max_blocks,
-                                                                              scores);
+    block_scores_kernel<uint16_t><<<grid, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(pooled16, dead16, q_idx,
+                                                                                        steps, max_blocks, scores);
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_f16: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }
 
 bool qsa_block_topk_old() {

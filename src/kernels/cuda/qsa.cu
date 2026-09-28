@@ -156,7 +156,8 @@ __global__ void indexer_key_append_kernel(const float* __restrict__ raw, const i
                                           float* __restrict__ tail, float* __restrict__ dead,
                                           float* __restrict__ pooled, int32_t* __restrict__ block_pos,
                                           int idx_dim, int r, int n_rot, const float* __restrict__ cos_tab,
-                                          const float* __restrict__ sin_tab, const int32_t* __restrict__ mtab) {
+                                          const float* __restrict__ sin_tab, const int32_t* __restrict__ mtab,
+                                          uint16_t* __restrict__ pooled16, uint16_t* __restrict__ dead16) {
     extern __shared__ double s_mean[];   // idx_dim doubles
     const int d = threadIdx.x;
     const int pos = (int) __ldg(pos_dev);
@@ -188,6 +189,10 @@ __global__ void indexer_key_append_kernel(const float* __restrict__ raw, const i
         // rope at position 0 is the identity here (cos = 1, sin = 0 exactly), so no rotation is applied and
         // the parity test asserts the value is bit-exact - which is what makes skipping it legitimate.
         pooled[d] = dead[d];
+        if (pooled16 != nullptr) {   // O6: the fp16 shadow of every row written here
+            dead16[d] = f16_from_f32(dead[d]);
+            pooled16[d] = dead16[d];
+        }
     }
 
     if (slot != r - 1) return;
@@ -231,6 +236,11 @@ __global__ void indexer_key_append_kernel(const float* __restrict__ raw, const i
         // what this project keeps finding written down wrong.
         rope_neox_pair(row[d], row[half + d], cos_tab[toff + d], sin_tab[toff + d], row[d], row[half + d]);
     }
+    if (pooled16 == nullptr) return;
+    // O6: the fp16 shadow of the two rows written above, once the rotation has finished with this one
+    __syncthreads();
+    pooled16[(size_t) b * idx_dim + d] = f16_from_f32(pooled[(size_t) b * idx_dim + d]);
+    pooled16[(size_t) (b + 1) * idx_dim + d] = f16_from_f32(dead[d]);
 }
 
 // ================= 3. qsa_index =================
@@ -712,6 +722,8 @@ void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_ba
     if (pos_dev == nullptr) fail("indexer_key_append: pos_dev is null");
     if (b.tail == nullptr || b.dead == nullptr || b.pooled == nullptr || b.block_pos == nullptr)
         fail("indexer_key_append: the indexer buffers are not all set (tail/dead/pooled/block_pos)");
+    if ((b.pooled16 == nullptr) != (b.dead16 == nullptr))
+        fail("indexer_key_append: the fp16 shadow needs both pooled16 and dead16");
     const int threads = (int) s.idx_dim;
     const size_t smem = (size_t) s.idx_dim * sizeof(double);
     // **ONE LAUNCH, NO HOST BRANCH ON THE POSITION.**  The completion rotation is inside the kernel now.  The
@@ -719,7 +731,7 @@ void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_ba
     // be captured and replayed, and the position arrives through `pos_dev` like every other kernel's data.
     indexer_key_append_kernel<<<1, threads, smem, (cudaStream_t) stream>>>(
         raw, pos_dev, (int) pos_base, w_k_norm, eps, b.tail, b.dead, b.pooled, b.block_pos, (int) s.idx_dim,
-        (int) s.idx_block, (int) s.n_rot, cos_tab, sin_tab, mrope_table());
+        (int) s.idx_block, (int) s.n_rot, cos_tab, sin_tab, mrope_table(), b.pooled16, b.dead16);
     check_launch("indexer_key_append");
     if (stream == nullptr) check_sync("indexer_key_append");
 }

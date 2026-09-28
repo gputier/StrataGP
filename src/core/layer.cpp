@@ -177,6 +177,23 @@ void qsa_set_kv_int8(bool enabled) { g_kv_int8 = enabled; }
 bool qsa_kv_int8() { return g_kv_int8; }
 void qsa_set_kv_q4(bool enabled) { g_kv_q4 = enabled; }
 bool qsa_kv_q4() { return g_kv_q4; }
+namespace { bool g_idx_fp16 = false; }
+void qsa_set_idx_fp16(bool enabled) { g_idx_fp16 = enabled; }
+bool qsa_idx_fp16() { return g_idx_fp16; }
+strata::kernels::QsaIndexerBuffers qsa_indexer_buffers(const QsaState& st) {
+    strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+    ib.pooled16 = st.idx_pooled16;
+    ib.dead16 = st.idx_dead16;
+    return ib;
+}
+void qsa_index_scores(const QsaState& st, const float* q_idx, const int32_t* steps, int64_t nq, int64_t max_blocks,
+                      const strata::kernels::QsaShapes& s, float* scores, void* stream) {
+    if (st.idx_pooled16 != nullptr)
+        strata::kernels::qsa_block_scores_f16(st.idx_pooled16, st.idx_dead16, q_idx, steps, nq, max_blocks, s, scores,
+                                              stream);
+    else
+        strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, q_idx, steps, nq, max_blocks, s, scores, stream);
+}
 uint64_t gdn_buffers_bytes(const ModelGeometry& g) {    const int64_t C = g.ssm_conv_channels;    const int64_t V = g.ssm_value_dim;    const uint64_t parts[] = {        q8k_bytes(g.n_embd),
 // x_q8k
 (uint64_t) (g.n_embd / 32) * 34,
@@ -530,6 +547,7 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
     n += (uint64_t) s.idx_dim * 4;                                             // dead
     n += (uint64_t) p.pooled_rows * s.idx_dim * 4;                             // pooled
     n += 16;                                                                   // block_pos
+    if (g_idx_fp16) n += (uint64_t) (p.pooled_rows + 1) * s.idx_dim * 2 + 2 * 16;   // O6: fp16 shadow + dead16
     if (with_rope) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;          // cos + sin tables
     n += strata::kernels::qsa_step_bytes() + 16;                               // counts and aligned attention status
     n += (uint64_t) s.n_head * 4;                                              // pos_dev
@@ -580,6 +598,8 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.idx_pooled_rows = p.pooled_rows;
     st.idx_pooled = c.take<float>((uint64_t) p.pooled_rows * s.idx_dim);
     st.idx_block_pos = c.take<int32_t>(1);
+    st.idx_pooled16 = g_idx_fp16 ? c.take<uint16_t>((uint64_t) p.pooled_rows * s.idx_dim) : nullptr;
+    st.idx_dead16 = g_idx_fp16 ? c.take<uint16_t>((uint64_t) s.idx_dim) : nullptr;
     if (share_rope != nullptr) {
         st.cos_tab = share_rope->cos_tab;
         st.sin_tab = share_rope->sin_tab;
@@ -677,6 +697,10 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_pooled, 0, (size_t) st.idx_pooled_rows * s.idx_dim * 4, cs);
+    if (st.idx_pooled16 != nullptr) {   // fp16 zero is all-zero bits: the shadow stays f16(pooled)
+        cudaMemsetAsync(st.idx_pooled16, 0, (size_t) st.idx_pooled_rows * s.idx_dim * 2, cs);
+        cudaMemsetAsync(st.idx_dead16, 0, (size_t) s.idx_dim * 2, cs);
+    }
 }
 
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {
@@ -867,7 +891,7 @@ if (st.kv_q4) {
     strata::kernels::fwht256_inplace_cuda(b.kcur, g.n_head_kv, stream);   // Q4_0: rotated K and V (kv_q4.hpp)
     strata::kernels::fwht256_inplace_cuda(b.vcur, g.n_head_kv, stream);
     strata::kernels::kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);
-} else if (st.kv_int8) kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);    else kv_append_step(st.k_pool, st.v_pool, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);    {        const uint64_t nvk = (uint64_t) g.n_head_kv * g.head_dim;        const uint64_t base = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim + 2 * nvk + 8;        if (!st.kv_int8) dump_slot(dump, g, layer, (const float*) st.k_pool, base, nvk / 2, stream);        if (!st.kv_int8) dump_slot(dump, g, layer, (const float*) st.v_pool, base + nvk / 2, nvk / 2, stream);        dump_slot(dump, g, layer, b.vcur, base + nvk, nvk, stream);        dump_slot(dump, g, layer, b.kcur, base + 2 * nvk, nvk, stream);    }    {        const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};        if (native_qsa_indexer_enabled()) {
+} else if (st.kv_int8) kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);    else kv_append_step(st.k_pool, st.v_pool, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);    {        const uint64_t nvk = (uint64_t) g.n_head_kv * g.head_dim;        const uint64_t base = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim + 2 * nvk + 8;        if (!st.kv_int8) dump_slot(dump, g, layer, (const float*) st.k_pool, base, nvk / 2, stream);        if (!st.kv_int8) dump_slot(dump, g, layer, (const float*) st.v_pool, base + nvk / 2, nvk / 2, stream);        dump_slot(dump, g, layer, b.vcur, base + nvk, nvk, stream);        dump_slot(dump, g, layer, b.kcur, base + 2 * nvk, nvk, stream);    }    {        const QsaIndexerBuffers ib = qsa_indexer_buffers(st);        if (native_qsa_indexer_enabled()) {
     try {
         native_qsa_indexer_append(b.idx_raw, st.step + kStepPos, pos_base,
             (const float*) w_ikn->data, RMS_EPS, ib, s, st.max_cells, (float) qsa_freq_base(), stream);
@@ -894,7 +918,7 @@ if (!normalize_rotate(b.q_idx, w_iqn, (int) g.idx_q_heads, (int) g.idx_key_dim))
 int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
     if (g_fast_select) {
         // Plan v0.3 P7: block-level FP32 scores and a radix selection over blocks (qsa_select.hpp).
-        qsa_block_scores(st.idx_pooled, st.idx_dead, b.q_idx, st.step, 1, max_blocks, s, b.cell_scores, stream);
+        qsa_index_scores(st, b.q_idx, st.step, 1, max_blocks, s, b.cell_scores, stream);   // O6: fp16 when opted in
         qsa_block_topk(b.cell_scores, st.step, 1, max_blocks, cap, s, b.ids, stream);
     } else {
     qsa_index_step(st.idx_pooled, b.q_idx, nullptr, s, st.step, max_blocks, b.cell_scores, stream);    topk_512_step(b.cell_scores, s, cap, st.step, b.ids, stream);

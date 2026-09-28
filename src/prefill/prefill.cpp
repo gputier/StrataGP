@@ -987,7 +987,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     rope(m.q_idx, T, 4, 128, 512, p0, (float) strata::kernels::qsa_freq_base(), m.cs);
                     // the indexer appends, token by token; then scores + selection for many queries at once:
                     // a query reads completed blocks (final once completed) and `dead` for its own tail block
-                    const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+                    const strata::kernels::QsaIndexerBuffers ib = core::qsa_indexer_buffers(st);
                     pt.mark(kPfQsaIdx, cs);
                     for (int64_t t = 0; t < T; ++t) {
                         const int32_t* step_t = m.steps_dev + t * strata::kernels::kStepCount;
@@ -1001,8 +1001,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     for (int64_t t0 = 0; t0 < T; t0 += m.sel_batch) {
                         const int64_t nb = std::min(m.sel_batch, T - t0);
                         const int32_t* steps0 = m.steps_dev + t0 * strata::kernels::kStepCount;
-                        strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
-                                                          m.max_blocks, s, m.sel_scores, m.cs);
+                        core::qsa_index_scores(st, m.q_idx + t0 * 512, steps0, nb, m.max_blocks, s, m.sel_scores,
+                                               m.cs);   // O6: from the fp16 shadow when opted in
                         strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                                         m.sel_ids + t0 * m.cap, m.cs);
                     }

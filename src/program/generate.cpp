@@ -211,6 +211,7 @@ struct Options {
     bool no_publish_kernel = false;    ///< plan v0.3 P3 A/B: memcpy nodes for the doorbell and QSA step
     bool no_fused_gdn = false;         ///< plan v0.3 P3 A/B: llama.cpp-layout GDN step + separate out norm
     bool no_fast_select = false;       ///< plan v0.3 P7 A/B: FP64 row scores + bit-serial cell top-k
+    bool idx_fp16 = false;             ///< O6 (#21): block scores from the fp16 shadow of the pooled keys (opt-in)
     /// Plan v0.3 P4: `--expert-cache auto` sizes the VRAM tier from what is free after the weights, the session
     /// and the KV state, minus this reserve for the graphs, the hit scratch and the head.
     int vram_reserve_mib = 700;
@@ -312,6 +313,9 @@ void usage() {
                  "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
                  "                       whole K/V in pinned RAM; the freed VRAM goes to expert slots. 0 (default):\n"
                  "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
+                 "  --idx-fp16           score the QSA block selection from an fp16 copy of the pooled indexer keys\n"
+                 "                       (half the bytes at long context; can change selected cells; also\n"
+                 "                       STRATA_IDX_FP16=1). Default: fp32\n"
                  "  --stream-token       enqueue token work on the session stream (experimental)\n"
                  "  --check-logits       copy and check all logits in the stream-token path\n"
                  "  --gr-fp32-activations  experimental CUDA-oracle GR activation precision\n"
@@ -865,6 +869,7 @@ int main(int argc, char** argv) {
         else if (a == "--ple-sync-submit") o.ple_sync_submit = true;
         else if (a == "--kv") o.kv = next("--kv");
         else if (a == "--kv-resident") o.kv_resident = std::atoll(next("--kv-resident"));
+        else if (a == "--idx-fp16") o.idx_fp16 = true;
         else if (a == "--stream-token") o.stream_token = true;
         else if (a == "--check-logits") o.check_logits = true;
         else if (a == "--gr-fp32-activations") o.gr_fp32_activations = true;
@@ -1023,6 +1028,11 @@ int main(int argc, char** argv) {
         return 2;
     }
     strata::core::qsa_set_kv_resident(o.kv_resident);
+    // O6 (#21): the fp16 indexer keys change which cells are selected, so they are opt-in (flag or environment)
+    if (const char* e = std::getenv("STRATA_IDX_FP16"); e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0)
+        o.idx_fp16 = true;
+    strata::core::qsa_set_idx_fp16(o.idx_fp16);
+    if (o.idx_fp16) std::fprintf(stderr, "strata: QSA block selection scored from fp16 indexer keys (--idx-fp16)\n");
     // Prompt lookup (the suffix drafter, on by default): the MTP keeps its --spec windows and a lookup window may be
     // up to 2 tokens longer; the draft policy (strata/spec/draft_policy.hpp) takes one only where it pays. Code
     // edits +6-11%, ordinary text unchanged (bench/results/2026-09-27-spec). --suffix-draft 0 turns it off.

@@ -214,6 +214,12 @@ struct QsaIndexerBuffers {
     float* dead = nullptr;
     float* pooled = nullptr;
     int32_t* block_pos = nullptr;
+    /// O6 (#21), optional: an fp16 SHADOW of `pooled` and `dead` (same rows, fp16 bits), written by the pooling
+    /// kernels next to every fp32 row they write, as `f16_from_f32` of it.  The fp32 rows stay the reference; the
+    /// shadow is only read when the fp16 scoring is opted in (`qsa_block_scores_f16`), because the rounding can move
+    /// the selection boundary (see INDEXER KEYS above).  Null: not maintained.
+    uint16_t* pooled16 = nullptr;
+    uint16_t* dead16 = nullptr;
 };
 
 /// Append one raw indexer key (IDX_DIM wide, fp32, NEVER normed and NEVER rotated - `ref/qsa.py` L201-210) and

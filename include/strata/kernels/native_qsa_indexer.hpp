@@ -13,7 +13,9 @@ bool native_qsa_indexer_enabled();
 // Uses the existing buffers: tail[3,128] stores half-rounded raw values expanded
 // to F32; dead[128] is the repeated-cell0 spare key; pooled[max_cells/4+1,128]
 // contains completed blocks followed by the spare; block_pos[1] changes only on
-// completion and records that block's first absolute position.
+// completion and records that block's first absolute position. When buffers.pooled16
+// and buffers.dead16 are set (O6, #21), every row written to pooled/dead is also
+// written there as f16_from_f32 of it; the F32 arithmetic is unchanged.
 //
 // relative_pos_device is a cell index, advancing 0..max_cells-1 (use kStepPos,
 // not the absolute RoPE position vector). The sequence is text,
