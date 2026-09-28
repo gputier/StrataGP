@@ -123,6 +123,11 @@ public:
     /// core's bandwidth; this streams every expert at all of them.  At most `kMaxSplit` experts.
     void run_split(ExpertJob* jobs, int n);
     static constexpr int kMaxSplit = 16;
+    /// O8 (#27): `run_split` cuts each phase into 3 x threads equal ranges of rows across all its experts (the
+    /// default), or, with `false` (`STRATA_OLD_RUN_SPLIT=1`), each expert into the same number of parts.  Both
+    /// are bitwise the same; only the balance differs.  Set it between batches, from the host thread.
+    void set_flat_split(bool on) { flat_split_ = on; }
+    bool flat_split() const { return flat_split_; }
     /// Plan v0.3 P6: `run_split` for multi-token jobs (at most `kMaxSplitMulti`); the rows of each expert are
     /// read once for all of its tokens.
     void run_split_multi(ExpertJobMulti* jobs, int n);
@@ -223,6 +228,7 @@ private:
     // run_split state: mode 0 = whole experts, 1 = gate/up row parts, 2 = down row parts
     int mode_ = 0;
     int parts_a_ = 1, parts_b_ = 1;
+    bool flat_split_ = true;   // O8 (#27): modes 1 and 2 cut `mrows_` into `mtasks_` ranges, as modes 3 and 4 do
     struct SplitBuf {
         alignas(64) float ff[FF];
         ActQ a2;
