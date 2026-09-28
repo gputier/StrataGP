@@ -5,11 +5,14 @@
 //
 // The body stands in for the draft layer: its "forward" reads the draft id and probability back from the record
 // mtp_chain_stage copied for step j (the id as step[0], the probability as the bits of pos[0]), through a 2-D
-// memcpy node and a memset node, as the real body has.  Synthetic data, no model.
+// memcpy node and a memset node, as the real body has.  The head stands in for the round, which MtpDrafter records
+// before mtp_chain_init in the same graph: a memset node and a copy of p0 from the pinned staging, so the chain
+// only starts once that work is done.  Synthetic data, no model.
 //   1. every (limit, min_p, probability pattern) of a seeded sweep: the draft count, the drafts and their
 //      probabilities are exactly the host loop's; the outputs past the count are untouched.
 //   2. the same graph launched again and again (the counter restarts at every launch).
-//   --bench: one chain launch + one synchronization against one launch + one synchronization per step.
+//   --bench: one chain launch + one synchronization against one launch + one synchronization per step, staged once
+//   (indicative only: a synthetic body, and the per-step side relaunches this graph with limit 2).
 
 #include "strata/kernels/mtp_chain.hpp"
 
@@ -53,7 +56,7 @@ constexpr int32_t kSentinel = -777;
 struct Rig {
     cudaStream_t s = nullptr;
     int32_t *h_step = nullptr, *m_step = nullptr, *h_pos = nullptr, *m_pos = nullptr;
-    int32_t *h_par = nullptr, *m_par = nullptr, *h_out = nullptr, *m_out = nullptr;
+    int32_t *h_par = nullptr, *m_par = nullptr, *h_out = nullptr, *m_out = nullptr, *h_p0 = nullptr, *m_p0 = nullptr;
     float *h_outp = nullptr, *m_outp = nullptr;
     int32_t *ctl = nullptr, *step_dst = nullptr, *pos_dst = nullptr, *ids = nullptr, *row = nullptr, *scratch = nullptr;
     cudaGraphExec_t exec = nullptr;
@@ -65,6 +68,7 @@ struct Rig {
         mapped(16, &h_par, &m_par);
         mapped(kMaxT, &h_out, &m_out);
         mapped(kMaxT, &h_outp, &m_outp);
+        mapped(4, &h_p0, &m_p0);
         ck(cudaMalloc(&ctl, 16), "ctl");
         ck(cudaMalloc(&step_dst, 16), "step");
         ck(cudaMalloc(&pos_dst, kNH * 4), "pos");
@@ -73,7 +77,9 @@ struct Rig {
         ck(cudaMalloc(&row, 16), "row");
         ck(cudaMemset(row, 0, 16), "row zero");
         auto head = [&](unsigned long long h) {
-            // the round left p0 in probs[*row]: here the bits of pos_dst[0], set by the host before the launch
+            // the round's work: it leaves p0 in probs[*row], here the bits of pos_dst[0], copied at every launch
+            if (cudaMemsetAsync(scratch, 0, 256, s) != cudaSuccess) return false;
+            if (cudaMemcpyAsync(pos_dst, h_p0, 4, cudaMemcpyHostToDevice, s) != cudaSuccess) return false;
             k::mtp_chain_init(ctl, (const float*) pos_dst, row, m_par, m_par + 2, h, s);
             return true;
         };
@@ -93,8 +99,8 @@ struct Rig {
         exec = (cudaGraphExec_t) e;
     }
 
-    // one round: returns the draft count; out / outp hold the chain's outputs
-    int run(int limit, float min_p, float p0, const std::vector<int32_t>& id, const std::vector<float>& pr) {
+    // one round's staging (mapped / pinned host memory, read by the graph when it runs)
+    void stage(int limit, float min_p, float p0, const std::vector<int32_t>& id, const std::vector<float>& pr) {
         for (int j = 1; j < kMaxT; ++j) {
             const int r = kRow0 + j - 1;
             for (int c = 0; c < 4; ++c) h_step[r * 4 + c] = c == 0 ? id[(size_t) j] : 1000 * j + c;
@@ -104,11 +110,19 @@ struct Rig {
         h_par[0] = limit;
         h_par[1] = bits(min_p);
         h_par[2] = 0;
-        const int32_t p0b = bits(p0);
-        ck(cudaMemcpy(pos_dst, &p0b, 4, cudaMemcpyHostToDevice), "p0");
+        h_p0[0] = bits(p0);
+    }
+
+    // one launch and one synchronization: returns the draft count; out / outp hold the chain's outputs
+    int launch() {
         ck(cudaGraphLaunch(exec, s), "launch");
         ck(cudaStreamSynchronize(s), "sync");
         return ((volatile int32_t*) h_par)[2];
+    }
+
+    int run(int limit, float min_p, float p0, const std::vector<int32_t>& id, const std::vector<float>& pr) {
+        stage(limit, min_p, p0, id, pr);
+        return launch();
     }
 };
 
@@ -171,18 +185,28 @@ int main(int argc, char** argv) {
     g_fail += bad_untouched != 0;
 
     if (bench) {
+        // staged once; both sides time only the launches and the synchronizations.  Every step keeps p = 1, so the
+        // staging stays valid: limit 7 runs 6 steps per launch, limit 2 one step per launch.
         using Clock = std::chrono::steady_clock;
         std::vector<int32_t> id(kMaxT, 7);
         std::vector<float> pr(kMaxT, 1.0f);
-        const int R = 2000;
+        const int R = 2000, S = kMaxT - 2;
+        rig.stage(kMaxT - 1, 0.0f, 1.0f, id, pr);
+        int n_one = 0, n_per = 0;
+        for (int r = 0; r < 20; ++r) n_one = rig.launch();
         auto t0 = Clock::now();
-        for (int r = 0; r < R; ++r) rig.run(kMaxT - 1, 0.0f, 1.0f, id, pr);   // 6 steps in one launch
+        for (int r = 0; r < R; ++r) rig.launch();   // 6 steps in one launch
         const double one = std::chrono::duration<double, std::micro>(Clock::now() - t0).count() / R;
+        rig.h_par[0] = 2;
+        for (int r = 0; r < 20; ++r) n_per = rig.launch();
         t0 = Clock::now();
         for (int r = 0; r < R; ++r)
-            for (int st = 0; st < kMaxT - 2; ++st) rig.run(2, 0.0f, 1.0f, id, pr);   // one step per launch + sync
+            for (int st = 0; st < S; ++st) rig.launch();   // one step per launch + sync
         const double per = std::chrono::duration<double, std::micro>(Clock::now() - t0).count() / R;
-        std::printf("  bench: 6 steps, one launch %.1f us/round; one launch per step %.1f us/round\n", one, per);
+        if (n_one != S + 1 || n_per != 2)
+            std::printf("  bench: unexpected draft counts %d and %d (want %d and 2)\n", n_one, n_per, S + 1);
+        std::printf("  bench (indicative, synthetic body): %d steps, one launch %.1f us/round; one launch per step "
+                    "%.1f us/round\n", S, one, per);
     }
     std::printf("%s\n", g_fail == 0 ? "PASS" : "FAIL");
     return g_fail == 0 ? 0 : 1;
