@@ -191,6 +191,7 @@ if(STRATA_ENABLE_CUDA)
                           src/kernels/cuda/kv_q8.cu
                           src/kernels/cuda/kv_stream.cu
                           src/kernels/cuda/kv_q4.cu
+                          src/kernels/cuda/qsa_prep.cu
                           src/kernels/cuda/fused_gr.cu
                           src/kernels/cuda/cvec.cu
                           src/kernels/cuda/qsa_decode_attn.cu
@@ -400,6 +401,13 @@ if(STRATA_ENABLE_CUDA)
   target_include_directories(ple_stage_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(ple_stage_parity PRIVATE strata_kernels CUDA::cudart)
   add_test(NAME ple_stage_parity COMMAND ple_stage_parity)
+
+  # O6e/O6d: the fused QSA preparation (norm + rope + FWHT + KV append, and both queries) vs the separate launches,
+  # byte for byte over every format and variant, adversarial rows included (GPU, synthetic, no model).
+  add_executable(qsa_prep_parity src/kernels/qsa_prep_parity.cpp)
+  target_include_directories(qsa_prep_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(qsa_prep_parity PRIVATE strata_kernels CUDA::cudart)
+  add_test(NAME qsa_prep_parity COMMAND qsa_prep_parity)
   add_executable(cvec_parity src/kernels/cvec_parity.cpp)
   target_include_directories(cvec_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(cvec_parity PRIVATE strata_kernels CUDA::cudart)

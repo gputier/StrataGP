@@ -54,9 +54,11 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k) {
     uint64_t n = 0;
     n += gdn_buffers_bytes(g);
     n += (uint64_t) g.n_gdn_layers() * gdn_state_floats(g) * 4;
-    // One QSA state carries the RoPE table; the others borrow it (P7: 64 MiB per layer at 262K).
+    // One QSA state carries the RoPE table; the others borrow it (P7: 64 MiB per layer at 262K). E4: none at all
+    // when nothing will read it (`qsa_rope_table_needed`: --native).
     if (g.n_qsa_layers() > 0)
-        n += qsa_state_bytes(g, max_cells, true) + (uint64_t) (g.n_qsa_layers() - 1) * qsa_state_bytes(g, max_cells, false);
+        n += qsa_state_bytes(g, max_cells, qsa_rope_table_needed()) +
+             (uint64_t) (g.n_qsa_layers() - 1) * qsa_state_bytes(g, max_cells, false);
     n += qsa_buffers_bytes(g, max_cells);
     n += moe_buffers_bytes(g, k);
     n += block_buffers_bytes(g);
@@ -82,7 +84,8 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     // the 12 QSA states are separate allocations carved from one arena, because `QsaState` is a struct of
     // pointers and `qsa_state_init` writes them - a contiguous array would need the arena to be laid out the
     // same way, which is a coupling with nothing to gain.
-    const uint64_t first = qsa_state_bytes(g, max_cells, true), rest = qsa_state_bytes(g, max_cells, false);
+    const bool rope = qsa_rope_table_needed();   // as `session_bytes` sized it
+    const uint64_t first = qsa_state_bytes(g, max_cells, rope), rest = qsa_state_bytes(g, max_cells, false);
     s.qsa_state_arena = take(g.n_qsa_layers() > 0 ? first + (uint64_t) (g.n_qsa_layers() - 1) * rest : 0);
     s.qsa_states = new QsaState[(size_t) g.n_qsa_layers()];
     s.qsa_buf_arena = take(qsa_buffers_bytes(g, max_cells));
@@ -92,8 +95,13 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     // attention read null host pointers at the first request ("illegal memory access"), so the session fails here
     for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
         if (qsa_state_init(g, max_cells, qp + (i == 0 ? 0 : first + (uint64_t) (i - 1) * rest), s.qsa_states[i],
-                           i == 0 ? nullptr : &s.qsa_states[0]) == 0)
+                           i == 0 ? nullptr : &s.qsa_states[0], 0, rope) == 0)
             return 0;
+    // O6d: the twelve layers' step and positions are functions of the same position, so the first QSA layer - the
+    // first one every token runs - uploads them once and the others read its buffers. STRATA_OLD_QSA_STEP=1 keeps
+    // one upload per layer (A/B).
+    if (std::getenv("STRATA_OLD_QSA_STEP") == nullptr)
+        for (int64_t i = 1; i < g.n_qsa_layers(); ++i) qsa_state_share_step(s.qsa_states[i], s.qsa_states[0]);
     qsa_buffers_init(g, max_cells, s.qsa_buf_arena, s.qsa_bufs);
 
     s.moe_arena = take(moe_buffers_bytes(g, k));

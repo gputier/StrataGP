@@ -62,6 +62,8 @@ namespace { std::atomic<const int32_t*> mrope_tab{nullptr}; }
 void mrope_table_set(const int32_t* device_table) { mrope_tab.store(device_table, std::memory_order_relaxed); }
 const int32_t* mrope_table() { return mrope_tab.load(std::memory_order_relaxed); }
 void native_rope_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
+// Match pinned host-side float powf before device fast powf/trigonometry.
+float native_rope_theta_scale(float freq_base, int n_rot) { return powf(freq_base, -2.0f / n_rot); }
 bool native_rope_enabled() { return enabled.load(std::memory_order_relaxed); }
 void native_rope_apply(const float* x, float* out, int rows, int head_dim,
                        int n_rot, float freq_base, const int* positions, void* stream) {
@@ -78,8 +80,7 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
         overlaps(positions, size_t(rows) * sizeof(int), x, bytes)) {
         throw std::invalid_argument("native RoPE buffers partially overlap");
     }
-    // Match pinned host-side float powf before device fast powf/trigonometry.
-    const float theta_scale = powf(freq_base, -2.0f / n_rot);
+    const float theta_scale = native_rope_theta_scale(freq_base, n_rot);
     apply<<<dim3((head_dim / 2 + 127) / 128, rows), 128, 0,
               static_cast<cudaStream_t>(stream)>>>(x, out, rows, head_dim, n_rot, theta_scale, positions, mrope_table());
     const auto error = cudaGetLastError();
