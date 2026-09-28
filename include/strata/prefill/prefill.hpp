@@ -57,6 +57,9 @@ public:
     /// ring (a big one only pays when the copy engine, not the host copies, is the limit); set before bytes_needed.
     static void set_pinned_share(double share);
     static double pinned_share();
+    /// Issue #39, `--prefill-dense-mmq` (opt-in, it changes the rounding): the dense GGUF projections through
+    /// llama.cpp's MMQ kernels (q8_1 activations, int8 tensor cores) instead of FP16 cuBLAS; set before `init`.
+    static void set_dense_mmq(bool on);
 
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk);

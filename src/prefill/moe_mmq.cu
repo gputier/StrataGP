@@ -151,6 +151,31 @@ __global__ void iota_kernel(int32_t* dst, int64_t n) {
 
 unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 
+// issue #39: the dense products' launch, over every instance this library compiles (CMakeLists.txt's strata_mmq)
+void dispatch(ggml_backend_cuda_context& ctx, ggml_type t, const mmq_args& a, cudaStream_t s) {
+    switch (t) {
+        case GGML_TYPE_Q2_0: mul_mat_q_case<GGML_TYPE_Q2_0>(ctx, a, s); break;
+        case GGML_TYPE_IQ2_XXS: mul_mat_q_case<GGML_TYPE_IQ2_XXS>(ctx, a, s); break;
+        case GGML_TYPE_IQ2_XS: mul_mat_q_case<GGML_TYPE_IQ2_XS>(ctx, a, s); break;
+        case GGML_TYPE_IQ2_S: mul_mat_q_case<GGML_TYPE_IQ2_S>(ctx, a, s); break;
+        case GGML_TYPE_IQ3_XXS: mul_mat_q_case<GGML_TYPE_IQ3_XXS>(ctx, a, s); break;
+        case GGML_TYPE_IQ3_S: mul_mat_q_case<GGML_TYPE_IQ3_S>(ctx, a, s); break;
+        case GGML_TYPE_IQ4_NL: mul_mat_q_case<GGML_TYPE_IQ4_NL>(ctx, a, s); break;
+        case GGML_TYPE_IQ4_XS: mul_mat_q_case<GGML_TYPE_IQ4_XS>(ctx, a, s); break;
+        case GGML_TYPE_Q4_0: mul_mat_q_case<GGML_TYPE_Q4_0>(ctx, a, s); break;
+        case GGML_TYPE_Q5_0: mul_mat_q_case<GGML_TYPE_Q5_0>(ctx, a, s); break;
+        case GGML_TYPE_Q8_0: mul_mat_q_case<GGML_TYPE_Q8_0>(ctx, a, s); break;
+        case GGML_TYPE_Q3_K: mul_mat_q_case<GGML_TYPE_Q3_K>(ctx, a, s); break;
+        case GGML_TYPE_Q4_K: mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, a, s); break;
+        case GGML_TYPE_Q5_K: mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, a, s); break;
+        case GGML_TYPE_Q6_K: mul_mat_q_case<GGML_TYPE_Q6_K>(ctx, a, s); break;
+        default:
+            std::fprintf(stderr, "prefill mmq: type %d is not covered\n", (int) t);
+            std::exit(1);
+    }
+    ck(cudaGetLastError(), "mul_mat_q");
+}
+
 }  // namespace
 
 bool built() { return true; }
@@ -162,6 +187,16 @@ bool supported(int t) {
             return true;
         default:
             return false;
+    }
+}
+
+bool dense_supported(int t) {
+    switch ((ggml_type) t) {
+        case GGML_TYPE_Q4_0: case GGML_TYPE_Q5_0: case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K:
+            return true;
+        default:
+            return supported(t);
     }
 }
 
@@ -212,6 +247,25 @@ void Context::run(const Product& p, void* stream) {
             std::exit(1);
     }
     ck(cudaGetLastError(), "mul_mat_q");
+}
+
+void Context::dense(const void* w, int type, int64_t w_rows, int64_t w_cols, const void* xq, int64_t n, float* dst,
+                    int64_t ld_dst, void* stream) {
+    if (n <= 0 || w_rows <= 0) return;
+    const ggml_type t = (ggml_type) type;
+    if (!dense_supported(type)) {
+        std::fprintf(stderr, "prefill mmq: dense type %d is not covered\n", (int) type);
+        std::exit(1);
+    }
+    // ggml_cuda_mul_mat_q's arguments for a 2-D src0 and src1 (one channel, one sample: their strides are unused);
+    // no row table and no bounds, so column j of the product is row j of dst
+    const int64_t bpr = w_cols / ggml_blck_size(t);
+    const mmq_args a = {(const char*) w, t, (const int*) xq, nullptr, nullptr, dst, nullptr,
+                        w_cols, w_rows, n, bpr, n, ld_dst,
+                        1, 1, 0, 0, 0,
+                        1, 1, 0, 0, 0,
+                        n, n};
+    dispatch(*(ggml_backend_cuda_context*) ctx_, t, a, (cudaStream_t) stream);
 }
 
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,
