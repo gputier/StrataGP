@@ -73,9 +73,13 @@ phase `qsa indexer` de `STRATA_PREFILL_TIMING=1`.
      espacés (région empruntée) ; `STRATA_PREFILL_COALESCE=0` revient à une copie par expert ;
    - les produits MMQ sont lancés **exactement** comme avant (mêmes groupes, même `max_rows`, mêmes bornes), d'où
      l'identité au bit près ;
+   - l'événement `copied` d'une copie fusionnée est enregistré sur le **dernier** emplacement de la série (le premier
+     peut être rendu et re-rempli dès la libération du lot qui contient la première entrée, alors qu'un lot suivant
+     attend encore la série : il aurait attendu une copie jusqu'à `ring` entrées plus loin) ;
    - en fin de morceau, chaque emplacement retrouve son propre événement `used` (ce qu'attendent la marche par
      expert et les petits morceaux) ; un morceau interrompu synchronise les deux flux au morceau suivant.
-4. `Prefill::run` synchronise aussi le flux de copie avant de rendre la main : la copie d'un expert non routé n'était
+4. `Prefill::run` synchronise aussi le flux de copie avant de rendre la main, **sur chaque retour** (garde de
+   portée : succès, erreur, et `cancelled` quand un STOP arrive entre deux morceaux) : la copie d'un expert non routé n'était
    jamais attendue et atterrissait dans les emplacements empruntés que l'appelant re-remplit ensuite (course
    théorique déjà présente, nécessaire pour #42).
 
@@ -121,8 +125,11 @@ premier token sur les longues conversations (audit).
 ## #45 (E2) : points de reprise de conversation
 
 - Chaque point de reprise prend **un** tampon d'un pool (`CkptPool`, `generate.cpp`) : épinglé (`cudaHostAlloc`),
-  rendu au pool quand le point de reprise est abandonné (le pool en garde au plus `--prompt-cache` + 1, ~118 Mo
-  chacun) ; paginable si plus rien ne peut être épinglé.
+  rendu au pool quand le point de reprise est abandonné ; paginable si plus rien ne peut être épinglé.
+- **Empreinte épinglée** : au plus `--prompt-cache` + 1 tampons de ~118 Mo (~826 Mo avec la valeur par défaut 6)
+  tant que les points de reprise vivent. À chaque requête, après l'abandon des points de reprise qui ne servent plus
+  (nouvelle conversation, changement de vecteur de contrôle, préfixe différent), le pool libère ses tampons inactifs
+  au-delà d'**un** (`CkptPool::trim(1)`) : la mémoire épinglée suit les points de reprise vivants.
 - Les morceaux (GDN, historique PLE, queues de l'indexeur) sont copiés par `cudaMemcpyAsync` sur le flux du pool,
   avec **une** attente ; la restauration fait le chemin inverse (après un `cudaDeviceSynchronize`, comme avant).
 - Mêmes octets. `STRATA_OLD_CKPT=1` : vecteurs paginables réalloués et `cudaMemcpy` synchrones, comme avant.
@@ -146,6 +153,9 @@ commit du dépôt). Le vrai coût du démarrage est le remplissage lui-même : *
   premier) : +1,38 Mo lus.
 - La durée du remplissage est affichée : `pre-filled N of M slots from the profile in X ms; the first and the last
   verified`.
+- Le flux de remplissage est non bloquant, donc **pas** ordonné après le flux 0 : un `cudaDeviceSynchronize` le
+  précède, sinon la mise à zéro de l'arène (`cudaMemset` de `ExpertCache::open`, jamais attendue avec
+  `--expert-cache N` fixe) pourrait atterrir sur les copies.
 - `STRATA_OLD_PROFILE_FILL=1` : les copies bloquantes.
 
 **Gain (HYPOTHÈSE) :** 5 à 15 % du temps de remplissage (l'écart entre deux copies bloquantes), soit ~0,05 à 0,3 s sur
@@ -207,6 +217,19 @@ cmp new.r old.r && echo "résidus identiques"
 diff <(grep '^output' new.txt) <(grep '^output' old.txt) && echo "tokens identiques"
 # chaque changement séparément, si une différence apparaît :
 #   STRATA_OLD_IDX_APPEND=1 seul (#40), STRATA_OLD_MOE_GROUP=1 seul (#36), STRATA_PREFILL_COALESCE=0 (copies)
+
+# la tenue de l'anneau de la marche par groupe (issue_runs / flush / événements) n'a pas de test unitaire : elle
+# n'est couverte que par cette comparaison, À FAIRE AVANT LA FUSION.  Copies fusionnées ou non, et un anneau
+# plus petit que le nombre d'experts diffusés d'une couche (~480 à 8 192 tokens), séries à cheval sur deux lots
+# (une variable vide n'est pas « absente » : `env ${ring:+...}` ne la pose que si elle a une valeur) :
+for ring in "" 16 40; do for co in 1 0; do
+  env ${ring:+STRATA_PREFILL_RING=$ring} STRATA_PREFILL_COALESCE=$co STRATA_STATE_HASH_GDN=1 STRATA_PREFILL_DUMP_R=r_${ring}_$co.r \
+    ./build/strata $OPTS --tokens-file <PROMPT_32K.ids> > t_${ring}_$co.txt 2> t_${ring}_$co.err
+  env ${ring:+STRATA_PREFILL_RING=$ring} STRATA_OLD_MOE_GROUP=1 STRATA_STATE_HASH_GDN=1 STRATA_PREFILL_DUMP_R=o_${ring}_$co.r \
+    ./build/strata $OPTS --tokens-file <PROMPT_32K.ids> > o_${ring}_$co.txt 2> o_${ring}_$co.err
+  cmp r_${ring}_$co.r o_${ring}_$co.r && diff <(grep GDN_HASH t_${ring}_$co.err) <(grep GDN_HASH o_${ring}_$co.err) \
+    && echo "ring=${ring:-défaut} coalesce=$co identiques"
+done; done
 ```
 
 ### Benchmark A/B (3 prompts × 3 exécutions, glouton, 256 tokens)
@@ -221,7 +244,7 @@ for p in p1 p2 p3; do for r in 1 2 3; do
   STRATA_ASYNC_REFILL=1 ./build/strata $OPTS --tokens-file prompts/$p.ids > ab/async_${p}_$r.txt 2>&1
 done; done
 # débit de prefill et délai avant le premier token ; durée du remplissage du profil ; re-remplissage
-grep -h "^prefill\|pre-filled\|lent slots" ab/*.txt
+grep -h "generate: prefill\|pre-filled\|lent slots" ab/*.txt
 # les tokens : identiques entre old et new ; async peut différer légèrement (#42)
 for p in p1 p2 p3; do diff <(grep '^output' ab/old_${p}_1.txt) <(grep '^output' ab/new_${p}_1.txt) && echo "$p ok"; done
 ```
