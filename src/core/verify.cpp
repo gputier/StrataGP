@@ -32,6 +32,8 @@
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
+#include <cuda.h>
+
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -114,6 +116,7 @@ Verifier::~Verifier() {
     for (auto& e : exec_)
         if (e) cudaGraphExecDestroy(e);
     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
+    if (commit_ev_) cudaEventDestroy(commit_ev_);
     if (cs_) cudaStreamDestroy(cs_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (arena_) cudaFree(arena_);
@@ -265,6 +268,19 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) {
         err = "verify: stream create failed";
         return false;
+    }
+    if (cudaEventCreateWithFlags(&commit_ev_, cudaEventDisableTiming) != cudaSuccess) {
+        err = "verify: event create failed";
+        return false;
+    }
+    // issue #16: flag B by a stream write in DMA mode (resolved at run time: nothing links the driver library)
+    if (const char* v = std::getenv("STRATA_OLD_DMA_FLAG"); v == nullptr || v[0] == '\0' || v[0] == '0') {
+        cudaDriverEntryPointQueryResult q = cudaDriverEntryPointSymbolNotFound;
+        void* fn = nullptr;
+        if (cudaGetDriverEntryPointByVersion("cuStreamWriteValue32", &fn, 12000, cudaEnableDefault, &q) == cudaSuccess &&
+            q == cudaDriverEntryPointSuccess)
+            write_value32_ = fn;
+        cudaGetLastError();
     }
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers\n", max_t,
                  (double) count.used / 1048576.0);
@@ -771,6 +787,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    b_queued_ = false;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = T;
     last_pos0_ = pos0;
@@ -829,7 +846,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_b(want);
         }
         *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
@@ -837,6 +854,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
     const cudaError_t se = cudaStreamSynchronize(cs_);
+    commit_pending_ = false;   // the last commit ran before this window on the same stream
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
@@ -918,13 +936,35 @@ void Verifier::raise_flag(uint32_t* flag, uint32_t value) {
 void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes) {
     Verifier* v = (Verifier*) ctx;
     const uint32_t want = v->cur_layer_ + 1;
-    if (n <= 0) { raise_flag(v->h_flagB_, want); return; }
+    if (n <= 0) { v->raise_b(want); return; }
     uint8_t* stage = (uint8_t*) v->sink_.staging;                  // this group's half in a split window
     for (int i = 0; i < n; ++i) cudaMemcpyAsync(stage + (size_t) i * bytes, src[i], bytes, cudaMemcpyHostToDevice, v->copy_);
-    FlagSet& fs = v->flag_sets_[v->cur_layer_ % (sizeof v->flag_sets_ / sizeof v->flag_sets_[0])];
-    fs.flag = v->h_flagB_;
-    fs.value = want;
-    cudaLaunchHostFunc(v->copy_, [](void* p) { FlagSet* s = (FlagSet*) p; raise_flag(s->flag, s->value); }, &fs);
+    v->queue_raise_b(want);
+}
+
+// Flag B now, or behind what the copy stream already holds for this window (a direct write could land before a
+// queued smaller one, which would then lower the flag under a GPU that already waits for the larger value).
+void Verifier::raise_b(uint32_t value) {
+    if (b_queued_) queue_raise_b(value);
+    else raise_flag(h_flagB_, value);
+}
+
+// Flag B once the copy stream reaches this point: a stream write, else a host function.
+bool Verifier::queue_raise_b(uint32_t value) {
+    b_queued_ = true;
+    if (write_value32_ != nullptr) {
+        using WriteValue32 = CUresult (*)(CUstream, CUdeviceptr, cuuint32_t, unsigned int);
+        if (((WriteValue32) write_value32_)((CUstream) copy_, (CUdeviceptr) (uintptr_t) m_flagB_, (cuuint32_t) value,
+                                            CU_STREAM_WRITE_VALUE_DEFAULT) == CUDA_SUCCESS)
+            return true;
+        std::fprintf(stderr, "strata verify: cuStreamWriteValue32 refused; flag B by host functions from now on\n");
+        write_value32_ = nullptr;
+    }
+    FlagSet& fs = flag_sets_[cur_layer_ % (sizeof flag_sets_ / sizeof flag_sets_[0])];
+    fs.flag = h_flagB_;
+    fs.value = value;
+    return cudaLaunchHostFunc(copy_, [](void* p) { FlagSet* s = (FlagSet*) p; raise_flag(s->flag, s->value); }, &fs) ==
+           cudaSuccess;
 }
 
 void Verifier::publish_plan(void* ctx) {
@@ -933,8 +973,9 @@ void Verifier::publish_plan(void* ctx) {
     *(volatile uint32_t*) v->h_flagA_ = v->cur_layer_ + 1;
 }
 
-bool Verifier::commit(int n_keep, std::string& err) {
+bool Verifier::commit(int n_keep, std::string& err, bool wait) {
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
+    if (!sync_commit(err)) return false;   // h_commit_ is read by the previous commit's graph
     const Clock::time_point t0 = Clock::now();
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
@@ -942,13 +983,32 @@ bool Verifier::commit(int n_keep, std::string& err) {
     std::atomic_thread_fence(std::memory_order_seq_cst);
     const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
     if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
-    const cudaError_t se = cudaStreamSynchronize(cs_);
-    if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
+    static const bool old_sync = [] {
+        const char* v = std::getenv("STRATA_OLD_COMMIT_SYNC");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    if (wait || old_sync) {
+        const cudaError_t se = cudaStreamSynchronize(cs_);
+        if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
+    } else {
+        // issue #16: the next window follows on this stream; the MTP round waits for this event on its own
+        const cudaError_t re = cudaEventRecord(commit_ev_, cs_);
+        if (re != cudaSuccess) { err = std::string("verify: commit event: ") + cudaGetErrorString(re); return false; }
+        commit_pending_ = true;
+    }
     for (int t = 0; t < n_keep; ++t) {
         ss_->ple_prev[0] = ss_->ple_prev[1];
         ss_->ple_prev[1] = last_tokens_[t];
     }
     ms_commit += ms_since(t0);
+    return true;
+}
+
+bool Verifier::sync_commit(std::string& err) {
+    if (!commit_pending_) return true;
+    commit_pending_ = false;
+    const cudaError_t se = cudaStreamSynchronize(cs_);
+    if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
     return true;
 }
 

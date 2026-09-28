@@ -87,7 +87,14 @@ public:
     void set_head_sampling(bool on) { head_sampling_ = on; }
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
-    bool commit(int n_keep, std::string& err);
+    /// Issue #16: with `wait` false the host does not wait for the commit (STRATA_OLD_COMMIT_SYNC=1 still does):
+    /// the next `run` is ordered after it on the verify stream, the MTP round on the device through
+    /// `commit_event()`, and anything else must call `sync_commit` before it reads the session's state.
+    bool commit(int n_keep, std::string& err, bool wait = true);
+    /// Waits for a commit launched with `wait` false (no-op otherwise); reports its error.
+    bool sync_commit(std::string& err);
+    /// Recorded after each commit the host does not wait for.
+    cudaEvent_t commit_event() const { return commit_ev_; }
 
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
@@ -135,6 +142,8 @@ private:
     cudaStream_t cs_ = nullptr;
     cudaGraphExec_t exec_[9] = {};
     cudaGraphExec_t commit_exec_ = nullptr;
+    cudaEvent_t commit_ev_ = nullptr;
+    bool commit_pending_ = false;   // a commit the host has not waited for (issue #16)
 
     // mapped staging (host pointer, device alias)
     int32_t* h_tok_ = nullptr;   int32_t* m_tok_ = nullptr;     // T
@@ -155,6 +164,13 @@ private:
     FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)
     static void fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes);
     static void raise_flag(uint32_t* flag, uint32_t value);
+    // Issue #16: in DMA mode flag B is raised by a stream write (cuStreamWriteValue32) queued behind the copies, not
+    // by a host function (STRATA_OLD_DMA_FLAG=1 keeps the host function).  Once one raise of a window is queued on
+    // the copy stream, every later one of that window is queued too, so the flag still only rises.
+    void raise_b(uint32_t value);
+    bool queue_raise_b(uint32_t value);
+    void* write_value32_ = nullptr;   // the driver's cuStreamWriteValue32, null = host functions
+    bool b_queued_ = false;           // a raise of flag B is queued on copy_ in this window
     int32_t* h_plan_ = nullptr;  int32_t* m_plan_ = nullptr;     // counts | start | dst | tok | ptr (as int32 pairs)
     int64_t plan_i32_ = 0;                                        // int32 words in the plan block
     GpuPlanSink sink_;
