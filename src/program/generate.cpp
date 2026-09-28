@@ -626,8 +626,45 @@ struct ImgKey {
 struct ConvCheckpoint {
     std::vector<int32_t> ids;     ///< the tokens this state has consumed
     std::vector<ImgKey> imgs;     ///< the images among them
-    std::vector<uint8_t> gdn, ple, tails;
+    std::vector<uint8_t> gdn, ple, tails;   ///< STRATA_OLD_CKPT=1: pageable copies
+    std::shared_ptr<uint8_t> state;         ///< issue #45: GDN | PLE | tails in one buffer of a CkptPool
+    size_t ple_bytes = 0;                   ///< ...of which the PLE history (0: none)
     uint64_t used = 0;            ///< last-use stamp for the retention policy (conv_cache.hpp)
+};
+
+// Issue #45: the checkpoints' host buffers.  Until 0.1.20 a checkpoint synchronized the device and copied its ~118 MB
+// with a synchronous cudaMemcpy per piece into freshly allocated pageable vectors (the pages faulted in by the copy
+// itself).  Here each checkpoint takes one pinned buffer of the pool, handed back when the checkpoint is dropped (so
+// the pool holds at most --prompt-cache + 1 of them), and the pieces are queued on a stream of their own with one
+// wait for all of them: DMA at the link's speed, no allocation, no fault.  Pageable when no more RAM can be pinned.
+// The bytes are the same either way.  Declared before the checkpoints, so it outlives them.
+struct CkptPool {
+    size_t bytes = 0;                                   ///< one checkpoint's running state
+    std::vector<std::pair<uint8_t*, bool>> free_list;   ///< (buffer, pinned)
+    cudaStream_t stream = nullptr;
+    ~CkptPool() {
+        for (const auto& [p, pinned] : free_list) {
+            if (pinned) cudaFreeHost(p);
+            else delete[] p;
+        }
+        if (stream) cudaStreamDestroy(stream);
+    }
+    /// A buffer of `bytes`, back in the pool when its last owner drops it; null on failure.
+    std::shared_ptr<uint8_t> take() {
+        if (stream == nullptr && cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) return nullptr;
+        std::pair<uint8_t*, bool> b{nullptr, false};
+        if (!free_list.empty()) {
+            b = free_list.back();
+            free_list.pop_back();
+        } else if (cudaHostAlloc((void**) &b.first, bytes, cudaHostAllocDefault) == cudaSuccess) {
+            b.second = true;
+        } else {
+            (void) cudaGetLastError();
+            b.first = new (std::nothrow) uint8_t[bytes];
+            if (b.first == nullptr) return nullptr;
+        }
+        return std::shared_ptr<uint8_t>(b.first, [this, pinned = b.second](uint8_t* p) { free_list.emplace_back(p, pinned); });
+    }
 };
 
 uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull) {
@@ -650,9 +687,26 @@ ConvStateSizes conv_state_sizes(const strata::core::ModelGeometry& g) {
     return z;
 }
 
-/// Copies the running state out.  The caller has synchronized the device.
-bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
+/// Copies the running state out.  The caller has synchronized the device.  With a pool (issue #45): into one of its
+/// buffers, on its stream; without (STRATA_OLD_CKPT=1): into pageable vectors, synchronously.
+bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, const strata::core::ModelGeometry& g,
+                     CkptPool* pool = nullptr) {
     const ConvStateSizes z = conv_state_sizes(g);
+    if (pool != nullptr) {
+        const size_t ple = ss.ple_hist != nullptr ? z.ple : 0, tails = z.tail * (size_t) g.n_qsa_layers();
+        pool->bytes = z.gdn + z.ple + tails;
+        c.state = pool->take();
+        c.ple_bytes = ple;
+        if (c.state == nullptr) return false;
+        uint8_t* p = c.state.get();
+        bool ok = cudaMemcpyAsync(p, ss.gdn_state, z.gdn, cudaMemcpyDeviceToHost, pool->stream) == cudaSuccess;
+        if (ple > 0)
+            ok = ok && cudaMemcpyAsync(p + z.gdn, ss.ple_hist, ple, cudaMemcpyDeviceToHost, pool->stream) == cudaSuccess;
+        for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
+            ok = ok && cudaMemcpyAsync(p + z.gdn + ple + (size_t) i * z.tail, ss.qsa_states[i].idx_tail, z.tail,
+                                       cudaMemcpyDeviceToHost, pool->stream) == cudaSuccess;
+        return cudaStreamSynchronize(pool->stream) == cudaSuccess && ok;
+    }
     c.gdn.resize(z.gdn);
     c.ple.resize(ss.ple_hist != nullptr ? z.ple : 0);
     c.tails.resize(z.tail * (size_t) g.n_qsa_layers());
@@ -667,8 +721,25 @@ bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, co
 }
 
 /// Puts a checkpoint's running state back; the positional cells below it are the caller's to guarantee.
-bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
+bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss, const strata::core::ModelGeometry& g,
+                        CkptPool* pool = nullptr) {
     const ConvStateSizes z = conv_state_sizes(g);
+    if (c.state != nullptr) {   // saved into a pool's buffer (issue #45): back on its stream
+        if (pool == nullptr || pool->stream == nullptr || (c.ple_bytes > 0 && ss.ple_hist == nullptr)) return false;
+        if (cudaDeviceSynchronize() != cudaSuccess) return false;   // nothing may still be reading the state
+        const uint8_t* p = c.state.get();
+        bool ok = cudaMemcpyAsync(ss.gdn_state, p, z.gdn, cudaMemcpyHostToDevice, pool->stream) == cudaSuccess;
+        if (c.ple_bytes > 0)
+            ok = ok && cudaMemcpyAsync(ss.ple_hist, p + z.gdn, c.ple_bytes, cudaMemcpyHostToDevice, pool->stream) == cudaSuccess;
+        for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
+            ok = ok && cudaMemcpyAsync(ss.qsa_states[i].idx_tail, p + z.gdn + c.ple_bytes + (size_t) i * z.tail, z.tail,
+                                       cudaMemcpyHostToDevice, pool->stream) == cudaSuccess;
+        if (cudaStreamSynchronize(pool->stream) != cudaSuccess || !ok) return false;
+        const size_t L = c.ids.size();
+        ss.ple_prev[0] = L >= 2 ? c.ids[L - 2] : -1;
+        ss.ple_prev[1] = L >= 1 ? c.ids[L - 1] : -1;
+        return cudaDeviceSynchronize() == cudaSuccess;
+    }
     if (c.gdn.size() != z.gdn || c.tails.size() != z.tail * (size_t) g.n_qsa_layers()) return false;
     if (cudaMemcpy(ss.gdn_state, c.gdn.data(), z.gdn, cudaMemcpyHostToDevice) != cudaSuccess) return false;
     if (!c.ple.empty() && cudaMemcpy(ss.ple_hist, c.ple.data(), z.ple, cudaMemcpyHostToDevice) != cudaSuccess)
@@ -2489,6 +2560,10 @@ int main(int argc, char** argv) {
         std::vector<int32_t> live;
         std::vector<ImgKey> live_imgs, req_imgs;
         bool live_ok = false;
+        // issue #45: the checkpoints' pinned buffers (declared first: it outlives them); STRATA_OLD_CKPT=1 keeps the
+        // pageable vectors and synchronous copies (the A/B)
+        CkptPool ckpt_pool;
+        CkptPool* const ckpt_pinned = std::getenv("STRATA_OLD_CKPT") != nullptr ? nullptr : &ckpt_pool;
         std::vector<ConvCheckpoint> checks;
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
@@ -2507,7 +2582,7 @@ int main(int argc, char** argv) {
             ConvCheckpoint c;
             c.ids.assign(cur.begin(), cur.begin() + L);
             c.imgs = imgs_below(req_imgs, L);
-            if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_save(c, ss, g)) return false;
+            if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_save(c, ss, g, ckpt_pinned)) return false;
             c.used = ++check_clock;
             checks.push_back(std::move(c));
             while ((int) checks.size() > o.prompt_cache) {
@@ -2955,7 +3030,7 @@ int main(int argc, char** argv) {
                     reread_to = resume;
                     std::fprintf(stderr, "strata serve: STRATA_CKPT_REREAD: reading %lld tokens again instead of "
                                          "restoring\n", (long long) resume);
-                } else if (c == nullptr || !checkpoint_restore(*c, ss, g)) {
+                } else if (c == nullptr || !checkpoint_restore(*c, ss, g, ckpt_pinned)) {
                     std::printf("ERR restoring a conversation checkpoint failed\n");
                     return 1;
                 }
