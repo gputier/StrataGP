@@ -837,7 +837,8 @@ void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t 
 void set_f16_saturate(bool on) {
     g_f16_forced.store(true);
     const int v = on ? 1 : 0;
-    if (cudaMemcpyToSymbol(c_f16_sat, &v, sizeof v) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) check("set_f16_saturate");
+    if (cudaMemcpyToSymbol(c_f16_sat, &v, sizeof v) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess)
+        check("set_f16_saturate");
 }
 
 }  // namespace strata::prefill

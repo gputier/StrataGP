@@ -500,7 +500,8 @@ bool Prefill::carve(size_t T, void* alloc) {
     core::SessionState& ss = *m.ss;
     bool ok = true;
     // xn: the FP32 image of the GR norm, or only its per-row scales (P8, gr_old_path() off)
-    m.emb = o.take<float>(T * N, ok); m.R = o.take<float>(T * D, ok); m.xn = o.take<float>(gr_old_path() ? T * D : T * HC, ok);
+    m.emb = o.take<float>(T * N, ok); m.R = o.take<float>(T * D, ok);
+    m.xn = o.take<float>(gr_old_path() ? T * D : T * HC, ok);
     m.xn16 = o.take<uint16_t>(T * D, ok); m.lo = o.take<float>(T * LR, ok); m.lo16 = o.take<uint16_t>(T * LR, ok);
     m.gated = o.take<float>(T * D, ok); m.inj = o.take<float>(T * HC, ok);
     m.mixed = o.take<float>(T * N, ok); m.mixed_bf = o.take<uint16_t>(T * N, ok);
@@ -1351,7 +1352,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     }
                 }
                 // ---- the hyper-connection write of this half, and with it the next half's norm when nothing else
-                // writes R in between (not after a layer the control vector covers, not before the PLE block of layer 1)
+                // writes R in between (not after a layer the control vector covers, not before layer 1's PLE block)
                 const core::WeightRef* wn_next = nullptr;
                 if (!old_gr && half == 0) wn_next = v.get("hc_ffn_norm.weight");
                 else if (!old_gr && l + 1 < g.n_layers && !strata::kernels::cvec().covers(l) && !(l + 1 == 1 && ple_on))
