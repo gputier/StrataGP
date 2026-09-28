@@ -261,6 +261,111 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
     }
 }
 
+// Issue #26 (O7): the kernel above with a head's 128 columns split over a cluster of GC blocks (32 columns x 4 row
+// groups each): 4x the SMs on the state load and the commit's store.  A column's arithmetic is the kernel's above
+// line for line.  Two things move, neither touching a value:
+//   * the RMS norm of token t needs the whole head, so it waits until after the token loop: warp 0 of each block
+//     (32 consecutive columns, the same lane per column as warp `part` above, hence the same butterfly) pushes its
+//     sum for t into every block of the cluster, and after one cluster barrier `ss` adds the same four warp sums in
+//     the same order;
+//   * the kv and o partials use separate arrays, which removes the barrier between reading one and writing the
+//     other: with the norm's barrier gone too, 4 block barriers per token instead of 6 (5 for a replayed token).
+// sm_90 and newer; the launcher checks before using it.
+constexpr int GC = 4;                             // blocks per head
+constexpr int GCW = S / GC;                       // 32 columns per block
+
+__global__ void __launch_bounds__(GCW * RG) gdn_step_norm_multi_cluster_kernel(float* __restrict__ state,
+                                                                               const float* __restrict__ hbuf, int C,
+                                                                               const float* __restrict__ gate,
+                                                                               const float* __restrict__ beta,
+                                                                               const float* __restrict__ z,
+                                                                               const float* __restrict__ gamma,
+                                                                               float eps, float* __restrict__ y,
+                                                                               int h_k, int h_v, int T,
+                                                                               const int32_t* __restrict__ n_keep,
+                                                                               int t_out_begin) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    __shared__ float sk[S], sq[S];
+    __shared__ float red_kv[RG][GCW], red_o[RG][GCW];
+    __shared__ float wsum[kVerifyMaxT][S / 32];   // per token, the head's four warp sums (one pushed by each block)
+    __shared__ float ocs[kVerifyMaxT][GCW];       // row group 0's outputs, normed after the token loop
+    __cluster_barrier_arrive_relaxed();           // waited below, before the first store into another block
+    const int part = (int) __clusterRelativeBlockRank();
+    const int head = blockIdx.x / GC;
+    const int c = threadIdx.x;                    // 0..31
+    const int col = part * GCW + c;
+    const int rg = threadIdx.y;                   // 0..3
+    const int tid = rg * GCW + c;                 // 0..127
+    const int qh = head % h_k;
+    const int qk = S * h_k;                       // q at [0, qk), k at [qk, 2qk), v at [2qk, ...)
+    const int value_dim = S * h_v;
+    const int n_run = n_keep ? *n_keep : T;
+    const int n = n_run < kVerifyMaxT ? n_run : kVerifyMaxT;   // the host keeps T <= kVerifyMaxT; wsum/ocs hold that
+    float s[RPG];
+    float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+    const size_t row_stride = (size_t) h_v * S;
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+    __cluster_barrier_wait();                     // every block of the cluster is running: DSMEM is live
+    for (int t = 0; t < n; ++t) {
+        const float* ht = hbuf + (size_t) t * C;
+        __syncthreads();                          // the previous token is done with sk/sq, red_kv and red_o
+        if (tid < S) { sk[tid] = ht[qk + qh * S + tid]; sq[tid] = ht[qh * S + tid]; }
+        __syncthreads();
+        const float g = __expf(gate[(size_t) t * h_v + head]);
+        float kv = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
+        red_kv[rg][c] = kv;
+        __syncthreads();
+        const float kv_col = red_kv[0][c] + red_kv[1][c] + red_kv[2][c] + red_kv[3][c];
+        const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
+        float o = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) {
+            s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
+            o = fmaf(s[r], sq[rg * RPG + r], o);
+        }
+        red_o[rg][c] = o;
+        __syncthreads();
+        float oc = 0.0f, sq_part = 0.0f;
+        if (rg == 0) {
+            oc = (red_o[0][c] + red_o[1][c] + red_o[2][c] + red_o[3][c]) * rsqrtf((float) S);
+            sq_part = oc * oc;
+        }
+        if (t < t_out_begin) continue;   // a replayed token: its state update is needed, its output is not
+        for (int o2 = 16; o2 > 0; o2 >>= 1) sq_part += __shfl_xor_sync(0xffffffffu, sq_part, o2);
+        if (rg == 0) {
+            ocs[t][c] = oc;
+            if (c == 0) {
+#pragma unroll
+                for (int b = 0; b < GC; ++b)
+                    static_cast<float*>(__cluster_map_shared_rank(&wsum[t][0], (unsigned) b))[part] = sq_part;
+            }
+        }
+    }
+    __cluster_barrier_arrive();                   // release: every push above ...
+    __cluster_barrier_wait();                     // ... is visible here, and no block reads another after this
+    if (rg == 0) {
+        for (int t = t_out_begin; t < n; ++t) {
+            const float ss = wsum[t][0] + wsum[t][1] + wsum[t][2] + wsum[t][3];
+            const float scale = rsqrtf(ss / (float) S + eps);
+            const float zz = z[(size_t) t * value_dim + head * S + col];
+            y[(size_t) t * value_dim + head * S + col] = ocs[t][c] * scale * gamma[col] * (1.0f / (1.0f + __expf(-zz)));
+        }
+    }
+    if (n_keep != nullptr && n > 0) {
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
+    }
+#endif
+}
+
+bool multi_cluster_ready() {
+    static const bool ready = cluster_launchable(gdn_step_norm_multi_cluster_kernel, dim3(GCW, RG), GC);
+    return ready;
+}
+
 __global__ void embedding_gather_dev_kernel(const uint8_t* __restrict__ codes, const float* __restrict__ scales,
                                             const float* __restrict__ offsets, const int32_t* __restrict__ tokens,
                                             int64_t n, int code_bits, int code_bias, int group_elems,
@@ -505,9 +610,34 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         std::fprintf(stderr, "gdn_step_norm_multi: invalid arguments\n");
         std::exit(1);
     }
-    gdn_step_norm_multi_kernel<<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(
-        state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin);
+    if (gdn_step_norm_multi_cluster_path()) {
+        cudaLaunchAttribute at{};
+        at.id = cudaLaunchAttributeClusterDimension;
+        at.val.clusterDim.x = GC;
+        at.val.clusterDim.y = 1;
+        at.val.clusterDim.z = 1;
+        cudaLaunchConfig_t cfg{};
+        cfg.gridDim = dim3((unsigned) (h_v * GC));
+        cfg.blockDim = dim3(GCW, RG);
+        cfg.stream = (cudaStream_t) stream;
+        cfg.attrs = &at;
+        cfg.numAttrs = 1;
+        const cudaError_t e = cudaLaunchKernelEx(&cfg, gdn_step_norm_multi_cluster_kernel, state, h, conv_channels, gate,
+                                                 beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin);
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "gdn_step_norm_multi (cluster; STRATA_OLD_GDN_STEP=1 avoids it): %s\n",
+                         cudaGetErrorString(e));
+            std::exit(1);
+        }
+    } else {
+        gdn_step_norm_multi_kernel<<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(
+            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin);
+    }
     check("gdn_step_norm_multi");
+}
+
+bool gdn_step_norm_multi_cluster_path() {
+    return !old_gdn_step().on() && multi_cluster_ready();
 }
 
 namespace {

@@ -24,7 +24,9 @@ void fused_gdn_conv_l2(float* history, const float* qkv, const float* conv_w, fl
 
 /// alpha and beta, both `(h_v, n_embd)` BF16 against the FP32 activation, with their epilogues:
 /// gate = softplus(alpha + dt) * ssm_a,  beta = sigmoid(beta).  One warp per row; replaces two MMVF launches and
-/// two elementwise kernels.
+/// two elementwise kernels.  Issue #26: each row now has a block of four warps that stage it (bitwise the same;
+/// STRATA_OLD_GDN_AB=1 for the warp-per-row launch), and the step below a cluster of 4 blocks per head
+/// (STRATA_OLD_GDN_STEP=1) - see launch_grid.hpp.
 void fused_gdn_ab(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
                   float* gate, float* beta, int n_embd, int h_v, void* stream);
 

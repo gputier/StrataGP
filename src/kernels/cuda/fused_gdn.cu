@@ -184,6 +184,89 @@ __global__ void __launch_bounds__(AB_THREADS) gdn_ab_row_kernel(const float* __r
     }
 }
 
+// Issue #26 (O7): the step above with a head's 128 columns split over a cluster of GC blocks (32 columns x 4 row
+// groups each), so the 6.3 MB of state traffic runs on 4x the SMs.  A column's arithmetic never leaves its thread
+// and is the kernel's above line for line (its 32 rows per row group, the four row-group partials summed in the
+// same order).  The RMS norm spans the head: warp 0 of each block holds 32 consecutive columns with the same lane
+// per column as warp `part` of the kernel above, so its butterfly is the same, and its sum is pushed into every
+// block of the cluster (distributed shared memory) - `ss` adds the same four warp sums in the same order.  The
+// result is bitwise the one-block-per-head kernel's.  sm_90 and newer; the launcher checks before using it.
+constexpr int GC = 4;                             // blocks per head
+constexpr int GCW = S / GC;                       // 32 columns per block
+
+__global__ void __launch_bounds__(GCW * RG) gdn_step_norm_cluster_kernel(float* __restrict__ state,
+                                                                         const float* __restrict__ q,
+                                                                         const float* __restrict__ k,
+                                                                         const float* __restrict__ v,
+                                                                         const float* __restrict__ gate,
+                                                                         const float* __restrict__ beta,
+                                                                         const float* __restrict__ z,
+                                                                         const float* __restrict__ gamma, float eps,
+                                                                         float* __restrict__ y, int h_k, int h_v) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    __shared__ float sk[S], sq[S];
+    __shared__ float red[RG][GCW];
+    __shared__ float wsum[S / 32];                // the head's four warp sums, one pushed by each block
+    __cluster_barrier_arrive_relaxed();           // waited below, before the first store into another block
+    const int part = (int) __clusterRelativeBlockRank();
+    const int head = blockIdx.x / GC;
+    const int c = threadIdx.x;                    // 0..31
+    const int col = part * GCW + c;
+    const int rg = threadIdx.y;                   // 0..3
+    const int tid = rg * GCW + c;                 // 0..127: loads sk/sq like the first 128 threads above
+    const int qh = head % h_k;
+    if (tid < S) { sk[tid] = k[qh * S + tid]; sq[tid] = q[qh * S + tid]; }
+    float s[RPG];
+    float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+    const size_t row_stride = (size_t) h_v * S;
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+    __syncthreads();
+    const float g = __expf(gate[head]);
+    float kv = 0.0f;
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
+    red[rg][c] = kv;
+    __syncthreads();
+    const float kv_col = red[0][c] + red[1][c] + red[2][c] + red[3][c];
+    const float delta = (v[head * S + col] - g * kv_col) * beta[head];
+    float o = 0.0f;
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) {
+        s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
+        o = fmaf(s[r], sq[rg * RPG + r], o);
+        base[r * row_stride] = s[r];
+    }
+    __syncthreads();                              // every thread has read red[] for kv_col
+    red[rg][c] = o;
+    __syncthreads();
+    float oc = 0.0f, sq_part = 0.0f;
+    if (rg == 0) {
+        oc = (red[0][c] + red[1][c] + red[2][c] + red[3][c]) * rsqrtf((float) S);
+        sq_part = oc * oc;
+    }
+    for (int o2 = 16; o2 > 0; o2 >>= 1) sq_part += __shfl_xor_sync(0xffffffffu, sq_part, o2);
+    __cluster_barrier_wait();                     // every block of the cluster is running: DSMEM is live
+    if (tid == 0) {
+#pragma unroll
+        for (int b = 0; b < GC; ++b) static_cast<float*>(__cluster_map_shared_rank(wsum, (unsigned) b))[part] = sq_part;
+    }
+    __cluster_barrier_arrive();                   // release: the pushes above ...
+    __cluster_barrier_wait();                     // ... are visible here, and no block reads another after this
+    if (rg == 0) {
+        const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
+        const float scale = rsqrtf(ss / (float) S + eps);
+        const float zz = z[head * S + col];
+        y[head * S + col] = oc * scale * gamma[col] * (1.0f / (1.0f + __expf(-zz)));
+    }
+#endif
+}
+
+bool step_cluster_ready() {
+    static const bool ready = cluster_launchable(gdn_step_norm_cluster_kernel, dim3(GCW, RG), GC);
+    return ready;
+}
+
 }  // namespace
 
 void fused_gdn_conv_l2(float* history, const float* qkv, const float* conv_w, float* h, int channels, int qk_heads,
@@ -220,13 +303,38 @@ void fused_gdn_step_norm(float* state, const float* q, const float* k, const flo
         std::fprintf(stderr, "fused_gdn_step_norm: invalid arguments\n");
         std::exit(1);
     }
-    gdn_step_norm_kernel<<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, q, k, v, gate, beta, z,
-                                                                                   gamma, eps, y, h_k, h_v);
+    if (fused_gdn_step_cluster_path()) {
+        cudaLaunchAttribute at{};
+        at.id = cudaLaunchAttributeClusterDimension;
+        at.val.clusterDim.x = GC;
+        at.val.clusterDim.y = 1;
+        at.val.clusterDim.z = 1;
+        cudaLaunchConfig_t cfg{};
+        cfg.gridDim = dim3((unsigned) (h_v * GC));
+        cfg.blockDim = dim3(GCW, RG);
+        cfg.stream = (cudaStream_t) stream;
+        cfg.attrs = &at;
+        cfg.numAttrs = 1;
+        const cudaError_t le = cudaLaunchKernelEx(&cfg, gdn_step_norm_cluster_kernel, state, q, k, v, gate, beta, z,
+                                                  gamma, eps, y, h_k, h_v);
+        if (le != cudaSuccess) {
+            std::fprintf(stderr, "fused_gdn_step_norm (cluster; STRATA_OLD_GDN_STEP=1 avoids it): %s\n",
+                         cudaGetErrorString(le));
+            std::exit(1);
+        }
+    } else {
+        gdn_step_norm_kernel<<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, q, k, v, gate, beta, z,
+                                                                                       gamma, eps, y, h_k, h_v);
+    }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "fused_gdn_step_norm: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
+}
+
+bool fused_gdn_step_cluster_path() {
+    return !old_gdn_step().on() && step_cluster_ready();
 }
 
 }  // namespace strata::kernels
