@@ -3339,6 +3339,7 @@ int main(int argc, char** argv) {
                         return false;
                     host_res[(size_t) i] = slot;
                 }
+                res_up.sync();   // an upload of #16 still in flight on the refill stream must not land after this one
                 cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
                 lent_now.clear();
                 lent_chunk = 0;
@@ -3364,6 +3365,7 @@ int main(int argc, char** argv) {
                         lent_now.emplace_back((int32_t) i, host_res[i]);
                         host_res[i] = strata::core::kNotResident;
                     }
+                res_up.sync();   // the same: the prompt path reads d_res, which must be this table
                 cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
                 lent_chunk = want;
                 return true;
