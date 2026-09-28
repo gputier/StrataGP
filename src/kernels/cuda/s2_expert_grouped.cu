@@ -478,9 +478,11 @@ void check(const char* who, void* stream) {
 }
 
 // O3 (#17): the previous kernels stay selectable for A/B - `STRATA_OLD_GROUPED=1` in the environment, or
-// `moe_grouped_select_old` (the parity test runs both in one process).  Decided at launch, so a captured graph keeps
-// the kernels it was captured with.
+// `moe_grouped_select_old` (the parity test runs both in one process).  The environment is read once, on first use;
+// the choice is made at each launch, so a captured graph keeps the kernels it was captured with.
 std::atomic<int> g_select_old{-1};
+// Which kernels the last launch of an entry point used: 1 = O3, 0 = previous, -1 = none since the last query.
+std::atomic<int> g_last_path{-1};
 
 bool old_kernels() {
     const int s = g_select_old.load(std::memory_order_relaxed);
@@ -492,16 +494,34 @@ bool old_kernels() {
     return env;
 }
 
+// `STRATA_GROUPED_PAIR_MIN_HITS=N`: the per-hit path keeps the previous one-warp-per-row kernels below N hits of
+// capacity.  The O3 per-hit kernels launch half the warps (two rows each), so one hit's gate/up is 80 blocks - fewer
+// than an RTX 5090's SMs - and whether that costs time at one to three hits is what `--bench` measures.  Bitwise
+// the same either way; default 0 (always O3).  Ignored while `moe_grouped_select_old` forces a choice.
+long long pair_min_hits() {
+    if (g_select_old.load(std::memory_order_relaxed) >= 0) return 0;
+    static const long long n = [] {
+        const char* e = std::getenv("STRATA_GROUPED_PAIR_MIN_HITS");
+        return e != nullptr ? std::atoll(e) : 0LL;
+    }();
+    return n;
+}
+
 // The new kernels read the activations as aligned words (`load_x_chunk`), so they need 4-byte aligned activation
 // rows - the input's and the intermediate's in `scratch`; the per-hit ones also read a blob's codes as uint2, which
 // needs an 8-byte aligned arena and slot size (the grouped kernels above already did).  Anything else keeps the
 // previous kernels rather than issuing a misaligned load.
 bool new_grouped(const void* x_q8_0, const void* scratch) {
-    return !old_kernels() && ((uintptr_t) x_q8_0 & 3) == 0 && ((uintptr_t) scratch & 3) == 0;
+    const bool fast = !old_kernels() && ((uintptr_t) x_q8_0 & 3) == 0 && ((uintptr_t) scratch & 3) == 0;
+    g_last_path.store(fast ? 1 : 0, std::memory_order_relaxed);
+    return fast;
 }
 
-bool new_hit(const void* blob_base, long long blob_bytes, const void* x_q8_0, const void* scratch) {
-    return new_grouped(x_q8_0, scratch) && ((uintptr_t) blob_base & 7) == 0 && (blob_bytes & 7) == 0;
+bool new_hit(const void* blob_base, long long blob_bytes, const void* x_q8_0, const void* scratch, long long cap) {
+    const bool fast = new_grouped(x_q8_0, scratch) && ((uintptr_t) blob_base & 7) == 0 && (blob_bytes & 7) == 0 &&
+                      cap >= pair_min_hits();
+    g_last_path.store(fast ? 1 : 0, std::memory_order_relaxed);
+    return fast;
 }
 
 // The per-hit path's two projections, previous or O3 kernels (one warp per row, or per pair of rows).
@@ -539,6 +559,8 @@ void launch_hit_down(bool fast, const uint8_t* blob_base, const int32_t* slot_in
 
 void moe_grouped_select_old(int old) { g_select_old.store(old < 0 ? -1 : (old != 0 ? 1 : 0)); }
 
+int moe_grouped_last_path() { return g_last_path.exchange(-1, std::memory_order_relaxed); }
+
 uint64_t moe_hit_grouped_scratch_bytes(int64_t n_hits, int64_t n_embd, int64_t n_ff) {
     if (n_hits <= 0) return 0;
     const uint64_t gu = (uint64_t) n_hits * (uint64_t) (2 * n_ff) * 4;
@@ -555,7 +577,7 @@ void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, con
                         void* stream, const float* x_scales) {
     if (n_hits <= 0) return;
     cudaStream_t cs = (cudaStream_t) stream;
-    const bool fast = new_hit(blob_base, blob_bytes, x_q8_0, scratch);   // O3 (#17)
+    const bool fast = new_hit(blob_base, blob_bytes, x_q8_0, scratch, n_hits);   // O3 (#17)
 
     const uint64_t gu_bytes = ((uint64_t) n_hits * (uint64_t) (2 * FF) * 4 + 15) & ~15ull;
     const uint64_t q8_bytes = ((uint64_t) n_hits * (uint64_t) (FF / 32) * 34 + 15) & ~15ull;
@@ -659,7 +681,7 @@ void moe_hit_grouped_s2_dev(const uint8_t* blob_base, const int32_t* slot_index,
                             void* scratch, float* out, void* stream, const float* x_scales) {
     if (cap <= 0) return;
     cudaStream_t cs = (cudaStream_t) stream;
-    const bool fast = new_hit(blob_base, blob_bytes, x_q8_0, scratch);   // O3 (#17)
+    const bool fast = new_hit(blob_base, blob_bytes, x_q8_0, scratch, cap);   // O3 (#17)
     const uint64_t gu_bytes = ((uint64_t) cap * (uint64_t) (2 * FF) * 4 + 15) & ~15ull;
     const uint64_t q8_bytes = ((uint64_t) cap * (uint64_t) (FF / 32) * 34 + 15) & ~15ull;
     float* gate_up = (float*) scratch;
@@ -696,7 +718,7 @@ void moe_hit_grouped_s2_multi(const uint8_t* blob_base, const int32_t* slot_inde
                               const float* x_scales, int k_per_token, void* scratch, float* out, void* stream) {
     if (cap <= 0) return;
     cudaStream_t cs = (cudaStream_t) stream;
-    const bool fast = new_hit(blob_base, blob_bytes, x_q8_0, scratch);   // O3 (#17)
+    const bool fast = new_hit(blob_base, blob_bytes, x_q8_0, scratch, cap);   // O3 (#17)
     const uint64_t gu_bytes = ((uint64_t) cap * (uint64_t) (2 * FF) * 4 + 15) & ~15ull;
     const uint64_t q8_bytes = ((uint64_t) cap * (uint64_t) (FF / 32) * 34 + 15) & ~15ull;
     float* gate_up = (float*) scratch;
