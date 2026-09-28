@@ -238,3 +238,10 @@ explicite des fichiers.
 - **VRAM de l'état** : la moitié libérée de chaque tranche n'est pas rendue (~54 Mo) ; le faire changerait la
   disposition de l'arène et le budget du planificateur pour un gain négligeable.
 - **S6** (prefill par couche entière) : hors de ce paquet.
+
+## Intégration (`perf/all`)
+
+- Le pas GDN en cluster de `grids` (#26) est aussi instancié pour l'état BF16 : `--gdn-state-bf16` le garde.
+- Les points de reprise du pool épinglé de `prefill-host` (#45) copient l'état selon `gdn_runs` (les seules parties
+  vivantes avec l'état BF16), en asynchrone sur le flux du pool ; `STRATA_OLD_CKPT=1` garde les copies synchrones,
+  avec la même disposition. Voir [../PERF-CHANGES.md](../PERF-CHANGES.md).

@@ -207,3 +207,10 @@ Tests lancés ici (sans GPU) : compilation complète (sm_120) sans avertissement
 `pool_test` : échec attendu (pas de pack de modèle) ; `grids_parity` et `grids_parity_capture` : échec attendu
 (pas de pilote CUDA) ;
 `python3 serve/test_server.py` : 26 tests OK.
+
+## Intégration (`perf/all`)
+
+Avec `research` (#53, `--gdn-state-bf16`), les kernels en cluster du pas GDN (`gdn_step_norm_cluster_kernel`,
+`gdn_step_norm_multi_cluster_kernel`) sont des templates sur le type de stockage de l'état, comme les kernels d'un
+bloc par tête : l'état BF16 garde le lancement en cluster. L'instanciation FP32 est le kernel décrit ici, inchangé ;
+`STRATA_OLD_GDN_STEP=1` rend l'ancien kernel dans les deux cas. Voir [../PERF-CHANGES.md](../PERF-CHANGES.md).

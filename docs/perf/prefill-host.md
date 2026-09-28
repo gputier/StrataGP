@@ -268,3 +268,12 @@ requête le `prompt_ms` de la ligne `DONE` (ou le délai avant le premier token 
 `STRATA_TRACE=1`, les lignes `refill start` / `prompt done`. Les réponses doivent être identiques entre les deux
 premiers lancements. `STRATA_CKPT_REREAD=1` reste le contrôle des points de reprise (relecture au lieu de
 restauration, même réponse attendue avec `--adapt-swaps 0`).
+
+## Intégration (`perf/all`)
+
+- #40 × `qsa-longctx` (#21) : l'ajout par morceau écrit aussi l'ombre FP16 des lignes regroupées et de la clé de
+  secours quand `--idx-fp16` est actif, comme le kernel par cellule ; `qsa_indexer_chunk_parity` le vérifie (cas
+  « fp16 shadow »).
+- #42 × `round-sync` (#16) : le prêt et le re-remplissage des emplacements attendent le téléversement asynchrone de
+  `d_res` encore en vol avant de le réécrire.
+- #45 × `research` (#53) : voir [research.md](research.md). Détail : [../PERF-CHANGES.md](../PERF-CHANGES.md).
