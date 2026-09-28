@@ -303,6 +303,8 @@ if(STRATA_ENABLE_CUDA)
   target_include_directories(grids_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(grids_parity PRIVATE strata_kernels CUDA::cudart)
   add_test(NAME grids_parity COMMAND grids_parity --selftest)
+  # the first launches (device queries, cluster launch) inside a stream capture: a fresh process of its own
+  add_test(NAME grids_parity_capture COMMAND grids_parity --capture)
 
   add_executable(s2_gemv_q8_parity src/kernels/s2_gemv_q8_parity.cpp)
   target_include_directories(s2_gemv_q8_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

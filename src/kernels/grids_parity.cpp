@@ -8,11 +8,15 @@
 //      the state it writes and y;
 //   4. gdn_step_norm_multi: the same, as verify (no n_keep; t_out_begin 0, 1, T-1) and as commit (n_keep 0, 1, T);
 //   5. fetch_blobs (from mapped host memory) and gather_rows: the device-sized grid and 48 * 8 (STRATA_OLD_GRIDS),
-//      both against a host copy.
+//      both against a host copy;
+//   6. --capture (a separate ctest, a fresh process): every launcher's first call - the one-time device queries and
+//      the cluster launch - inside a ThreadLocal stream capture; the graph's bytes against eager, old and host runs.
 //
 // "New equals old" would also pass with both wrong, so 1-4 are ALSO held against a double-precision host
 // reference (a tolerance: the kernels use __expf and fmaf chains).  On a device without clusters (sm_80/86/89) the
-// step checks compare the old kernel with itself; the output says which path ran, so read the "cluster" line.
+// step checks compare the old kernel with itself; the output says which path ran ("cluster" line).  On a device that
+// takes clusters the test FAILS when the cluster kernels did not run (--allow-no-cluster accepts it; --require-cluster
+// fails on any device).
 //
 // --bench: old vs new time per launch of each kernel (cudaEvent over many launches).
 #include "strata/kernels/fused_gdn.hpp"
@@ -463,6 +467,174 @@ void test_gather_rows(int64_t row_bytes, int64_t rows, int64_t n) {
     cudaFree(d_src); cudaFree(d_ids); cudaFree(d_dst);
 }
 
+// ------------------------------------------------------------------ 6. the first launches inside a graph capture
+// The engine captures its decode step, so the first call of a launcher - and with it the one-time device queries of
+// launch_grid.hpp (cudaGetDevice, cudaDeviceGetAttribute, cudaFuncGetAttributes, cudaOccupancyMaxActiveClusters)
+// and the cluster launch - may run inside a ThreadLocal capture.  `--capture` (its own process, its own ctest) makes
+// every launcher's first call there: nothing that reads that device state is called before.  The graph is replayed
+// twice and its bytes held against an eager run of the same calls, against the old launches and (the copies)
+// against the host.
+struct CapBuf {
+    const char* name;
+    void* p;
+    size_t bytes;
+};
+
+std::vector<std::vector<uint8_t>> snapshot(const std::vector<CapBuf>& bufs) {
+    std::vector<std::vector<uint8_t>> out;
+    for (const CapBuf& b : bufs) out.push_back(host_copy(static_cast<const uint8_t*>(b.p), b.bytes));
+    return out;
+}
+
+void set_old_paths(bool v) {
+    sk::old_grids().set(v);
+    sk::old_gdn_ab().set(v);
+    sk::old_gdn_step().set(v);
+}
+
+void capture_test() {
+    std::printf("\n6. every launcher's first call inside a ThreadLocal stream capture\n");
+    const int N = 2560, HV = 48, HK = 16, MT = sk::kVerifyMaxT;
+    const int32_t KEEP = 3;
+    const int qk = S * HK;
+    // alpha/beta: one token and a window of MT
+    const AbCase ab = make_ab(N, HV, MT, 11);
+    float *ax = dev_copy(ab.x), *adt = dev_copy(ab.dt), *asa = dev_copy(ab.ssm_a);
+    uint16_t *awa = dev_copy(ab.wa), *awb = dev_copy(ab.wb);
+    float *g1 = dev_alloc<float>((size_t) HV), *b1 = dev_alloc<float>((size_t) HV);
+    float *gm = dev_alloc<float>((size_t) MT * HV), *bm = dev_alloc<float>((size_t) MT * HV);
+    // the step: one token, a verify window (T = MT, outputs from 1) and a commit of KEEP tokens
+    const StepCase c1 = make_step(HK, HV, 1, 12), cm = make_step(HK, HV, MT, 13);
+    const size_t ns = c1.state.size(), ny1 = (size_t) HV * S, nym = (size_t) MT * HV * S;
+    float *s1_0 = dev_copy(c1.state), *s1 = dev_alloc<float>(ns), *h1 = dev_copy(c1.h);
+    float *ga1 = dev_copy(c1.gate), *be1 = dev_copy(c1.beta), *z1 = dev_copy(c1.z), *gm1 = dev_copy(c1.gamma);
+    float* y1 = dev_alloc<float>(ny1);
+    float *sm_0 = dev_copy(cm.state), *sv = dev_alloc<float>(ns), *sc = dev_alloc<float>(ns), *hm = dev_copy(cm.h);
+    float *gam = dev_copy(cm.gate), *bem = dev_copy(cm.beta), *zm = dev_copy(cm.z), *gmm = dev_copy(cm.gamma);
+    float *yv = dev_alloc<float>(nym), *yc = dev_alloc<float>(nym);
+    int32_t* d_keep = dev_alloc<int32_t>(1);
+    check(cudaMemcpy(d_keep, &KEEP, 4, cudaMemcpyHostToDevice), "keep");
+    // the copies: blobs in mapped host memory, rows in device memory
+    const int64_t blob = 64 * 1024 + 16;
+    const int cap = 5;
+    const int32_t nblob = 3;
+    uint8_t* host = nullptr;
+    check(cudaHostAlloc((void**) &host, (size_t) blob * cap, cudaHostAllocMapped), "cudaHostAlloc");
+    std::mt19937 rng(14);
+    for (int64_t i = 0; i < blob * cap; ++i) host[i] = (uint8_t) rng();
+    uint8_t* host_dev = nullptr;
+    check(cudaHostGetDevicePointer((void**) &host_dev, host, 0), "cudaHostGetDevicePointer");
+    std::vector<unsigned long long> ptrs((size_t) cap);
+    for (int k = 0; k < cap; ++k) ptrs[(size_t) k] = (unsigned long long) (host_dev + (size_t) ((k * 3 + 1) % cap) * blob);
+    unsigned long long* d_ptrs = dev_copy(ptrs);
+    int32_t* d_n = dev_alloc<int32_t>(1);
+    check(cudaMemcpy(d_n, &nblob, 4, cudaMemcpyHostToDevice), "n");
+    uint8_t* d_blobs = dev_alloc<uint8_t>((size_t) blob * cap);
+    const int64_t row = 2100, rows = 300, nrow = 211;
+    std::vector<uint8_t> src((size_t) (row * rows));
+    for (uint8_t& b : src) b = (uint8_t) rng();
+    std::vector<int32_t> ids((size_t) nrow);
+    for (int32_t& i : ids) i = (int32_t) (rng() % (uint32_t) rows);
+    uint8_t* d_src = dev_copy(src);
+    int32_t* d_ids = dev_copy(ids);
+    uint8_t* d_rows = dev_alloc<uint8_t>((size_t) (row * nrow));
+    check(cudaDeviceSynchronize(), "setup");
+
+    enum { kFetch = 10, kGather = 11, kCommitState = 8 };
+    const std::vector<CapBuf> outs = {
+        {"fused_gdn_ab gate", g1, (size_t) HV * 4},       {"fused_gdn_ab beta", b1, (size_t) HV * 4},
+        {"gdn_ab_multi gate", gm, (size_t) MT * HV * 4},  {"gdn_ab_multi beta", bm, (size_t) MT * HV * 4},
+        {"fused_gdn_step_norm state", s1, ns * 4},        {"fused_gdn_step_norm y", y1, ny1 * 4},
+        {"gdn_step_norm_multi verify state", sv, ns * 4}, {"gdn_step_norm_multi verify y", yv, nym * 4},
+        {"gdn_step_norm_multi commit state", sc, ns * 4}, {"gdn_step_norm_multi commit y", yc, nym * 4},
+        {"fetch_blobs", d_blobs, (size_t) blob * cap},    {"gather_rows", d_rows, (size_t) (row * nrow)},
+    };
+    // The copies first: grid_device() is then first read by grid_sms(), and each cluster_launchable() still makes
+    // its own queries (cudaFuncGetAttributes, cudaOccupancyMaxActiveClusters) inside the capture.
+    auto enqueue = [&](cudaStream_t st) {
+        for (const CapBuf& b : outs) check(cudaMemsetAsync(b.p, 0xa5, b.bytes, st), "memset");
+        check(cudaMemcpyAsync(s1, s1_0, ns * 4, cudaMemcpyDeviceToDevice, st), "state");
+        check(cudaMemcpyAsync(sv, sm_0, ns * 4, cudaMemcpyDeviceToDevice, st), "state");
+        check(cudaMemcpyAsync(sc, sm_0, ns * 4, cudaMemcpyDeviceToDevice, st), "state");
+        sk::fetch_blobs(d_ptrs, d_n, d_blobs, blob, cap, st);
+        sk::gather_rows(d_src, row, d_ids, nrow, d_rows, st);
+        sk::fused_gdn_ab(ax, awa, awb, adt, asa, g1, b1, N, HV, st);
+        sk::gdn_ab_multi(ax, awa, awb, adt, asa, gm, bm, N, HV, MT, st);
+        sk::fused_gdn_step_norm(s1, h1, h1 + qk, h1 + 2 * qk, ga1, be1, z1, gm1, EPS, y1, HK, HV, st);
+        sk::gdn_step_norm_multi(sv, hm, cm.C, gam, bem, zm, gmm, EPS, yv, HK, HV, MT, nullptr, st, 1);
+        sk::gdn_step_norm_multi(sc, hm, cm.C, gam, bem, zm, gmm, EPS, yc, HK, HV, MT, d_keep, st, 0);
+    };
+    cudaStream_t st = nullptr;
+    check(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "cudaStreamCreate");
+    check(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), "cudaStreamBeginCapture");
+    enqueue(st);
+    cudaGraph_t graph = nullptr;
+    const cudaError_t ce = cudaStreamEndCapture(st, &graph);
+    const cudaError_t le = cudaGetLastError();
+    const bool captured = ce == cudaSuccess && le == cudaSuccess && graph != nullptr;
+    report(captured, "  %-58s %s%s\n", "capture of the first launches",
+           captured ? "" : std::string(" (") + cudaGetErrorString(ce != cudaSuccess ? ce : le) + ")");
+    if (!captured) return;
+    cudaGraphExec_t exec = nullptr;
+    check(cudaGraphInstantiate(&exec, graph, 0), "cudaGraphInstantiate");
+    check(cudaGraphLaunch(exec, st), "cudaGraphLaunch");
+    check(cudaStreamSynchronize(st), "graph replay 1");
+    const auto rep1 = snapshot(outs);
+    check(cudaGraphLaunch(exec, st), "cudaGraphLaunch");
+    check(cudaStreamSynchronize(st), "graph replay 2");
+    const auto rep2 = snapshot(outs);
+    enqueue(st);
+    check(cudaStreamSynchronize(st), "eager");
+    const auto eager = snapshot(outs);
+    set_old_paths(true);
+    enqueue(st);
+    check(cudaStreamSynchronize(st), "old launches");
+    const auto old = snapshot(outs);
+    set_old_paths(false);
+    for (size_t i = 0; i < outs.size(); ++i) {
+        std::string det;
+        if (rep1[i] != rep2[i]) det += " replay 1 != replay 2;";
+        if (rep1[i] != eager[i]) det += " graph != eager;";
+        if (rep1[i] != old[i]) det += " graph != old launch;";
+        char name[96];
+        std::snprintf(name, sizeof name, "graph: %s", outs[i].name);
+        report(det.empty(), "  %-58s %s%s\n", name, det);
+    }
+    // new == old would also pass with both wrong: the copies against the host, the commit against the double reference
+    int bad = 0;
+    for (int k = 0; k < cap; ++k) {
+        const uint8_t* g = rep1[kFetch].data() + (size_t) k * blob;
+        if (k < nblob) {
+            if (!same_bytes(g, host + (size_t) ((k * 3 + 1) % cap) * blob, (size_t) blob)) ++bad;
+        } else {
+            for (int64_t i = 0; i < blob; ++i)
+                if (g[i] != 0xa5) { ++bad; break; }
+        }
+    }
+    for (int64_t i = 0; i < nrow; ++i)
+        if (!same_bytes(rep1[kGather].data() + i * row, src.data() + (int64_t) ids[(size_t) i] * row, (size_t) row))
+            ++bad;
+    report(bad == 0, "  %-58s %s%s\n", "graph: fetch_blobs / gather_rows vs host");
+    std::vector<double> ref(cm.state.begin(), cm.state.end()), ry;
+    for (int t = 0; t < KEEP; ++t) step_reference(ref, cm, t, ry);
+    std::vector<float> got(ns);
+    std::memcpy(got.data(), rep1[kCommitState].data(), ns * 4);
+    const double e = rel_l1(got, ref);
+    char det[64];
+    std::snprintf(det, sizeof det, " (%.2e)", e);
+    report(e <= 1e-4, "  %-58s %s%s\n", "graph: commit state vs double reference", det);
+    cudaGraphExecDestroy(exec);
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(st);
+    for (void* p : {(void*) ax, (void*) adt, (void*) asa, (void*) awa, (void*) awb, (void*) g1, (void*) b1, (void*) gm,
+                    (void*) bm, (void*) s1_0, (void*) s1, (void*) h1, (void*) ga1, (void*) be1, (void*) z1, (void*) gm1,
+                    (void*) y1, (void*) sm_0, (void*) sv, (void*) sc, (void*) hm, (void*) gam, (void*) bem, (void*) zm,
+                    (void*) gmm, (void*) yv, (void*) yc, (void*) d_keep, (void*) d_ptrs, (void*) d_n, (void*) d_blobs,
+                    (void*) d_src, (void*) d_ids, (void*) d_rows})
+        cudaFree(p);
+    cudaFreeHost(host);
+}
+
 // ------------------------------------------------------------------ --bench
 template <typename Fn>
 double time_us(Fn&& fn, int iters) {
@@ -578,28 +750,48 @@ void bench() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    bool do_bench = false;
+    bool do_bench = false, do_capture = false, require_cluster = false, allow_no_cluster = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--bench") do_bench = true;
         else if (a == "--selftest") {}
-        else { std::fprintf(stderr, "usage: grids_parity [--selftest] [--bench]\n"); return 2; }
+        else if (a == "--capture") do_capture = true;
+        else if (a == "--require-cluster") require_cluster = true;
+        else if (a == "--allow-no-cluster") allow_no_cluster = true;
+        else {
+            std::fprintf(stderr, "usage: grids_parity [--selftest] [--bench] [--capture] "
+                                 "[--require-cluster | --allow-no-cluster]\n");
+            return 2;
+        }
     }
     int dev = 0;
     check(cudaGetDevice(&dev), "cudaGetDevice");
     cudaDeviceProp prop{};
     check(cudaGetDeviceProperties(&prop, dev), "cudaGetDeviceProperties");
+    check(cudaFree(nullptr), "context");
+    // the switches may come from the environment; this test sets them itself (OldPath reads no device state)
+    set_old_paths(false);
+    // --capture: nothing may read launch_grid.hpp's device state before the capture does
+    if (do_capture) capture_test();
     const sk::GridDevice& gd = sk::grid_device();
-    // the switches may come from the environment; this test sets them itself
-    sk::old_grids().set(false);
-    sk::old_gdn_ab().set(false);
-    sk::old_gdn_step().set(false);
-    std::printf("grids_parity: %s, sm_%d%d, %d SMs, clusters %s\n", prop.name, prop.major, prop.minor, gd.sms,
-                gd.clusters ? "yes" : "no");
+    const bool step_cluster = sk::fused_gdn_step_cluster_path();
+    const bool multi_cluster = sk::gdn_step_norm_multi_cluster_path();
+    std::printf("%sgrids_parity: %s, sm_%d%d, %d SMs, clusters %s\n", do_capture ? "\n" : "", prop.name, prop.major,
+                prop.minor, gd.sms, gd.clusters ? "yes" : "no");
     std::printf("  copy grids: %d blocks (48 * 8 = 384 before)\n", sk::grid_sms() * 8);
     std::printf("  cluster: fused_gdn_step_norm %s, gdn_step_norm_multi %s\n",
-                sk::fused_gdn_step_cluster_path() ? "yes" : "NO (old kernel; its checks compare it with itself)",
-                sk::gdn_step_norm_multi_cluster_path() ? "yes" : "NO (old kernel; its checks compare it with itself)");
+                step_cluster ? "yes" : "NO (old kernel; its checks compare it with itself)",
+                multi_cluster ? "yes" : "NO (old kernel; its checks compare it with itself)");
+    // On a device that takes clusters (sm_90 and newer) the new step kernels must have run, or the step checks prove
+    // nothing: a failed readiness query or a build without sm_90+ code would otherwise look green in ctest.
+    // --allow-no-cluster accepts that fallback; --require-cluster fails on any device without the cluster path.
+    if (!(step_cluster && multi_cluster) && (require_cluster || (gd.clusters && !allow_no_cluster)))
+        report(false, "  %-58s %s%s\n", "the cluster step kernels ran",
+               gd.clusters ? " (the device takes clusters; --allow-no-cluster accepts this)" : " (--require-cluster)");
+    if (do_capture) {
+        std::printf("\n%s (%d failed)\n", g_bad ? "FAIL" : "PASS", g_bad);
+        return g_bad ? 1 : 0;
+    }
 
     std::printf("\n1-2. alpha/beta: a block of four warps per row vs a warp per row\n");
     for (int n : {2560, 2048, 4096, 1032, 8, 4104}) test_ab(n, 48);
