@@ -9,6 +9,7 @@
 // logit distributions including ties (where the "smallest index wins" rule is the only thing that decides) and
 // near-ties (where a float difference decides).  It also asserts that the 2**-14 CLAMP CANNOT TRIGGER for this
 // model's geometry - see below - so the absence of a clamp test is a proven fact rather than an omission.
+#include "strata/kernels/native_router.hpp"
 #include "strata/kernels/router_top10.hpp"
 
 #include <cuda_runtime.h>
@@ -107,6 +108,48 @@ int run_case(const char* name, const std::vector<float>& logits, int n_tokens, i
     return (int) (id_bad + w_bad);
 }
 
+/// #8: THE NATIVE ROUTER (`native_router.hpp`, the pinned llama.cpp topk-moe contract, compiled with fast-math),
+/// one launch per token, against the SAME host reference.  It is specified for exactly 512 experts and top 10,
+/// and breaks equal probabilities toward the lower expert index, which is the reference's stable sort - so the
+/// ids must match exactly, ties included.  Its softmax uses __expf and an approximate reciprocal, a few ulp per
+/// probability, which the weights' 1e-5 relative tolerance covers.
+int run_native_case(const char* name, const std::vector<float>& logits, int n_tokens, double tol) {
+    constexpr int NE = 512, K = 10;
+    std::vector<int> r_ids((size_t) n_tokens * K), h_ids((size_t) n_tokens * K);
+    std::vector<float> r_w((size_t) n_tokens * K), h_w((size_t) n_tokens * K);
+    for (int t = 0; t < n_tokens; ++t)
+        reference(&logits[(size_t) t * NE], NE, K, &r_ids[(size_t) t * K], &r_w[(size_t) t * K]);
+    float *d_l = nullptr, *d_w = nullptr;
+    int32_t* d_ids = nullptr;
+    cudaStream_t st = nullptr;
+    check(cudaStreamCreate(&st), "native stream");
+    check(cudaMalloc(&d_l, logits.size() * sizeof(float)), "malloc logits");
+    check(cudaMalloc(&d_ids, h_ids.size() * sizeof(int32_t)), "malloc ids");
+    check(cudaMalloc(&d_w, h_w.size() * sizeof(float)), "malloc w");
+    check(cudaMemcpy(d_l, logits.data(), logits.size() * sizeof(float), cudaMemcpyHostToDevice), "copy");
+    for (int t = 0; t < n_tokens; ++t)
+        strata::kernels::native_router_top10(d_l + (size_t) t * NE, d_ids + (size_t) t * K, d_w + (size_t) t * K, st);
+    check(cudaStreamSynchronize(st), "native router");
+    check(cudaMemcpy(h_ids.data(), d_ids, h_ids.size() * sizeof(int32_t), cudaMemcpyDeviceToHost), "back ids");
+    check(cudaMemcpy(h_w.data(), d_w, h_w.size() * sizeof(float), cudaMemcpyDeviceToHost), "back w");
+    long long id_bad = 0, w_bad = 0;
+    double worst = 0;
+    for (size_t i = 0; i < h_ids.size(); ++i) {
+        if (h_ids[i] != r_ids[i]) ++id_bad;
+        const double rel = std::fabs((double) h_w[i] - (double) r_w[i]) /
+                           (std::fabs((double) r_w[i]) > 1e-30 ? std::fabs((double) r_w[i]) : 1e-30);
+        worst = std::max(worst, rel);
+        if (!(rel <= tol)) ++w_bad;
+    }
+    std::printf("  native %-19s ids %s (%lld bad)   weights worst rel %.3e (%lld over tol)\n", name,
+                id_bad ? "*** WRONG ***" : "exact", id_bad, worst, w_bad);
+    cudaFree(d_l);
+    cudaFree(d_ids);
+    cudaFree(d_w);
+    check(cudaStreamDestroy(st), "native stream destroy");
+    return (int) (id_bad + w_bad);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -144,6 +187,12 @@ int main(int argc, char** argv) {
     std::vector<float> d((size_t) NT * NE, 0.0f);
     for (int t = 0; t < NT; ++t) d[(size_t) t * NE + (t % NE)] = 20.0f;
     bad += run_case("dominant expert", d, NT, NE, K, 1e-5);
+
+    // ---- the same four distributions through the native router (512 experts, top 10 only)
+    bad += run_native_case("random normal", a, NT, 1e-5);
+    bad += run_native_case("all equal (ties)", b, NT, 1e-5);
+    bad += run_native_case("12-way exact tie", c, NT, 1e-5);
+    bad += run_native_case("dominant expert", d, NT, 1e-5);
 
     // ---- THE CLAMP CANNOT TRIGGER, and that is provable rather than untested.
     // The sum of the top k of a probability vector over n outcomes is at least k/n (the minimum is the uniform
