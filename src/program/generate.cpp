@@ -347,7 +347,8 @@ void usage() {
                  "  --dump-residual PATH write the final R (hc x n_embd, f32) for head bisection\n"
                  "  --dump-layers PATH   write R after EVERY layer, per position: the C1 bisection ladder\n"
                  "  --dump-halves PATH   write both halves' block_out and inject per layer: the half bisection\n"
-                 "  --dump-routing PATH  write the routed expert ids and weights per layer per position (P0.S8)\n"
+                 "  --dump-routing PATH  write the routed expert ids and weights per layer per position (P0.S8); a\n"
+                 "                       --spec window writes its committed tokens, weights 0 (tools/routing_locality.py)\n"
                  "  --no-capture         run the layers directly instead of replaying graphs\n"
                  "  --shared-late        A/B: shared expert after the CPU pool (default: overlapped with it)\n"
                  "  --keep-canonical     A/B: also load canonical copies of natively served tensors (more VRAM)\n"
@@ -462,7 +463,51 @@ struct Drive {
     /// needs no locking.  `d.layers` is the CURRENT layer on entry (the adapter increments it as it walks the
     /// blob), which is why the layer index comes from there rather than from a counter of our own.
     std::FILE* routing = nullptr;
+    /// Issue #51: a verify window's routing waits here until its acceptance is known, so that only the committed
+    /// tokens reach the trace, in position order - the same records the token path would have written, which
+    /// makes a --spec run (and a native pack, which decodes only in windows) traceable.  `win[(layer * MAXT + t)
+    /// * k + j]`, `win_n[layer]` tokens held.  The window publishes no weights: they are written as 0.
+    std::vector<int32_t> win;
+    std::vector<int32_t> win_n;
+    int64_t win_k = 0;
+    int64_t routing_records = 0;
 };
+
+constexpr int32_t kRoutingLayers = 48;   // the trace's layer range, as `drive_pool` checks it
+
+/// Holds one layer's ids for the tokens of one call (a whole window, or one group of a split one: a layer's
+/// groups arrive in token order).
+void routing_hold(Drive* t, const int32_t* ids, int64_t n_tok, int64_t k, int64_t layer) {
+    constexpr int MAXT = strata::kernels::kVerifyMaxT;
+    if (layer < 0 || layer >= kRoutingLayers || k < 1) return;
+    if (t->win_k != k) {
+        t->win_k = k;
+        t->win.assign((size_t) kRoutingLayers * MAXT * (size_t) k, -1);
+        t->win_n.assign(kRoutingLayers, 0);
+    }
+    for (int64_t i = 0; i < n_tok && t->win_n[(size_t) layer] < MAXT; ++i) {
+        const size_t at = ((size_t) layer * MAXT + (size_t) t->win_n[(size_t) layer]++) * (size_t) k;
+        std::memcpy(t->win.data() + at, ids + i * k, (size_t) k * sizeof(int32_t));
+    }
+}
+
+/// Writes the first `n_keep` tokens of the held window, each as its layers 0..47, then drops the window.
+void routing_commit(Drive& t, int n_keep) {
+    constexpr int MAXT = strata::kernels::kVerifyMaxT;
+    if (t.routing == nullptr || t.win_k < 1) return;
+    const std::vector<float> zeros((size_t) t.win_k, 0.0f);
+    for (int tok = 0; tok < n_keep && tok < MAXT; ++tok)
+        for (int32_t layer = 0; layer < kRoutingLayers; ++layer) {
+            if (tok >= t.win_n[(size_t) layer]) continue;
+            const int32_t rec[2] = {layer, (int32_t) t.win_k};
+            std::fwrite(rec, sizeof rec, 1, t.routing);
+            std::fwrite(t.win.data() + ((size_t) layer * MAXT + (size_t) tok) * (size_t) t.win_k, sizeof(int32_t),
+                        (size_t) t.win_k, t.routing);
+            std::fwrite(zeros.data(), sizeof(float), zeros.size(), t.routing);
+            ++t.routing_records;
+        }
+    std::fill(t.win_n.begin(), t.win_n.end(), 0);
+}
 
 void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd, int64_t k,
                 float* out) {
@@ -490,6 +535,7 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
         std::fwrite(rec, sizeof rec, 1, t->routing);
         std::fwrite(ids, sizeof(int32_t), (size_t) k, t->routing);
         std::fwrite(weights, sizeof(float), (size_t) k, t->routing);
+        ++t->routing_records;
     }
 }
 
@@ -502,6 +548,7 @@ void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t 
     strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
     ++t->calls;
+    if (t->routing != nullptr) routing_hold(t, ids, n_tok, k, layer);
 }
 
 // ---- issue #31: what the watchdog prints before it stops a stalled engine
@@ -3954,6 +4001,7 @@ int main(int argc, char** argv) {
             }
             int a = 0;
             while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+            routing_commit(drive, a + 1);   // #51: the committed tokens' routing, if --dump-routing
             if (first_window) {
                 first_window = false;
                 ttft_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
@@ -4068,7 +4116,7 @@ int main(int argc, char** argv) {
         std::fclose(routing);
         drive.routing = nullptr;
         std::printf("%-24s %s (%lld records of layer, k, ids, weights)\n", "routing dumped",
-                    o.dump_routing.c_str(), (long long) drive.calls);
+                    o.dump_routing.c_str(), (long long) drive.routing_records);
     }
     if (o.stage_timing) strata::core::stage_timing_report(g.n_layers);
 

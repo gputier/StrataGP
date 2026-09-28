@@ -18,10 +18,12 @@ if they can be guessed.  This reads `--dump-routing` traces and measures, per la
     token (among non-resident experts only), and the result is the share of the misses they cover and their
     precision (useful copies / copies).
 
-THE TRACE: a one-shot run WITHOUT --spec.  `drive_pool` (generate.cpp) writes one record per layer per position of
-the token path; the verify window of --spec does not write it, so a --spec run traces its first token only.  The
-prompt is traced too when it goes through the token path (no --prefill).  Record: int32 layer, int32 k, k int32
-expert ids, k float32 router weights.  A position is a run of records whose layer index increases.
+THE TRACE: a one-shot `strata` run with --dump-routing FILE (generate.cpp).  The token path writes one record per
+layer per position; a verify window (--spec, and every decode window of a native pack) writes its COMMITTED tokens
+once their acceptance is known, in position order and with weights 0 (the window publishes none; the weighted
+figures then count every expert alike).  The prompt is traced when it goes through the token path (no --prefill).
+Record: int32 layer, int32 k, k int32 expert ids, k float32 router weights.  A position is a run of records whose
+layer index increases.
 
     python tools/routing_locality.py TRACE [TRACE ...] [--budget 2,5,10,20,40] [--window 1,2,4,8] [--train-frac 0.5]
                                      [--resident N] [--skip N] [--smooth 8] [--per-layer] [--json OUT]
@@ -84,7 +86,10 @@ def hot(ids, weights, n_expert):
     rows = np.arange(P)[:, None]
     m[rows, col] = True
     w[rows, col] = weights
-    return m[:, :n_expert], w[:, :n_expert]
+    m, w = m[:, :n_expert], w[:, :n_expert]
+    flat = (w.sum(axis=1) <= 0) & m.any(axis=1)          # a verify window's records carry no weights: uniform
+    w[flat] = m[flat] / m[flat].sum(axis=1, keepdims=True)
+    return m, w
 
 
 class Acc:

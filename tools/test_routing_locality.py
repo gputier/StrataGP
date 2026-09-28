@@ -87,6 +87,16 @@ class RoutingLocality(unittest.TestCase):
         self.assertAlmostEqual(r["reuse"]["2"]["reuse"], (k - 1) / k)
         self.assertAlmostEqual(r["reuse"]["2"]["window_experts"], k + 1)
 
+    def test_window_records_without_weights_count_alike(self):
+        # a verify window writes weights 0: the weighted figures must then equal the plain ones
+        k, n = 4, 32
+        pos = [[[(t + j) % n for j in range(k)] for _ in range(2)] for t in range(60)]
+        zeros = [[[0.0] * k for _ in range(2)] for _ in range(60)]
+        r = measure_files([self.trace("w0.bin", pos, zeros)], 2, n, windows=(1,), budgets=(k,))
+        self.assertAlmostEqual(r["reuse"]["1"]["weighted"], r["reuse"]["1"]["reuse"])
+        x = r["next_layer"][str(k)]
+        self.assertAlmostEqual(x["prev_weighted"], x["prev"])
+
     def test_a_layer_map_is_learned(self):
         # layer l+1 = a fixed permutation of layer l, layer 0 random: only the cross-layer table can know it
         rng = random.Random(2)
