@@ -14,6 +14,11 @@
 //                                    share), and more group capacity than groups
 //   5. `moe_group_resident` + `moe_grouped_s2`   the MTP layer's shape, with and without fp32 scales
 //   6. an activation row that is only 2-byte aligned: the new path must fall back to the previous kernels
+//   7. a slot stride that is not a multiple of 8 (BLOB + 4), and 8. an arena 4 bytes past an aligned address: the
+//      per-hit path must fall back as well (its codes are read as uint2)
+// Every run asks `moe_grouped_last_path` which kernels it launched, so a new path that silently declined cannot pass
+// as "the previous kernels against themselves": forced new must report the new kernels, and 6-8 the previous ones.
+// (A misaligned scratch is not exercised: the previous kernels store floats there, so it is not a legal input.)
 // The output AND the scratch (gate/up, the quantized intermediate and its scales) are compared, so a failure names
 // the projection.  Bitwise equality with the previous kernels is the contract; on top of it a double-precision
 // host reference of every up row and every down row checks that the fixture computes an expert at all - two
@@ -142,13 +147,21 @@ struct Run {
 };
 
 bool twice(const char* name, float* d_out, size_t out_floats, const Scratch& s,
-           const std::function<void()>& call, Run* keep) {
+           const std::function<void()>& call, Run* keep, bool expect_new = true) {
     Run r[2];
     for (int old = 1; old >= 0; --old) {
         ck(cudaMemset(d_out, 0xA5, out_floats * 4), "sentinel out");
         ck(cudaMemset(s.p, 0x5A, s.bytes), "sentinel scratch");
         k::moe_grouped_select_old(old);
+        (void) k::moe_grouped_last_path();   // clear
         call();
+        const int path = k::moe_grouped_last_path();
+        const int want = old ? 0 : (expect_new ? 1 : 0);
+        if (path != want) {
+            std::printf("  %-44s forced %s: launched %s kernels, expected %s\n", name, old ? "previous" : "new",
+                        path == 1 ? "the new" : path == 0 ? "the previous" : "no", want ? "the new" : "the previous");
+            ++g_fail;
+        }
         ck(cudaGetLastError(), name);
         ck(cudaDeviceSynchronize(), name);
         Run& x = r[old ? 0 : 1];
@@ -463,8 +476,48 @@ void check_all() {
         Run r;
         twice("moe_hit_grouped_s2 (2-byte aligned x)", d_out, (size_t) K * H, s, [&] {
             k::moe_hit_grouped_s2(fx.d, d_slot, d_dst, n_hits, (int64_t) BLOB, d_x2 + 2, s.p, d_out, nullptr, d_xs);
-        }, &r);
+        }, &r, /*expect_new=*/false);
         reference("moe_hit_grouped_s2 (2-byte aligned x)", r, s, ent, x, &xs);
+    }
+
+    // ---- 7. slots BLOB + 4 bytes apart, and 8. an arena at an address that is 4 mod 8: per-hit fallback
+    {
+        constexpr size_t STRIDE = BLOB + 4;
+        static_assert(STRIDE % 8 != 0, "the stride must defeat the uint2 code loads");
+        const int nb = 8;
+        uint8_t* d_arena = dalloc<uint8_t>((size_t) nb * STRIDE + 8);
+        const int n_hits = 4;
+        std::vector<int32_t> slot{6, 1, 3, 0}, dst{2, 7, 5, 8};
+        int32_t* d_slot = dalloc<int32_t>(n_hits);
+        int32_t* d_dst = dalloc<int32_t>(n_hits);
+        up(d_slot, slot);
+        up(d_dst, dst);
+        const Scratch s = make_scratch(n_hits);
+        float* d_out = dalloc<float>((size_t) K * H);
+        std::vector<Entry> ent;
+        for (int i = 0; i < n_hits; ++i) ent.push_back({fx.hb(slot[i]), 0, dst[i]});
+        // One allocation for both layouts: the BLOB + 4 strided copies first, then the same blobs BLOB apart from
+        // `d_arena + 4` over them.
+        for (int i = 0; i < nb; ++i)
+            ck(cudaMemcpy(d_arena + (size_t) i * STRIDE, fx.hb(i), BLOB, cudaMemcpyHostToDevice), "arena");
+        {
+            Run r;
+            twice("moe_hit_grouped_s2 (slot stride BLOB + 4)", d_out, (size_t) K * H, s, [&] {
+                k::moe_hit_grouped_s2(d_arena, d_slot, d_dst, n_hits, (int64_t) STRIDE, d_x, s.p, d_out, nullptr,
+                                      d_xs);
+            }, &r, /*expect_new=*/false);
+            reference("moe_hit_grouped_s2 (slot stride BLOB + 4)", r, s, ent, x, &xs);
+        }
+        for (int i = 0; i < nb; ++i)
+            ck(cudaMemcpy(d_arena + 4 + (size_t) i * BLOB, fx.hb(i), BLOB, cudaMemcpyHostToDevice), "arena");
+        {
+            Run r;
+            twice("moe_hit_grouped_s2 (arena 4 mod 8)", d_out, (size_t) K * H, s, [&] {
+                k::moe_hit_grouped_s2(d_arena + 4, d_slot, d_dst, n_hits, (int64_t) BLOB, d_x, s.p, d_out, nullptr,
+                                      d_xs);
+            }, &r, /*expect_new=*/false);
+            reference("moe_hit_grouped_s2 (arena 4 mod 8)", r, s, ent, x, &xs);
+        }
     }
 }
 
@@ -524,8 +577,9 @@ void bench() {
                     gb / us[0], us[1], gb / us[1], us[0] / us[1]);
     };
 
-    // per-hit path, decode: 9 hits of 10 (5090-like residency) and 5 of 10
-    for (const int n_hits : {9, 5}) {
+    // per-hit path, decode: 9 hits of 10 (5090-like residency), 5 of 10, and the low-residency 1-3 hits, where the
+    // new kernels' grid (80 gate/up blocks per hit) is below one block per SM - see `STRATA_GROUPED_PAIR_MIN_HITS`
+    for (const int n_hits : {9, 5, 3, 2, 1}) {
         std::vector<int32_t> slots((size_t) SETS * n_hits), dst(K);
         for (auto& v : slots) v = (int32_t) (rng() % nb);
         std::iota(dst.begin(), dst.end(), 0);
