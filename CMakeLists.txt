@@ -335,6 +335,24 @@ if(STRATA_ENABLE_CUDA)
   add_test(NAME grids_parity COMMAND grids_parity --selftest)
   # the first launches (device queries, cluster launch) inside a stream capture: a fresh process of its own
   add_test(NAME grids_parity_capture COMMAND grids_parity --capture)
+  # issues #8/#5: the fused and native GDN kernels (the --native path) over 256 steps against float64, the three
+  # softplus forms, fused_gdn_ab, fused_gdn_conv_l2 and the native preprocessing (synthetic data)
+  add_executable(gdn_fused_parity src/kernels/gdn_fused_parity.cpp)
+  target_include_directories(gdn_fused_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(gdn_fused_parity PRIVATE strata_kernels CUDA::cudart)
+  add_test(NAME gdn_fused_parity COMMAND gdn_fused_parity --selftest)
+
+  # issue #8: fused_gr_read against float64 and fused_gr_read_multi bitwise against it (synthetic data)
+  add_executable(fused_gr_parity src/kernels/fused_gr_parity.cpp)
+  target_include_directories(fused_gr_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(fused_gr_parity PRIVATE strata_kernels CUDA::cudart)
+  add_test(NAME fused_gr_parity COMMAND fused_gr_parity --selftest)
+
+  # issue #8: block scores, block top-k and split-K decode attention (FP16/INT8/Q4_0 pools) against float64
+  add_executable(qsa_decode_parity src/kernels/qsa_decode_parity.cpp)
+  target_include_directories(qsa_decode_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(qsa_decode_parity PRIVATE strata_kernels CUDA::cudart)
+  add_test(NAME qsa_decode_parity COMMAND qsa_decode_parity --selftest)
 
   add_executable(s2_gemv_q8_parity src/kernels/s2_gemv_q8_parity.cpp)
   target_include_directories(s2_gemv_q8_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -365,7 +383,8 @@ if(STRATA_ENABLE_CUDA)
 
   add_executable(quantize_act_parity src/kernels/quantize_act_parity.cpp)
   target_include_directories(quantize_act_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-  target_link_libraries(quantize_act_parity PRIVATE strata_kernels CUDA::cudart)
+  # strata_kernels_cpu: the scaled Q8_0 quantizer is checked against the CPU's own act_quant_q8_1 (issue #8)
+  target_link_libraries(quantize_act_parity PRIVATE strata_kernels strata_kernels_cpu CUDA::cudart)
   add_test(NAME quantize_act_parity COMMAND quantize_act_parity --selftest)
 
   add_executable(router_top10_parity src/kernels/router_top10_parity.cpp)
@@ -564,6 +583,10 @@ if(STRATA_BUILD_TESTS)
     target_link_libraries(round_sync_test PRIVATE CUDA::cudart)
     add_test(NAME round_sync_test COMMAND round_sync_test)
   endif()
+  # issue #13: the f32 -> bf16 rounding against ggml's, NaN included, over every f32 bit pattern (header-only, CPU)
+  add_executable(bf16_bits_test src/kernels/bf16_bits_test.cpp)
+  target_include_directories(bf16_bits_test PRIVATE include)
+  add_test(NAME bf16_bits_test COMMAND bf16_bits_test)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp

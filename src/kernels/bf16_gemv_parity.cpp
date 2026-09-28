@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <string>
 #include <vector>
@@ -54,6 +55,47 @@ void reference(const std::vector<uint16_t>& x, const std::vector<uint16_t>& w, l
             acc += (double) f32_from_bf16(x[(size_t) i]) * (double) f32_from_bf16(w[(size_t) (o * n_in + i)]);
         y[(size_t) o] = (float) acc;
     }
+}
+
+/// #8: `bf16_gemv_fp32_mmvf` (the native single-token MMVF, llama.cpp's order) EMULATED ON THE HOST, bit for bit.
+/// Its order is fully specified: thread t of a block of B takes the pairs t, t + B, ... with two ordered fmaf per
+/// pair, each warp reduces by xor shuffles 16, 8, 4, 2, 1, and for B > 32 warp 0 reduces the per-warp sums the
+/// same way (unused slots hold 0).  B is `mmvf_block_size`, transcribed.  f32 addition is commutative, so every
+/// lane of a butterfly holds the same bits and the emulation is exact - a reordering of the kernel shows up here.
+int mmvf_block_size(long long n_in) {
+    int best = 32;
+    long long best_iterations = (n_in + 63) / 64;
+    for (int candidate = 64; candidate <= 256; candidate += 32) {
+        const long long iterations = (n_in + 2 * candidate - 1) / (2 * candidate);
+        if (iterations < best_iterations) {
+            best_iterations = iterations;
+            best = candidate;
+        }
+    }
+    return best;
+}
+
+float butterfly(std::vector<float> v) {                  // 32 lanes, xor 16..1; lane 0's value
+    for (int off = 16; off > 0; off >>= 1) {
+        std::vector<float> n(32);
+        for (int l = 0; l < 32; ++l) n[(size_t) l] = v[(size_t) l] + v[(size_t) (l ^ off)];
+        v = n;
+    }
+    return v[0];
+}
+
+float mmvf_emulate(const std::vector<float>& x, const uint16_t* w, long long n_in) {
+    const int B = mmvf_block_size(n_in);
+    std::vector<float> acc((size_t) B, 0.0f);
+    for (int t = 0; t < B; ++t)
+        for (long long p = t; p < n_in / 2; p += B) {
+            acc[(size_t) t] = std::fma(f32_from_bf16(w[2 * p]), x[(size_t) (2 * p)], acc[(size_t) t]);
+            acc[(size_t) t] = std::fma(f32_from_bf16(w[2 * p + 1]), x[(size_t) (2 * p + 1)], acc[(size_t) t]);
+        }
+    std::vector<float> partials(32, 0.0f);
+    for (int wp = 0; wp < B / 32; ++wp)
+        partials[(size_t) wp] = butterfly(std::vector<float>(acc.begin() + wp * 32, acc.begin() + wp * 32 + 32));
+    return B > 32 ? butterfly(partials) : partials[0];
 }
 
 }  // namespace
@@ -139,6 +181,54 @@ int main(int argc, char** argv) {
             if (!visible) ++bad;
         }
         cudaFree(d_x); cudaFree(d_w); cudaFree(d_y);
+    }
+
+    // ---- 4. #8: THE NATIVE MMVF (F32 activation, BF16 weight), bitwise against the host emulation of its order and
+    // within 1e-5 of float64.  The shapes cover every block size the selector picks for the engine's projections:
+    // 32 (n_in <= 64), 160 (320: the hyper-connection up rows), 256 (2560 and 10240), and odd leftovers.
+    {
+        struct MShape { long long n_in, n_out; const char* what; };
+        const MShape mshapes[] = {
+            {2560, 48, "ssm_alpha        [2560, 48]"},   {10240, 320, "gr down          [10240, 320]"},
+            {320, 2048, "gr up (rows)     [320, 2048]"}, {2560, 512, "indexer.q_proj   [2560, 512]"},
+            {62, 33, "small            [62, 33]"},     {1000, 7, "ragged           [1000, 7]"},
+            {202, 5, "ragged           [202, 5]"},
+        };
+        for (const MShape& s : mshapes) {
+            std::mt19937 rng(9090 + (unsigned) s.n_in);
+            std::normal_distribution<float> g(0.0f, 1.0f);
+            std::vector<float> x((size_t) s.n_in);
+            std::vector<uint16_t> w((size_t) (s.n_in * s.n_out));
+            for (auto& v : x) v = g(rng);
+            for (auto& v : w) v = bf16_from_f32(g(rng) * 0.05f);
+            std::vector<float> want((size_t) s.n_out), emu((size_t) s.n_out);
+            for (long long o = 0; o < s.n_out; ++o) {
+                double acc = 0;
+                for (long long i = 0; i < s.n_in; ++i)
+                    acc += (double) f32_from_bf16(w[(size_t) (o * s.n_in + i)]) * (double) x[(size_t) i];
+                want[(size_t) o] = (float) acc;
+                emu[(size_t) o] = mmvf_emulate(x, w.data() + o * s.n_in, s.n_in);
+            }
+            float *d_x = nullptr, *d_y = nullptr;
+            uint16_t* d_w = nullptr;
+            check(cudaMalloc(&d_x, x.size() * 4), "mx");
+            check(cudaMalloc(&d_w, w.size() * 2), "mw");
+            check(cudaMalloc(&d_y, (size_t) s.n_out * 4), "my");
+            check(cudaMemcpy(d_x, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "mcx");
+            check(cudaMemcpy(d_w, w.data(), w.size() * 2, cudaMemcpyHostToDevice), "mcw");
+            strata::kernels::bf16_gemv_fp32_mmvf(d_x, d_w, d_y, s.n_in, s.n_out, nullptr);
+            check(cudaDeviceSynchronize(), "mmvf");
+            std::vector<float> got((size_t) s.n_out);
+            check(cudaMemcpy(got.data(), d_y, got.size() * 4, cudaMemcpyDeviceToHost), "mcy");
+            int differ = 0;
+            for (size_t o = 0; o < got.size(); ++o) differ += std::memcmp(&got[o], &emu[o], 4) != 0;
+            const double r = rel_l1(want, got);
+            const bool ok = differ == 0 && r <= 1e-5;
+            std::printf("  mmvf %-30s block %3d: %d of %lld rows differ from the emulated order, rel %.2e  %s\n",
+                        s.what, mmvf_block_size(s.n_in), differ, s.n_out, r, ok ? "ok" : "*** WRONG ***");
+            if (!ok) ++bad;
+            cudaFree(d_x); cudaFree(d_w); cudaFree(d_y);
+        }
     }
 
     std::printf("\nbf16_gemv: %d failures\n", bad);

@@ -305,7 +305,15 @@ int main() {
     ck(cudaMemcpy(h_k_scratch.data(), d_k_scratch, h_k_scratch.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost), "memcpy d2h k_scratch");
     ck(cudaMemcpy(h_v_scratch.data(), d_v_scratch, h_v_scratch.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost), "memcpy d2h v_scratch");
 
-    double worst_quant_err = 0.0;
+    // #8: THE GATHER IS ASSERTED, not only printed.  Two checks per element:
+    //   (a) bit for bit the host's dequantization of the host's own Q4_0 block (test 3 proved those blocks equal
+    //       to the pool's): f16((q - 8) * d16), q from the low nibble for j < 16 and the high one after - so the
+    //       gather's page lookup, nibble order and conversion are exact or the test fails;
+    //   (b) within Q4_0's own bound of the raw value: d = max / -8 puts the extreme at code 0 exactly and every
+    //       other x/d in [-8, 8], so the rounding error is at most |d|/2 - or |d| where x/d >= 7.5 clamps to code
+    //       15 - plus |d16 - d32| * 8 <= |d| * 2^-8 and the FP16 output's half ulp.  Allowed: 1.01 |d16| + |x|/1024.
+    double worst_quant_err = 0.0, worst_ratio = 0.0;
+    long gather_bits_bad = 0, bound_bad = 0;
     for (int i = 0; i < max_ids; ++i) {
         const int cell = ids[i];
         for (int is_v = 0; is_v < 2; ++is_v) {
@@ -313,16 +321,34 @@ int main() {
                 const float* orig = (is_v ? host_v[cell].data() : host_k[cell].data()) + h * D;
                 const uint16_t* gathered = (is_v ? h_v_scratch.data() : h_k_scratch.data()) + (i * H + h) * D;
 
-                for (int d = 0; d < D; ++d) {
-                    float deq = k::f32_from_f16(gathered[d]);
-                    float raw = orig[d];
-                    double err = std::fabs(deq - raw);
-                    if (err > worst_quant_err) worst_quant_err = err;
+                for (int b = 0; b < blocks_per_head; ++b) {
+                    k::block_q4_0 host_blk;
+                    quantize_block_q4_0_host(orig + b * 32, host_blk);
+                    const float d16 = k::f32_from_f16(host_blk.d);
+                    for (int t = 0; t < 32; ++t) {
+                        const int d = b * 32 + t;
+                        const int q = (t < 16 ? (host_blk.qs[t] & 0x0F) : (host_blk.qs[t - 16] >> 4)) - 8;
+                        if (gathered[d] != k::f16_from_f32((float) q * d16)) ++gather_bits_bad;
+                        const float deq = k::f32_from_f16(gathered[d]);
+                        const double err = std::fabs((double) deq - (double) orig[d]);
+                        const double bound = 1.01 * std::fabs((double) d16) + std::fabs((double) orig[d]) / 1024.0;
+                        if (err > worst_quant_err) worst_quant_err = err;
+                        if (bound > 0 && err / bound > worst_ratio) worst_ratio = err / bound;
+                        if (!(err <= bound)) ++bound_bad;
+                    }
                 }
             }
         }
     }
-    std::printf("  -> Max reconstruction error after 4-bit quant + dequant: %.4f (OK)\n", worst_quant_err);
+    std::printf("  -> Max reconstruction error after 4-bit quant + dequant: %.4f (worst %.3f of the Q4_0 bound)\n",
+                worst_quant_err, worst_ratio);
+    if (gather_bits_bad > 0 || bound_bad > 0) {
+        std::fprintf(stderr, "FAIL: %ld gathered values differ from the host dequantization, %ld exceed the Q4_0 "
+                             "error bound\n", gather_bits_bad, bound_bad);
+        ++g_fail;
+    } else {
+        std::printf("  -> Gathered values bitwise the host dequantization, all within the Q4_0 bound (OK)\n");
+    }
 
     cudaFree(d_src);
     cudaFree(d_dst);

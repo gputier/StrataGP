@@ -12,6 +12,8 @@
 //     q   = clip(rint(x / (double)d32), -128, 127)
 //     round trip = q * d16
 #include "strata/kernels/quantize_act.hpp"
+#include "strata/kernels/cpu/expert.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
 #include <cuda_runtime.h>
@@ -22,7 +24,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <random>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -400,7 +405,86 @@ int main(int argc, char** argv) {
         if (!(d / m > 0.005)) ++bad_k;
     }
 
-    std::printf("\nquantize_act: %d failures over 5 Q8_0 + 4 Q8_K distributions\n", bad + bad_k);
+    // ============================== Q8_0 SCALED: THE HIT PATH AGAINST THE MISS PATH (#8) ==============================
+    //
+    // `quantize_q8_0_scaled` exists to reproduce the CPU's `act_quant_q8_1` EXACTLY - same fp32 scale, same
+    // reciprocal multiply, same half-away-from-zero rounding - because a hit (GPU) and a miss (CPU) of the same
+    // expert must compute the same number.  Nothing checked that it does.  Here the REAL CPU function (linked from
+    // strata_kernels_cpu, its AVX2 form on a CPU without AVX-512) is the reference: the int8 codes and the fp32
+    // scales must be bit-identical, and the block's fp16 `d` must be that scale rounded.  The tie fixture puts
+    // x/s exactly on k + 0.5, where half-away and ggml's half-even disagree - asserted observable first.
+    int bad_s = 0;
+    {
+        using strata::kernels::cpu::ActQ;
+        const int n = strata::kernels::cpu::H;              // 2560: 80 chunks, the widest reduction
+        const bool zmm = strata::kernels::cpu::cpu_avx512_ok();
+        auto cpu_quant = [&](const std::vector<float>& x, ActQ& q) {
+            if (zmm) strata::kernels::cpu::act_quant_q8_1(x.data(), n, q);
+            else strata::kernels::cpu::act_quant_q8_1_avx2(x.data(), n, q);
+        };
+        std::vector<std::pair<const char*, std::vector<float>>> cases;
+        {
+            std::vector<float> v((size_t) n);
+            for (auto& e : v) e = gauss(rng);
+            cases.emplace_back("random normal", v);
+            for (auto& e : v) e = gauss(rng) * 1e-6f;
+            cases.emplace_back("small magnitude (1e-6)", v);
+            for (auto& e : v) e = gauss(rng) * 3e4f;
+            cases.emplace_back("large magnitude (3e4)", v);
+            std::fill(v.begin(), v.end(), 0.0f);
+            for (int k = 0; k < n / 32; k += 2) v[(size_t) k * 32 + 5] = 1.0f;     // every other chunk all zero
+            cases.emplace_back("zero chunks", v);
+            // amax = 127 makes s = 1 and inv = 1 exactly, so x = k + 0.5 lands x * inv exactly on the tie
+            for (int i = 0; i < n; ++i) v[(size_t) i] = (float) ((i % 254) - 127) + ((i % 32) == 0 ? 0.0f : 0.5f);
+            for (int k = 0; k < n / 32; ++k) v[(size_t) k * 32] = (k % 2) ? 127.0f : -127.0f;
+            cases.emplace_back("exact .5 ties", v);
+        }
+        uint8_t* d_blk = nullptr;
+        float *d_xs = nullptr, *d_sc = nullptr;
+        check(cudaMalloc(&d_xs, (size_t) n * 4), "scaled x");
+        check(cudaMalloc(&d_blk, (size_t) (n / 32) * 34), "scaled blocks");
+        check(cudaMalloc(&d_sc, (size_t) (n / 32) * 4), "scaled scales");
+        auto q = std::make_unique<ActQ>();
+        for (const auto& [name, x] : cases) {
+            cpu_quant(x, *q);
+            check(cudaMemcpy(d_xs, x.data(), (size_t) n * 4, cudaMemcpyHostToDevice), "scaled cx");
+            strata::kernels::quantize_q8_0_scaled(d_xs, d_blk, d_sc, n, nullptr);
+            check(cudaDeviceSynchronize(), "quantize_q8_0_scaled");
+            std::vector<uint8_t> blk((size_t) (n / 32) * 34);
+            std::vector<float> sc((size_t) (n / 32));
+            check(cudaMemcpy(blk.data(), d_blk, blk.size(), cudaMemcpyDeviceToHost), "scaled cblk");
+            check(cudaMemcpy(sc.data(), d_sc, sc.size() * 4, cudaMemcpyDeviceToHost), "scaled csc");
+            long long code_bad = 0, scale_bad = 0, d16_bad = 0, ties = 0, tie_rule_differs = 0;
+            for (int k = 0; k < n / 32; ++k) {
+                if (std::memcmp(&sc[(size_t) k], &q->scale[k], 4) != 0) ++scale_bad;
+                uint16_t d16;
+                std::memcpy(&d16, &blk[(size_t) k * 34], 2);
+                if (d16 != f32_to_f16_bits(q->scale[k])) ++d16_bad;
+                for (int j = 0; j < 32; ++j) {
+                    if ((int8_t) blk[(size_t) k * 34 + 2 + j] != q->q[k * 32 + j]) ++code_bad;
+                    const float t = x[(size_t) (k * 32 + j)] * (q->scale[k] > 0.f ? 1.f / q->scale[k] : 0.f);
+                    if (t != std::trunc(t) && std::fabs(t - std::trunc(t)) == 0.5f) {
+                        ++ties;
+                        if (std::lround(t) != (long) std::nearbyint(t)) ++tie_rule_differs;
+                    }
+                }
+            }
+            const bool ok = code_bad == 0 && scale_bad == 0 && d16_bad == 0;
+            std::printf("  %-26s codes %lld, fp32 scales %lld, fp16 d %lld differ from act_quant_q8_1%s  %s\n", name,
+                        code_bad, scale_bad, d16_bad, zmm ? "" : " (AVX2)", ok ? "ok" : "*** WRONG ***");
+            if (!ok) ++bad_s;
+            if (std::strcmp(name, "exact .5 ties") == 0) {
+                std::printf("  %-26s %lld exact ties, half-away and half-even disagree on %lld  %s\n", "  tie fixture",
+                            ties, tie_rule_differs, tie_rule_differs > 0 ? "(observable)" : "*** CANNOT SEE THE RULE ***");
+                if (tie_rule_differs == 0) ++bad_s;
+            }
+        }
+        cudaFree(d_xs); cudaFree(d_blk); cudaFree(d_sc);
+    }
+    std::printf("\nquantize_q8_0_scaled: %d failures\n", bad_s);
+    bad_k += bad_s;
+
+    std::printf("\nquantize_act: %d failures over 5 Q8_0 + 4 Q8_K distributions + the scaled Q8_0\n", bad + bad_k);
     if (bad + bad_k) return 1;
     if (selftest) std::printf("quantize_act_parity OK\n");
     return 0;
