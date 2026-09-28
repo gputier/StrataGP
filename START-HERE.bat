@@ -1,8 +1,8 @@
 @echo off
-rem Strata for Windows: the first run installs everything and starts the model; later runs just start it.
+rem StrataGP for Windows: the first run installs everything and starts the model; later runs just start it.
 rem Needs only an NVIDIA driver. Python is installed for your user account if it is missing (no admin needed).
 setlocal
-title Strata
+title StrataGP
 cd /d "%~dp0"
 if exist ".venv\Scripts\python.exe" goto run
 

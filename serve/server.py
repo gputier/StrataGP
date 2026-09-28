@@ -192,7 +192,7 @@ class StrataEngine:
         for line in reversed(tail.splitlines()):
             if "issue #29" in line:
                 return ("The engine stopped itself because it had stopped making progress - a hang it caught. Its log "
-                        "line: " + line.strip() + " - please report it at github.com/Niko1221/Strata/issues.")
+                        "line: " + line.strip() + " - please report it at github.com/gputier/StrataGP/issues.")
         return ("The usual cause is running out of RAM: Linux then ends the biggest program (check: sudo dmesg | "
                 "grep -i -E 'killed process|out of memory'); Windows slows down instead. Close other programs or use a "
                 "smaller model (Q2_0 / IQ2_XS).")
@@ -1073,7 +1073,7 @@ def make_handler(svc: Service):
                 return
             origin = self.headers.get("Origin")
             if origin and origin.split("://", 1)[-1] != self.headers.get("Host", ""):
-                self._json(403, {"error": {"message": "settings can only be changed from Strata's own page"}})
+                self._json(403, {"error": {"message": "settings can only be changed from StrataGP's own page"}})
                 return
             try:
                 req = json.loads(body or b"{}")
@@ -1330,7 +1330,7 @@ def main() -> int:
     try:                                                # before the minutes of loading: is the port free?
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
     except OSError:
-        ap.error(f"port {a.port} is already in use - is Strata (or another server) already running? "
+        ap.error(f"port {a.port} is already in use - is StrataGP (or another server) already running? "
                  f"Close it, or start this one with a different --port")
     if cfg.get("tokenizer"):
         a.tokenizer = cfg["tokenizer"]

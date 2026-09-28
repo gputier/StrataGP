@@ -1,5 +1,5 @@
 #!/bin/sh
-# Strata for Linux: the first run installs everything and starts the model; later runs just start it.
+# StrataGP for Linux: the first run installs everything and starts the model; later runs just start it.
 # Needs only an NVIDIA driver. Python (with venv) is installed through apt/dnf if it is missing (asks for sudo).
 cd "$(dirname "$0")" || exit 1
 # Python 3.10+ that can make a venv WITH pip: Debian/Ubuntu ship `venv` without `ensurepip` (that is the separate

@@ -1,13 +1,15 @@
-<h1 align="center">Strata</h1>
+<h1 align="center">StrataGP</h1>
+
+<p align="center"><sub>A fork of <a href="https://github.com/Niko1221/Strata">Strata</a> by Niko1221</sub></p>
 
 <p align="center"><b>Run a 125-billion-parameter AI model on a normal gaming PC</b><br>
 one NVIDIA card (12-24 GB) + 64 GB of RAM · Windows or Linux · one click to install</p>
 
-<p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that Strata's model wrote, running in the browser"></a><br>
+<p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that StrataGP's model wrote, running in the browser"></a><br>
 <sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
 <a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
 
-Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** - a large, smart AI model that
+StrataGP runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** - a large, smart AI model that
 normally needs a server - on your own PC. It writes its answers at **60-95 tokens per second** (a token is about ¾
 of a word): faster than you can read.
 
@@ -80,7 +82,7 @@ App). Everything else - Python, the engine, the model - is set up for you.
 
 **Windows**
 
-1. [Download this project](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip) and unzip it (or `git clone` it).
+1. [Download this project](https://github.com/gputier/StrataGP/archive/refs/heads/main.zip) and unzip it (or `git clone` it).
 2. Double-click **`START-HERE.bat`**.
 3. Answer a few questions - or just press Enter each time for the recommended choice:
    - **Which model and size?** The original or Swift 1.5, and Q2_0, IQ2_XS, IQ3_XXS or IQ3_S - see [above](#which-model-should-i-pick)
@@ -89,9 +91,9 @@ App). Everything else - Python, the engine, the model - is set up for you.
    - **Experimental speed projection?** Off unless you say yes - [read what it does](docs/DETAILS.md#experimental-speed-projection-experimental-off-by-default) first
 
 Then it downloads everything (the model is ~70 GB, so the first time takes a while - you can stop and it picks up
-where it left off) and **starts the model**. Your browser opens the Strata app at `http://127.0.0.1:8080`.
+where it left off) and **starts the model**. Your browser opens the StrataGP app at `http://127.0.0.1:8080`.
 
-> **While the model starts, your PC can be slow or stop responding for 1-3 minutes** (longest the first time): Strata
+> **While the model starts, your PC can be slow or stop responding for 1-3 minutes** (longest the first time): StrataGP
 > loads 35-55 GB into your RAM and locks part of it for the graphics card. That's normal - wait, and don't close the
 > window. The window tells you what it is doing.
 
@@ -99,17 +101,17 @@ where it left off) and **starts the model**. Your browser opens the Strata app a
 window to stop the model.
 
 **Updating:** download the new version and unzip it anywhere (or `git pull`), then run `START-HERE.bat` in it. The
-model files are kept in a `Strata-data` folder next to your Strata folder, so a new copy finds them and sets itself up
+model files are kept in a `Strata-data` folder next to your StrataGP folder, so a new copy finds them and sets itself up
 the same way - nothing big is downloaded again.
 
 **Linux:** run `./setup.sh` - same questions, same result.
 
 ## Using it
 
-<p align="center"><img src="docs/media/runpagoda.png" width="900" alt="The Strata app's Monitor tab next to a coding agent"><br>
-<sub>The Strata app's <b>Monitor</b> (left) while a coding agent writes the pagoda garden from the video (right)</sub></p>
+<p align="center"><img src="docs/media/runpagoda.png" width="900" alt="The StrataGP app's Monitor tab next to a coding agent"><br>
+<sub>The StrataGP app's <b>Monitor</b> (left) while a coding agent writes the pagoda garden from the video (right)</sub></p>
 
-- **In the browser:** `http://127.0.0.1:8080` - the Strata app (it opens by itself when the model starts): **Chat**, a
+- **In the browser:** `http://127.0.0.1:8080` - the StrataGP app (it opens by itself when the model starts): **Chat**, a
   live **Monitor** of the model and your GPU/CPU/RAM, and **About** with the settings and addresses.
 - **Chat in the terminal:** `.venv\Scripts\python chat.py`
 - **Your apps and coding agents:** add it as an "OpenAI-compatible" provider with base URL
@@ -127,8 +129,8 @@ the same way - nothing big is downloaded again.
 
 ## Something went wrong?
 
-**My PC froze, or got very slow, the first time Strata started.**
-That's normal while it starts, most of all the first time. Strata loads 35-55 GB into your RAM, locks part of it for
+**My PC froze, or got very slow, the first time StrataGP started.**
+That's normal while it starts, most of all the first time. StrataGP loads 35-55 GB into your RAM, locks part of it for
 the graphics card, and works out how much of the model fits on your GPU. The mouse can freeze for a few minutes. **Wait, and don't close the
 window.** The next starts are much faster. Still frozen after 10 minutes? Restart the PC, close other programs
 (browsers use a lot of RAM) and try again. If it keeps happening, pick a smaller size (Q2_0 or IQ2_XS).
@@ -141,13 +143,13 @@ Update it (NVIDIA App or [nvidia.com/drivers](https://www.nvidia.com/drivers)), 
 `START-HERE.bat` again.
 
 **It says port 8080 is already in use.**
-Strata is already running. Look for its window.
+StrataGP is already running. Look for its window.
 
 **It's very slow and the disk light keeps blinking.**
 Your PC is out of free RAM. Close other programs, or pick a smaller size (Q2_0 or IQ2_XS).
 
 **An answer stopped with "the engine stopped unexpectedly".**
-Usually not enough RAM (on Linux the system then stops the engine). Just send your message again: Strata starts the
+Usually not enough RAM (on Linux the system then stops the engine). Just send your message again: StrataGP starts the
 engine by itself. If it keeps happening, close other programs or pick a smaller size.
 
 **It says the prompt exceeds the context.**
@@ -155,12 +157,12 @@ The conversation is longer than the context you chose. Start a new chat, or run 
 context.
 
 **Still stuck?** Look in the [full troubleshooting table](docs/DETAILS.md#troubleshooting), or open an issue and
-attach `strata-<model>.log` from the Strata folder.
+attach `strata-<model>.log` from the StrataGP folder.
 
 ## How does it work?
 
 Models like this one normally run on servers with hundreds of gigabytes of graphics memory. Your graphics card has
-12-24 GB. Strata makes it fit by **sharing the work across your whole PC** - the same idea as a kitchen, where the
+12-24 GB. StrataGP makes it fit by **sharing the work across your whole PC** - the same idea as a kitchen, where the
 things you use all the time stay on the counter and the rest waits in the pantry.
 
 <p align="center"><img src="docs/media/how-it-works.svg" width="860" alt="The model's 24,576 experts: the busiest on the graphics card, all of them in RAM, a lookup table on the SSD"></p>
@@ -197,7 +199,7 @@ Want the full picture? The [details](docs/DETAILS.md#how-it-works) explain every
 
 ## License
 
-Strata is open source under the [MIT License](LICENSE). A few parts carry their own licenses: `third_party/ggml`
+StrataGP is open source under the [MIT License](LICENSE). A few parts carry their own licenses: `third_party/ggml`
 (MIT, llama.cpp / ggml), the web app's font (SIL Open Font License 1.1) and the experimental speed projection's
 vector in `data/experimental-speed-projection` (Qwen Community License 1.0, from the model's activations). The
 models are not part of this repository; each model's own license applies to its files.

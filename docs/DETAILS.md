@@ -1,6 +1,6 @@
-# Strata - the details
+# StrataGP - the details
 
-The technical side of Strata: every measured number, the API, images, all settings and how the engine works.
+The technical side of StrataGP: every measured number, the API, images, all settings and how the engine works.
 New here? Start with the [README](../README.md) - it has everything you need to install and use it.
 
 > **On this page:** [Speed](#speed-measured) · [Other GPUs](#other-gpus-estimated) · [Which model?](#which-model) ·
@@ -114,7 +114,7 @@ RCO on code, agentic and vision calibration data; its authors report 91.3% of th
 98.7% of LiveCodeBench v6. One size, named IQ1_M for its 1.89 bits per *original* parameter; the kept experts are
 stored like IQ3_S (IQ2_S-IQ4_XS gate/up, IQ4_NL/Q2_0 down). Shard 1 is 29.6 GB (experts: 23 GB of RAM), so it runs
 on **32 GB of RAM**, and at 262K on 64 GB. Its shard 2 and its vision encoder are the original's files: with the
-original installed, setup downloads only shard 1. Strata ships its expert profile (`data/expert-profile-coder.bin`,
+original installed, setup downloads only shard 1. StrataGP ships its expert profile (`data/expert-profile-coder.bin`,
 the shipped ranking mapped onto the kept experts through the release's `rco-allocation.txt`: 72% of the expert
 reads hit the GPU on a 12 GB card). Images work; the experimental speed projection loads and runs on it (it was made
 for the full model).
@@ -128,7 +128,7 @@ START-HERE.bat --setup --family coder
 The setup's first question also offers **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)**,
 UkisAI's fine-tune of Qwen3.8-Flash-Next, trained to reach the answer with much less thinking (its authors: 63% fewer
 thinking tokens, 1.8x sooner answers, under 1% accuracy loss). Same architecture, the same three sizes, its own
-vision encoder; Strata runs it at the same speed (4K, IQ2_XS: 465 prompt / 78.7 output tokens/s, vs 467 / 78.3 for
+vision encoder; StrataGP runs it at the same speed (4K, IQ2_XS: 465 prompt / 78.7 output tokens/s, vs 467 / 78.3 for
 the original). Its authors recommend **IQ2_XS** (their Q2_0 is marked experimental). Its license is the Swift Open
 License 1.0 - read it on the model page.
 
@@ -154,12 +154,12 @@ You need **only an NVIDIA driver** (version 580 or newer; update it with the NVI
 | OS | Windows 10/11, or Linux (Ubuntu 22.04/24.04 get everything installed automatically). |
 
 What the first start installs: in this folder `.venv/`, `engine/` and `third_party/`; the model files (`models/`,
-`packs/`, `mtp/`, 70-120 GB) in **`Strata-data` next to this folder**, so a new copy of Strata (an update unzipped
+`packs/`, `mtp/`, 70-120 GB) in **`Strata-data` next to this folder**, so a new copy of StrataGP (an update unzipped
 elsewhere) finds them and sets itself up the same way. The place is remembered per user (`%APPDATA%\Strata\settings.json`,
 `~/.config/strata/settings.json`); `--data-dir` chooses another. Installs from before 0.1.16 are moved there by the next
 start (a rename on the same drive; files on another drive are used where they are).
 Python 3.12 if you have none (for your user account, no admin), a private Python environment, NVIDIA's CUDA libraries
-(from pip, ~0.4 GB), the ready-made Strata engine for RTX 30/40/50, the model and the MTP draft layer. If no
+(from pip, ~0.4 GB), the ready-made StrataGP engine for RTX 30/40/50, the model and the MTP draft layer. If no
 ready-made engine fits your PC, it offers to install the build tools (Visual Studio Build Tools + CUDA Toolkit on
 Windows, `build-essential` + CUDA on Ubuntu) and compiles the engine for your GPU (asks first; 20-40 minutes once).
 
@@ -177,7 +177,7 @@ Windows, `build-essential` + CUDA on Ubuntu) and compiles the engine for your GP
 4. **Images?** yes / no (see [Images](#images-vision)).
 
 Then it downloads and prepares everything (the model is 66-76 GB, so the first start takes a while; an interrupted
-download continues where it stopped) and **starts the model**: your browser opens `http://127.0.0.1:8080`, the Strata
+download continues where it stopped) and **starts the model**: your browser opens `http://127.0.0.1:8080`, the StrataGP
 app. It has three tabs:
 - **Chat:** streaming answers, the model's thinking (folded away once it answers), code with a copy button, pictures when
   images are on, and sampling and thinking-level settings. Chats stay in your browser.
@@ -276,7 +276,7 @@ print(r.choices[0].message.content)
   connection or pressing stop in your app really stops the model, so the next request starts at once.
 - **Chat apps.** Any app with an "OpenAI-compatible" provider works: base URL `http://127.0.0.1:8080/v1`, any API key.
 - **Claude Code** (Strata 0.1.17 or newer): set `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` and
-  `ANTHROPIC_MODEL` to a Claude model name it knows (it refuses names it doesn't; Strata ignores the name), plus any
+  `ANTHROPIC_MODEL` to a Claude model name it knows (it refuses names it doesn't; StrataGP ignores the name), plus any
   `ANTHROPIC_AUTH_TOKEN` (or your `api_key`, if you set one).
 - **Context.** Chosen in setup (8K-262K). Requests longer than that are refused, never silently cut. A request whose
   `max_tokens` would run past the context is refused too (400); agents that always ask for their full output cap
@@ -380,7 +380,7 @@ on the GPU, measured through the API):
 run below the long-output speed: the first rounds have no draft yet.)
 
 **How it works inside:** the encoder turns the picture into rows of the same width as the model's word embeddings;
-Strata puts them where the prompt has `<|image_pad|>` tokens and gives each one its 2-D position (row and column in the
+StrataGP puts them where the prompt has `<|image_pad|>` tokens and gives each one its 2-D position (row and column in the
 picture; the model uses interleaved M-RoPE). Answers match llama.cpp's multimodal implementation token for token on our
 test images.
 
@@ -388,7 +388,7 @@ test images.
 
 ## Experimental speed projection (EXPERIMENTAL, off by default)
 
-**This is an experiment, not a finished feature.** It ships with Strata but stays off unless you turn it on.
+**This is an experiment, not a finished feature.** It ships with StrataGP but stays off unless you turn it on.
 
 A 480 KB control vector for Qwen3.8-Flash-Next (`data/experimental-speed-projection/`, see its README). After each
 of layers 4-44 the engine removes one direction from every hyper-connection stream of the residual: `h -= (h . v) v`,
@@ -406,7 +406,7 @@ no), or pass `--experimental-speed-projection on` (`off`, or a path to another v
 Qwen3.8-Flash-Next, not Swift 1.5. It writes these engine flags (llama.cpp's) into `strata-<model>.json`:
 
 ```
---control-vector-scaled <Strata>\data\experimental-speed-projection\Qwen3.8-Flash-Next-experimental-speed-projection.gguf:1.0
+--control-vector-scaled <StrataGP>\data\experimental-speed-projection\Qwen3.8-Flash-Next-experimental-speed-projection.gguf:1.0
 --control-vector-layer-range 4 44 --cvec-mode project --cvec-dir per-layer
 ```
 
@@ -431,7 +431,7 @@ the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
 | --- | --- |
 | `the NVIDIA driver is too old` | Update the driver (NVIDIA App or nvidia.com/drivers), restart, run `START-HERE.bat` again. |
 | Python or the build tools could not be installed | Install what it names (links are printed), then run it again. Everything already done is kept. |
-| `port 8080 is already in use` | Strata is already running (look for its window), or another program uses the port: `START-HERE.bat --port 8081`. |
+| `port 8080 is already in use` | StrataGP is already running (look for its window), or another program uses the port: `START-HERE.bat --port 8081`. |
 | `cudaHostRegister ... out of memory` in the log | Normal on Windows: the engine pins the experts in per-layer slices instead. Only a problem if the load then fails. |
 | The first start takes minutes | It is reading 34-55 GB into RAM; the second start is faster while the files are in the OS cache. |
 | The PC freezes for a few minutes at the start | Normal, most of all the first time (the server window says when it happens): the engine loads the experts into RAM, pins part of it for the GPU and sizes the expert cache. Wait; don't close the window. Still frozen after 10 minutes: restart the PC, close other programs, try again, or pick a smaller size. |
@@ -471,7 +471,7 @@ The full story, with measurements, bottlenecks and what comes next: **[docs/pape
 
 ## Credits and licenses
 
-Strata itself: [MIT](../LICENSE). The model files are not part of it; their licenses apply to them (below).
+StrataGP itself: [MIT](../LICENSE). The model files are not part of it; their licenses apply to them (below).
 
 - Model: [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team; quantizations:
   [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF).

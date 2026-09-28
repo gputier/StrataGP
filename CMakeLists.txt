@@ -1,4 +1,4 @@
-﻿# Strata Engine - top-level build (P1.S1).
+﻿# StrataGP Engine - top-level build (P1.S1).
 #
 # Targets (phase-1 Ă‚Â§P1.S1): `strata_artifact` (no CUDA dependency), `tests`.  `strata_plan` and the C++
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
@@ -18,7 +18,7 @@ if(MSVC AND CMAKE_BUILD_TYPE STREQUAL "Release")
 endif()
 
 # The prebuilt release (setup.py downloads it, so users need no compiler): ggml's CPU backend for any AVX2 CPU
-# instead of this machine's (Strata's own AVX-512 kernels are per-file and chosen at run time either way), and
+# instead of this machine's (StrataGP's own AVX-512 kernels are per-file and chosen at run time either way), and
 # the MSVC runtime linked in, so no Visual C++ redistributable is needed.
 option(STRATA_PORTABLE "build for other PCs: AVX2 baseline, static MSVC runtime" OFF)
 if(STRATA_PORTABLE AND MSVC)
@@ -58,11 +58,11 @@ if(STRATA_ENABLE_CUDA)
     endif()
     if(_base LESS 80)
       message(FATAL_ERROR
-        "Strata needs an NVIDIA GPU of compute capability 8.0 or newer (RTX 30 / 40 / 50 series), but "
+        "StrataGP needs an NVIDIA GPU of compute capability 8.0 or newer (RTX 30 / 40 / 50 series), but "
         "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}'.")
     endif()
   endforeach()
-  message(STATUS "Strata: CUDA enabled, arch ${CMAKE_CUDA_ARCHITECTURES}")
+  message(STATUS "StrataGP: CUDA enabled, arch ${CMAKE_CUDA_ARCHITECTURES}")
 endif()
 
 # Warnings live on an INTERFACE target the project's own code links, NOT in add_compile_options: applied
