@@ -103,6 +103,86 @@ class Calibrate(unittest.TestCase):
         self.assertEqual(CAL.pick({}, "a"), "a")
 
 
+class SpecEngine(FakeEngine):
+    """Speed also depends on the verify window the engine was started with (--spec)."""
+
+    def __init__(self, args, speed, info_workers=6, starts=None):
+        self.spec = int(CAL.arg_value(args, "--spec") or 0)
+        full = speed
+        super().__init__(args, lambda f, p, w: full(f, p, w, self.spec), info_workers, starts)
+
+
+class CalibrateSpec(unittest.TestCase):
+    """Issue #50: the verify window, measured only on request, kept only when it beats --spec 4 by more than 3%."""
+
+    def run_with(self, speed, specs=CAL.SPECS, workers=6, base=BASE):
+        starts = []
+        res = CAL.measure(base, [[1, 2, 3]] * 3, lambda a: SpecEngine(a, speed, workers, starts),
+                          say=lambda *_: None, specs=specs)
+        return res, starts
+
+    def test_not_measured_by_default(self):
+        res, starts = self.run_with(lambda f, p, w, s: 50.0 + 10 * s, specs=())
+        self.assertNotIn("--spec", res["settings"])
+        self.assertTrue(all(CAL.arg_value(a, "--spec") == "4" for a in starts))
+        self.assertNotIn("spec", res["report"])
+
+    def test_longer_window_kept(self):
+        res, starts = self.run_with(lambda f, p, w, s: {4: 50.0, 5: 56.0, 6: 53.0}[s])
+        self.assertEqual(res["settings"].get("--spec"), "5")
+        self.assertEqual(sorted(res["report"]["spec"]), ["4", "5", "6"])
+        self.assertEqual(len(res["report"]["spec"]["5"]), CAL.SPEC_RUNS)
+        self.assertEqual([CAL.arg_value(a, "--spec") for a in starts[1:4]], ["4", "5", "6"])
+        # the worker counts are then measured with the chosen window
+        self.assertTrue(all(CAL.arg_value(a, "--spec") == "5" for a in starts[4:]))
+        self.assertEqual(res["report"]["tok_s"], 56.0)
+
+    def test_small_gain_is_noise(self):
+        res, _ = self.run_with(lambda f, p, w, s: {4: 50.0, 5: 51.0, 6: 51.4}[s])
+        self.assertNotIn("--spec", res["settings"])
+
+    def test_with_the_chosen_pcie_share(self):
+        res, starts = self.run_with(lambda f, p, w, s: 50.0 + (10.0 if abs(f - 0.2) < 1e-6 else 0.0) + (s == 6) * 5)
+        self.assertEqual(res["settings"].get("--pcie-frac"), "0.20")
+        self.assertEqual(res["settings"].get("--spec"), "6")
+        self.assertTrue(all(CAL.arg_value(a, "--pcie-frac") == "0.20" for a in starts[1:]))
+
+    def test_apply(self):
+        a = CAL.apply(BASE, {"--spec": "6"})
+        self.assertEqual(CAL.arg_value(a, "--spec"), "6")
+        self.assertEqual(CAL.arg_value(CAL.apply(a, {}), "--spec"), "4")      # an older calibration does not linger
+        no_spec = [x for x in BASE if x not in ("--spec", "4")]
+        self.assertIsNone(CAL.arg_value(CAL.apply(no_spec, {"--spec": "6"}), "--spec"))   # never adds speculation
+
+    def test_parse(self):
+        self.assertEqual(CAL.parse_specs("6,4, 5,5"), (4, 5, 6))
+        self.assertEqual(CAL.parse_specs(""), ())
+        self.assertEqual(CAL.parse_specs(None), ())
+        for bad in ("4,x", "1", "9"):
+            with self.assertRaises(ValueError):
+                CAL.parse_specs(bad)
+
+    def test_env_asks_run_for_it(self):
+        seen = {}
+        saved = CAL.measure
+        CAL.measure = lambda args, ids, start, say, specs=(): seen.setdefault("specs", specs) or {}
+        os.environ["STRATA_CALIBRATE_SPEC"] = "4,6"
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                import strata_tokenizer as ST                   # a byte-level vocabulary, no merges but one
+                t = Path(d)
+                toks = [ST.BYTE_TO_UNICODE[b] for b in range(256)] + ["ab", "<|im_start|>", "<|im_end|>", "<think>",
+                                                                     "</think>"]
+                (t / "vocab.json").write_text(json.dumps({s: i for i, s in enumerate(toks)}))
+                (t / "merges.txt").write_text("a b", encoding="utf-8")
+                (t / "token_type.json").write_text(json.dumps([1] * 257 + [3, 3, 4, 4]))
+                CAL.run({"tokenizer": d, "args": BASE}, start_engine=lambda a: None)
+        finally:
+            CAL.measure = saved
+            del os.environ["STRATA_CALIBRATE_SPEC"]
+        self.assertEqual(seen["specs"], (4, 6))
+
+
 class SetupIntegration(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

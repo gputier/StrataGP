@@ -11,14 +11,21 @@ measured on (a Ryzen 5 7600 + RTX 5070 on PCIe 5):
 The first two are measured through one engine (per-request `strata_tune` keys); the worker count needs a restart
 per value.  Decode speed only: the prompt path streams every expert whatever these settings say.
 
+On request (issue #50), also
+  --spec          the verify window: the tokens one round checks (setup writes 4).  With most experts in VRAM (a
+                  32 GB card) a longer window costs little CPU and can pay.  A restart per value, 3 runs of the 3
+                  prompts each, so it is off unless asked: `--spec 4,5,6` here, or STRATA_CALIBRATE_SPEC=4,5,6 for
+                  setup's --calibrate.
+
 A setting is kept only when it beats the default by more than MIN_GAIN in an interleaved re-measurement - the
 adaptive expert tier and the OS make single measurements noisy by a few percent.
 
-    python tools/calibrate.py strata-q2_0.json        # measure and print; setup.py --calibrate also saves it
+    python tools/calibrate.py strata-q2_0.json [--spec 4,5,6]   # measure and print; setup.py --calibrate saves it
 """
 from __future__ import annotations
 
 import json
+import os
 import statistics
 import sys
 import threading
@@ -32,6 +39,9 @@ sys.path.insert(0, str(ROOT))
 MIN_GAIN = 0.03                    # a setting must beat the default by this much to be kept
 PCIE_FRACS = (0.0, 0.2, 0.35, 0.55, 0.75)
 SPEC_MIN_PS = (0.3, 0.5, 0.7)
+SPECS = (4, 5, 6)                  # the verify windows measured on request (issue #50)
+SPEC_DEFAULT = "4"                 # setup.py's --spec
+SPEC_RUNS = 3                      # runs of the prompts per window, after one warm-up
 MAX_NEW = 128
 PROMPTS = (
     "Write a Python function that merges two sorted lists into one sorted list, with a docstring and two tests.",
@@ -69,6 +79,19 @@ def worker_candidates(default: int) -> list[int]:
     return c
 
 
+def parse_specs(text: str | None) -> tuple[int, ...]:
+    """`4,5,6` -> (4, 5, 6); empty or None -> ().  The engine's verify window takes 2..8 tokens."""
+    if not text or not text.strip():
+        return ()
+    try:
+        vals = tuple(sorted({int(x) for x in text.replace(" ", "").split(",") if x}))
+    except ValueError:
+        raise ValueError(f"--spec values: a comma-separated list such as 4,5,6, not {text!r}") from None
+    if any(not 2 <= v <= 8 for v in vals):
+        raise ValueError(f"--spec values are 2..8, not {text!r}")
+    return vals
+
+
 def pick(measured: dict, default_key, min_gain: float = MIN_GAIN):
     """The key with the best median tok/s, or `default_key` unless the best beats it by more than min_gain."""
     med = {k: statistics.median(v) for k, v in measured.items() if v}
@@ -102,9 +125,12 @@ class Session:
             self.rate()
 
 
-def run(cfg: dict, say=print, start_engine=None) -> dict:
+def run(cfg: dict, say=print, start_engine=None, specs=None) -> dict:
     """Measure on the engine `cfg` describes; returns {"settings": {flag: value}, "report": {...}}.
-    `start_engine(args)` returns a started engine (serve.server.StrataEngine or a stand-in in tests)."""
+    `start_engine(args)` returns a started engine (serve.server.StrataEngine or a stand-in in tests).
+    `specs`: the verify windows to measure (None: $STRATA_CALIBRATE_SPEC, else none)."""
+    if specs is None:
+        specs = parse_specs(os.environ.get("STRATA_CALIBRATE_SPEC"))
     if start_engine is None:
         from serve.server import StrataEngine, child_env
 
@@ -119,10 +145,10 @@ def run(cfg: dict, say=print, start_engine=None) -> dict:
     tok = ST.Tokenizer(toks, (tpath / "merges.txt").read_text(encoding="utf-8").split("\n"),
                        json.loads((tpath / "token_type.json").read_text()))
     ids_list = [chat_ids(tok, p) for p in PROMPTS]
-    return measure(cfg["args"], ids_list, start_engine, say)
+    return measure(cfg["args"], ids_list, start_engine, say, specs=specs)
 
 
-def measure(base_args: list[str], ids_list, start_engine, say=print) -> dict:
+def measure(base_args: list[str], ids_list, start_engine, say=print, specs=()) -> dict:
     t0 = time.time()
     report: dict = {}
     say("  Loading the model for the measurements ...")
@@ -166,9 +192,31 @@ def measure(base_args: list[str], ids_list, start_engine, say=print) -> dict:
         settings["--pcie-frac"] = f"{chosen[0]:.2f}"
         settings["--spec-min-p"] = f"{chosen[1]:.2f}"
     base_rate = statistics.median(confirm[chosen]) if confirm.get(chosen) else None
-    # 4. fewer CPU workers (a restart each), with the chosen settings
+    tuned = with_arg(with_arg(base_args, "--pcie-frac", f"{chosen[0]:.2f}"), "--spec-min-p", f"{chosen[1]:.2f}")
+    # 4. on request, the verify window (a restart each, SPEC_RUNS runs of the prompts), with the chosen settings;
+    #    every window, the default included, in a fresh engine, so they start from the same expert cache
+    d_spec = arg_value(base_args, "--spec")
+    windows = sorted(set(specs) | {int(d_spec)}) if specs and d_spec and d_spec.isdigit() else []
+    if len(windows) > 1:
+        by_spec = {}
+        for k in windows:
+            say(f"  Measuring the verify window --spec {k} (restarts the engine) ...")
+            e = start_engine(with_arg(tuned, "--spec", str(k)))
+            try:
+                sk = Session(e, ids_list)
+                sk.warm_up(1)
+                by_spec[k] = [sk.rate() for _ in range(SPEC_RUNS)]
+                say(f"    --spec {k}: {statistics.median(by_spec[k]):.1f} tok/s")
+            finally:
+                close(e)
+        s_best = pick(by_spec, int(d_spec))
+        report["spec"] = {str(k): v for k, v in by_spec.items()}
+        if s_best != int(d_spec):
+            settings["--spec"] = str(s_best)
+        base_rate = statistics.median(by_spec[s_best])
+        tuned = with_arg(tuned, "--spec", str(s_best))
+    # 5. fewer CPU workers (a restart each), with the chosen settings
     if d_workers and len(worker_candidates(d_workers)) > 1:
-        tuned = with_arg(with_arg(base_args, "--pcie-frac", f"{chosen[0]:.2f}"), "--spec-min-p", f"{chosen[1]:.2f}")
         by_workers = {}
         for w in worker_candidates(d_workers):
             say(f"  Measuring with {w} CPU workers (restarts the engine) ...")
@@ -215,11 +263,21 @@ def apply(args: list[str], settings: dict) -> list[str]:
     out = list(args)
     for flag, default in DEFAULTS.items():
         out = with_arg(out, flag, settings.get(flag, default))
+    if arg_value(out, "--spec") is not None:            # issue #50: never added to a config that does not speculate
+        out = with_arg(out, "--spec", settings.get("--spec", SPEC_DEFAULT))
     return out
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        sys.exit("usage: calibrate.py <strata-*.json>")
-    res = run(json.loads(Path(sys.argv[1]).read_text(encoding="utf-8-sig")))
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("config", help="a run config written by setup (strata-*.json)")
+    ap.add_argument("--spec", default=None, help="also measure these verify windows, e.g. 4,5,6 (a restart each; "
+                                                 "default: $STRATA_CALIBRATE_SPEC, else not measured)")
+    a = ap.parse_args()
+    try:
+        specs = parse_specs(a.spec) if a.spec is not None else None
+    except ValueError as e:
+        ap.error(str(e))
+    res = run(json.loads(Path(a.config).read_text(encoding="utf-8-sig")), specs=specs)
     print(json.dumps(res, indent=1))
