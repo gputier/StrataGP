@@ -1,5 +1,6 @@
 // src/kernels/iq_multi_parity.cpp - O3b (#18): the IQ kernels that decode each weight part once for every
-// column / entry, against the older kernels that decode it again per column.  Synthetic blocks, no model.
+// column / entry, against the older kernels that decode it again per column; B5 (#4): the q8_1 quantizers'
+// division.  Synthetic blocks, no model.
 //
 //     build/iq_multi_parity            the checks (a ctest; needs the GPU)
 //     build/iq_multi_parity --bench    the checks, then old/new timings of both paths
@@ -10,12 +11,14 @@
 //     guard, not the contract.
 // (2) native_expert_grouped, every gate/up format with the down formats: groups of 0..11 entries (more than a pass
 //     of GRP_NC), unused grid rows (cap_groups > groups), scattered destinations; bitwise, new vs old, the rows it
-//     must not write included.
+//     must not write included - (4) with both divisions (iq_set_fast_div).
+// (3) quantize_q8_1_rows with the fast division gives native_quantize_q8_1's bytes, near-.5 values included.
 //
 // Random bytes are valid codes for every format here (all grid indices are in range); only the fp16 block scales
 // are set, small enough that the grouped path's SwiGLU output keeps a finite fp16 q8_1 scale.
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 
 #include <cuda_runtime.h>
 
@@ -251,21 +254,85 @@ struct Grouped {
 void check_grouped(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& rng) {
     // 0..11 entries per group: one pass, a partial pass, two passes and three passes of GRP_NC = 4
     Grouped G(gu, dt, H, FF, {1, 3, 4, 5, 0, 8, 2, 11, 1}, 8, rng);
-    const auto a = G.result(true, s), b = G.result(false, s);
-    size_t diff = 0, written = 0;
-    bool finite = true;
-    for (size_t i = 0; i < a.size(); ++i) {
-        diff += std::memcmp(&a[i], &b[i], 4) != 0;
-        if (i < (size_t) G.n_ent * H) { ++written; finite = finite && std::isfinite(b[i]); }
+    std::vector<float> by_mode[2];
+    for (int fast = 0; fast < 2; ++fast) {   // (4): the same contract with STRATA_IQ_FASTDIV's division
+        k::iq_set_fast_div(fast != 0);
+        const auto a = G.result(true, s), b = G.result(false, s);
+        size_t diff = 0;
+        bool finite = true;
+        for (size_t i = 0; i < a.size(); ++i) {
+            diff += std::memcmp(&a[i], &b[i], 4) != 0;
+            if (i < (size_t) G.n_ent * H) finite = finite && std::isfinite(b[i]);
+        }
+        const bool ok = diff == 0 && finite;
+        std::printf("%-8s/%-7s %5lld x %4lld  native_expert_grouped, %d groups, %d entries, %s division: %s\n",
+                    name_of(gu), name_of(dt), (long long) H, (long long) FF, G.n_groups, G.n_ent,
+                    fast ? "fast" : "IEEE", ok ? "bitwise equal to the old kernels" : "FAIL");
+        if (!ok) {
+            std::printf("  %zu of %zu floats differ%s\n", diff, a.size(), finite ? "" : ", non-finite outputs");
+            ++g_fail;
+        }
+        by_mode[fast] = b;
     }
-    const bool ok = diff == 0 && finite;
-    std::printf("%-8s/%-7s %5lld x %4lld  native_expert_grouped, %d groups, %d entries: %s\n", name_of(gu),
-                name_of(dt), (long long) H, (long long) FF, G.n_groups, G.n_ent,
-                ok ? "bitwise equal to the old kernels" : "FAIL");
-    if (!ok) {
-        std::printf("  %zu of %zu floats differ%s\n", diff, a.size(), finite ? "" : ", non-finite outputs");
-        ++g_fail;
+    k::iq_set_fast_div(false);
+    size_t moved = 0;
+    for (size_t i = 0; i < (size_t) G.n_ent * H; ++i) moved += std::memcmp(&by_mode[0][i], &by_mode[1][i], 4) != 0;
+    std::printf("  IEEE vs fast division: %zu of %lld outputs differ (information, not a check)\n", moved,
+                (long long) G.n_ent * H);
+}
+
+// ------------------------------------------------------------------------------------ (3) B5: the q8_1 contract
+// With the fast division, quantize_q8_1_rows (iq_kernels.cu, compiled without --use_fast_math) must give the bytes
+// native_quantize_q8_1 (native_mmvq.cu, compiled with it) gives.  Column 6 puts every value within a few ulps of a
+// rounding boundary of x/d, where the IEEE and approximate divisions part.
+void check_quantizers(cudaStream_t s, std::mt19937& rng) {
+    const int n_in = 2560, ncols = 8;
+    std::vector<float> x((size_t) ncols * n_in);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::uniform_real_distribution<float> ud(0.f, 1.f);
+    std::uniform_int_distribution<int> kd(-126, 126), pd(-4, 4);
+    const float scale[ncols] = {1e-3f, 1e-1f, 1.f, 3.f, 1e2f, 1e3f, 0.f, 1.f};
+    for (int c = 0; c < ncols; ++c)
+        for (int i = 0; i < n_in; ++i) x[(size_t) c * n_in + i] = scale[c] * nd(rng);
+    for (int b = 0; b < n_in / 32; ++b) {                     // column 6: x = (k + 1/2) d, give or take a few ulps
+        float* xb = &x[(size_t) 6 * n_in + b * 32];
+        const float d0 = std::ldexp(1.f + ud(rng), -(b % 20));
+        xb[0] = 127.f * d0;
+        for (int i = 1; i < 32; ++i) {
+            const float v = ((float) kd(rng) + 0.5f) * d0;
+            xb[i] = std::nextafter(v, pd(rng) >= 0 ? INFINITY : -INFINITY);
+            for (int j = std::abs(pd(rng)); j > 0; --j) xb[i] = std::nextafter(xb[i], v >= 0 ? INFINITY : -INFINITY);
+        }
     }
+    for (int i = 0; i < 32; ++i) x[(size_t) 7 * n_in + i] = 0.f;   // an all-zero block
+    for (int i = 32; i < 64; ++i) x[(size_t) 7 * n_in + i] = i == 40 ? -2.5f : 0.f;
+    float* dx = dalloc<float>(x.size());
+    ck(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
+    const size_t bytes = k::native_q8_1_bytes(n_in, ncols);
+    uint8_t *dn = dalloc<uint8_t>(bytes), *di = dalloc<uint8_t>(bytes), *df = dalloc<uint8_t>(bytes);
+    k::native_quantize_q8_1(dx, dn, n_in, ncols, s);
+    k::iq_set_fast_div(false);
+    k::quantize_q8_1_rows(dx, ncols, n_in, di, s);
+    k::iq_set_fast_div(true);
+    k::quantize_q8_1_rows(dx, ncols, n_in, df, s);
+    k::iq_set_fast_div(false);
+    ck(cudaStreamSynchronize(s), "sync");
+    std::vector<uint8_t> qn(bytes), qi(bytes), qf(bytes);
+    ck(cudaMemcpy(qn.data(), dn, bytes, cudaMemcpyDeviceToHost), "qn");
+    ck(cudaMemcpy(qi.data(), di, bytes, cudaMemcpyDeviceToHost), "qi");
+    ck(cudaMemcpy(qf.data(), df, bytes, cudaMemcpyDeviceToHost), "qf");
+    size_t fast_diff = 0, ieee_q = 0, ieee_d = 0;
+    for (size_t b = 0; b < bytes / 36; ++b) {
+        fast_diff += std::memcmp(&qn[b * 36], &qf[b * 36], 36) != 0;
+        ieee_d += std::memcmp(&qn[b * 36], &qi[b * 36], 2) != 0;
+        for (int i = 4; i < 36; ++i) ieee_q += qn[b * 36 + i] != qi[b * 36 + i];
+    }
+    std::printf("q8_1 quantizers, %zu blocks: fast division vs native_quantize_q8_1: %zu blocks differ: %s\n",
+                bytes / 36, fast_diff, fast_diff ? "FAIL" : "bitwise equal");
+    std::printf("  IEEE division (the default) vs native_quantize_q8_1: %zu int8 and %zu fp16 scales differ "
+                "(information, not a check)\n", ieee_q, ieee_d);
+    g_fail += fast_diff != 0;
+    cudaFree(dx); cudaFree(dn); cudaFree(di); cudaFree(df);
 }
 
 // ------------------------------------------------------------------------------------------------ --bench
@@ -340,6 +407,7 @@ int main(int argc, char** argv) {
         for (int dt : {20, 42}) check_grouped(gu, dt, 2560, 640, s, rng);   // the model's shape
         check_grouped(gu, 23, 1024, 512, s, rng);                           // IQ4_XS down needs n_ff % 256 == 0
     }
+    check_quantizers(s, rng);
     if (do_bench) bench(s, rng);
     std::printf("iq_multi_parity: %d failures\n", g_fail);
     cudaStreamDestroy(s);

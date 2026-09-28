@@ -735,12 +735,14 @@ __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned lon
     }
 }
 
+// FAST (B5, #4): the division as the --use_fast_math files make it, shared_expert.cu's native_swiglu_kernel
+template<bool FAST>
 __global__ void swiglu_entries_kernel(const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ h,
                                       long long n) {
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float g = gate[i];
-    h[i] = (g / (1.0f + __expf(-g))) * up[i];
+    h[i] = (FAST ? __fdividef(g, 1.0f + __expf(-g)) : g / (1.0f + __expf(-g))) * up[i];
 }
 
 template<int TD>
@@ -796,6 +798,13 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
 }
 
 // ---------------------------------------------------------------- q8_1 (quantize.cu)
+// B5 (#4): this file is not in CMakeLists.txt's --use_fast_math list, so `/` is the IEEE division (div.rn), while
+// native_mmvq.cu's native_quantize_q8_1_kernel - the same llama.cpp quantizer - gets div.approx.ftz from the flag.
+// An int8 flips where x/d lies within an ulp or two of .5, and d itself can differ in the last bit before its fp16
+// rounding.  FAST divides with __fdividef, as shared_expert.cu does to reproduce the flag's arithmetic outside the
+// list: div.approx.f32, the same instruction without the flush of subnormals, which only reaches blocks whose
+// fp16 scale rounds to 0 anyway (amax < 127 * 2^-126).  Opt-in (STRATA_IQ_FASTDIV=1): it changes last bits.
+template<bool FAST>
 __global__ void quantize_q8_1_kernel(const float* __restrict__ x, block_q8_1* __restrict__ y, long long n) {
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -806,8 +815,8 @@ __global__ void quantize_q8_1_kernel(const float* __restrict__ x, block_q8_1* __
         amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
         sum += __shfl_xor_sync(0xffffffffu, sum, o);
     }
-    const float d = amax / 127.0f;
-    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    const float d = FAST ? __fdividef(amax, 127.0f) : amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(FAST ? __fdividef(xi, d) : xi / d);
     const long long ib = i / 32, iqs = i % 32;
     y[ib].qs[iqs] = q;
     if (iqs == 0) y[ib].ds = make_half2(d, sum);
@@ -1001,6 +1010,8 @@ bool env_on(const char* name) {
 }
 // O3b: STRATA_OLD_IQ_MMVQ=1 keeps the per-column kernels (bitwise equal to the new ones; kept for A/B timing)
 bool g_old_kernels = env_on("STRATA_OLD_IQ_MMVQ");
+// B5: STRATA_IQ_FASTDIV=1 divides as the --use_fast_math files do (quantize_q8_1_kernel, swiglu_entries_kernel)
+bool g_fast_div = env_on("STRATA_IQ_FASTDIV");
 
 template<int TY>
 void launch_mmvq(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int n_in, int n_out, int ncols,
@@ -1033,6 +1044,8 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
 
 void iq_set_old_kernels(bool old) { g_old_kernels = old; }
 bool iq_old_kernels() { return g_old_kernels; }
+void iq_set_fast_div(bool on) { g_fast_div = on; }
+bool iq_fast_div() { return g_fast_div; }
 
 bool iq_supported(int t) noexcept { return is_iq(t); }
 
@@ -1055,7 +1068,10 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
 void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y, void* stream) {
     const long long n = (long long) n_rows * n_cols;
     if (n <= 0) return;
-    quantize_q8_1_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(x, (block_q8_1*) y, n);
+    if (g_fast_div)
+        quantize_q8_1_kernel<true><<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(x, (block_q8_1*) y, n);
+    else
+        quantize_q8_1_kernel<false><<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(x, (block_q8_1*) y, n);
     check("quantize_q8_1_rows");
 }
 
@@ -1161,8 +1177,13 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     }
     check("native_expert_grouped/gu");
     const long long nh = (long long) cap_entries * L.n_ff;
-    swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
-    quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
+    if (g_fast_div) {
+        swiglu_entries_kernel<true><<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
+        quantize_q8_1_kernel<true><<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
+    } else {
+        swiglu_entries_kernel<false><<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
+        quantize_q8_1_kernel<false><<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
+    }
     const dim3 gd((unsigned) ((L.n_embd + 7) / 8), (unsigned) cap_groups);
     switch (L.d_type) {
         case 20: launch_down<20>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;

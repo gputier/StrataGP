@@ -60,4 +60,11 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 void iq_set_old_kernels(bool old);
 bool iq_old_kernels();
 
+/// B5 (#4): true makes `quantize_q8_1_rows` and the SwiGLU of `native_expert_grouped` divide with __fdividef, the
+/// arithmetic of llama.cpp's --use_fast_math build that native_quantize_q8_1 and shared_expert.cu already use, so
+/// both q8_1 quantizers give the same bytes; false (default) keeps the IEEE division.  It changes last bits, hence
+/// opt-in: STRATA_IQ_FASTDIV=1 at startup.  Set before graph capture.
+void iq_set_fast_div(bool on);
+bool iq_fast_div();
+
 }  // namespace strata::kernels
