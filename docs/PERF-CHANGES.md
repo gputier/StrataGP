@@ -207,7 +207,7 @@ par défaut d'abord) :
 ```bash
 cd build
 ctest --output-on-failure -R "window_batch_parity|s2_expert_grouped_parity|iq_multi_parity|grids_parity|qsa_prep_parity|qsa_select_parity|qsa_decode_attn_parity|mtp_chain_parity|ple_stage_parity|sampler_parity|qsa_indexer_chunk_parity|moe_group_parity|prefill_kernels_parity"
-ctest --output-on-failure -R "gdn_fused_parity|fused_gr_parity|qsa_decode_parity|router_top10_parity|bf16_gemv_parity|quantize_act_parity|kv_q4_parity|s_gemv_q8k_parity|rope_parity|elementwise_parity|gdn_parity|s2_grouped_parity|gdn_state_bf16_parity|prefill_dense_mmq_parity"
+ctest --output-on-failure -R "gdn_fused_parity|fused_gr_parity|qsa_decode_parity|router_top10_parity|bf16_gemv_parity|quantize_act_parity|kv_q4_parity|s_gemv_q8k_parity|rope_parity|elementwise_parity|gdn_parity|s2_grouped_parity|gdn_state_bf16_parity|gdn_state_bf16_parity_old_step|prefill_dense_mmq_parity"
 ctest --output-on-failure    # le reste (parités existantes)
 ./iq_parity && ./native_expert_parity   # hors ctest (native_expert_parity lit le pack natif)
 ```
@@ -217,7 +217,8 @@ Points à lire dans la sortie :
   n'opposent que l'ancien kernel à lui-même (le repli sur l'ancien kernel est automatique).
 - `mtp_chain_parity` : `PASS` ; si le pilote refuse le nœud `WHILE`, le moteur repasse seul à l'ancien chemin.
 - `rope_parity` imprime l'erreur de phase réelle du RoPE natif jusqu'à 262 144.
-- `gdn_state_bf16_parity --selftest` couvre aussi le pas en cluster sous `--gdn-state-bf16` (voir 4.2).
+- `gdn_state_bf16_parity --selftest` couvre aussi le pas en cluster sous `--gdn-state-bf16` (voir 4.2) ;
+  `gdn_state_bf16_parity_old_step` refait les mêmes vérifications avec `STRATA_OLD_GDN_STEP=1` (un bloc par tête).
 - `qsa_indexer_chunk_parity` couvre l'ombre FP16 de `--idx-fp16` (cas « fp16 shadow »).
 
 Sous `compute-sanitizer` (memcheck, puis racecheck et synccheck pour les kernels à mémoire partagée, clusters,

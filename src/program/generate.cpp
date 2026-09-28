@@ -2841,7 +2841,9 @@ int main(int argc, char** argv) {
             else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
             for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
             pending.clear();
-            // issue #16: asynchronous behind the swapped blobs; no window reads d_res (the loop's end waits)
+            // issue #16: asynchronous behind the swapped blobs.  The verify windows do not read d_res (the loop's
+            // end waits); the prompt path does, and lend() / refill() call res_up.sync() before their synchronous
+            // d_res write (this also runs between the prompt's windows with STRATA_ASYNC_REFILL=1)
             if (d_res != nullptr) res_up.put(d_res, host_res, adapt_stream, wait);
         };
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)

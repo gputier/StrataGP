@@ -418,6 +418,9 @@ if(STRATA_ENABLE_CUDA)
   target_include_directories(gdn_state_bf16_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(gdn_state_bf16_parity PRIVATE strata_kernels CUDA::cudart)
   add_test(NAME gdn_state_bf16_parity COMMAND gdn_state_bf16_parity --selftest)
+  # the same checks on the block-per-head step (STRATA_OLD_GDN_STEP=1): the default run takes the cluster kernels
+  add_test(NAME gdn_state_bf16_parity_old_step COMMAND gdn_state_bf16_parity --selftest)
+  set_tests_properties(gdn_state_bf16_parity_old_step PROPERTIES ENVIRONMENT "STRATA_OLD_GDN_STEP=1")
   add_test(NAME gdn_state_bf16_drift_cpu COMMAND gdn_state_bf16_parity --cpu-drift)
 
   add_executable(qsa_parity src/kernels/qsa_parity.cpp)
