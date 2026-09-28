@@ -65,12 +65,23 @@ Les anciens `gu_kernel` et `down_kernel` sont remplacés par `gu_pair_kernel` et
 | Kernels par hit (`moe_hit_grouped_s2`, `_dev`, `_multi`) | **activé** | `STRATA_OLD_GROUPED=1` |
 
 - Le changement est identique au bit près par construction ; il n'y a donc pas d'option d'activation.
-- La variable est lue au lancement. Un graphe capturé garde les kernels choisis à sa capture.
+- La variable d'environnement est lue une seule fois, au premier appel ; la changer ensuite dans le même processus
+  n'a aucun effet. Le choix du kernel, lui, est refait à chaque lancement : un graphe capturé garde les kernels
+  choisis à sa capture. Pour basculer en cours d'exécution, utiliser `moe_grouped_select_old`.
+- `STRATA_GROUPED_PAIR_MIN_HITS=N` (lue une fois, défaut 0) garde les anciens kernels **par hit** en dessous de N hits
+  de capacité. Les nouveaux kernels par hit lancent deux fois moins de warps (deux lignes par warp) : pour 1 hit, le
+  gate/up tient en 80 blocs, moins que les 170 SM d'une RTX 5090. Si `--bench` montre une perte à 1-3 hits, régler
+  N (par exemple 4) ; le résultat reste identique au bit près. Ignorée quand `moe_grouped_select_old` force un choix.
 - En code, `moe_grouped_select_old(1 | 0 | -1)` force l'ancien kernel, force le nouveau, ou revient à l'environnement.
   Le test de parité s'en sert pour exécuter les deux versions dans un même processus.
 - **Repli automatique** sur l'ancien kernel si les lectures larges ne sont pas possibles : ligne d'activation ou
   `scratch` non aligné sur 4 octets, ou arène de blobs / taille de blob non alignée sur 8 octets (chemin par hit).
-  Le moteur est toujours aligné. Le test couvre ce repli avec une ligne décalée de 2 octets.
+  Le moteur est toujours aligné. Le test couvre ce repli avec une ligne décalée de 2 octets, un pas de slot de
+  `BLOB + 4` octets et une arène décalée de 4 octets. Un `scratch` non aligné n'est pas testé : l'ancien kernel y
+  écrit des floats, ce n'est donc pas une entrée valide.
+- `moe_grouped_last_path()` indique quels kernels le dernier appel a lancés (1 nouveau, 0 ancien) et se remet à -1.
+  Le test de parité vérifie à chaque exécution que le chemin forcé a bien été pris : un nouveau chemin qui se
+  désisterait en silence ne peut plus passer pour « ancien contre ancien ».
 
 ## Ressources (ptxas, sm_120, `-O3`)
 
@@ -147,7 +158,8 @@ Attendu : `bitwise identical` sur chaque ligne, `0 failures` / `PASS`, et aucune
 build/s2_expert_grouped_parity --bench
 ```
 La commande affiche µs par appel et Go/s effectifs pour :
-- `moe_hit_grouped_s2` à 9 et 5 hits ;
+- `moe_hit_grouped_s2` à 9, 5, 3, 2 et 1 hits (les petits nombres de hits correspondent aux configurations à faible
+  résidence ; si le nouveau y est plus lent, voir `STRATA_GROUPED_PAIR_MIN_HITS` ci-dessus) ;
 - `moe_grouped_s2` sur des fenêtres de 4 et 8 tokens avec 0 %, 30 % et 100 % d'experts partagés.
 
 Les blobs tournent sur plus de 3× la L2.
