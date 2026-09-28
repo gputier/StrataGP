@@ -354,6 +354,9 @@ __global__ void __launch_bounds__(S * RG) gdn_rec_kernel(float* __restrict__ sta
 // in the same order as computing it at the next token - and the next inputs are loaded while a token runs.  One
 // barrier a token.  o * rsqrt(128) goes to `o`; gdn_out_norm_kernel applies the norm.  Same bits.
 constexpr int SPLIT = 4, SC = S / SPLIT, QK_LD = RPG + 4;   // column blocks per head, their columns, a group's stride
+// h is far larger than L2 at the chunk sizes the prompt path runs, so a token's inputs come from DRAM: they are loaded
+// two tokens ahead, and their cache lines requested REC_PF tokens ahead (a prefetch does not touch the arithmetic)
+constexpr int REC_PF = 8;
 __device__ __forceinline__ float col_sum(float x, int src) {   // the column's four row-group partials, in order
     return __shfl_sync(0xffffffffu, x, src) + __shfl_sync(0xffffffffu, x, src + 1) +
            __shfl_sync(0xffffffffu, x, src + 2) + __shfl_sync(0xffffffffu, x, src + 3);
@@ -372,16 +375,19 @@ __global__ void __launch_bounds__(SC * RG) gdn_rec_split_kernel(float* __restric
     const size_t rs = (size_t) HV * S;
 #pragma unroll
     for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
-    // token 0 (T >= 1): its q|k to buffer 0 and its kv; token 1's q|k and token 0's gate, beta, v in registers.
-    // Thread tid carries q[tid] and k[tid].
+    // token 0 (T >= 1): its q|k to buffer 0 and its kv.  In registers: token 1's q|k (thread tid carries q[tid] and
+    // k[tid]), the gate, beta and v of tokens 0 (c*) and 1 (n*).
     sqk[0][0][tid >> 5][tid & 31] = h[qh * S + tid];
     sqk[0][1][tid >> 5][tid & 31] = h[HK * S + qh * S + tid];
-    float nq = 0.0f, nk = 0.0f;
+    float nq = 0.0f, nk = 0.0f, ng = 0.0f, nb = 0.0f, nv = 0.0f;
     if (T > 1) {
         nq = h[C + qh * S + tid];
         nk = h[C + HK * S + qh * S + tid];
+        ng = gate[HV + head];
+        nb = beta[HV + head];
+        nv = h[C + 2 * HK * S + head * S + col];
     }
-    float ng = gate[head], nb = beta[head], nv = h[2 * HK * S + head * S + col];
+    float cg = gate[head], cb = beta[head], cv = h[2 * HK * S + head * S + col];
     __syncthreads();
     float kv_col;
     {
@@ -403,16 +409,26 @@ __global__ void __launch_bounds__(SC * RG) gdn_rec_split_kernel(float* __restric
             sqk[bn][0][tid >> 5][tid & 31] = nq;
             sqk[bn][1][tid >> 5][tid & 31] = nk;
         }
-        const float g = __expf(ng), bt = nb, vt = nv;
-        if (t + 2 < T) {
+        const float g = __expf(cg), bt = cb, vt = cv;
+        cg = ng;
+        cb = nb;
+        cv = nv;
+        if (t + 2 < T) {   // token t+2's inputs, two tokens ahead
             const float* h2 = h + (t + 2) * C;
             nq = h2[qh * S + tid];
             nk = h2[HK * S + qh * S + tid];
+            ng = gate[(t + 2) * HV + head];
+            nb = beta[(t + 2) * HV + head];
+            nv = h2[2 * HK * S + head * S + col];
         }
-        if (t + 1 < T) {
-            ng = gate[(t + 1) * HV + head];
-            nb = beta[(t + 1) * HV + head];
-            nv = h[(t + 1) * C + 2 * HK * S + head * S + col];
+        if (t + REC_PF < T && tid < 11) {   // and token t+REC_PF's lines into L2: q, k (4 lines each), v, gate, beta
+            const float* hp = h + (t + REC_PF) * C;
+            const float* a = tid < 4   ? hp + qh * S + tid * 32
+                             : tid < 8 ? hp + HK * S + qh * S + (tid - 4) * 32
+                             : tid == 8 ? hp + 2 * HK * S + head * S + blockIdx.y * SC
+                             : tid == 9 ? gate + (t + REC_PF) * HV + head
+                                        : beta + (t + REC_PF) * HV + head;
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(a));
         }
         __syncthreads();
         const float delta = (vt - g * kv_col) * bt;
