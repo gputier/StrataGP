@@ -29,6 +29,7 @@ défaut. Si une lecture échoue, la fenêtre va quand même à son terme (un gra
 et l'appel échoue ensuite. Un garde RAII récupère un lot resté en vol sur tout retour anticipé.
 
 - Ancien chemin (A/B) : **`STRATA_OLD_PLE_STAGING=1`** (lecture bloquante avant le lancement, copie en tête).
+  La valeur est lue : variable absente, vide ou `0` = nouveau chemin ; toute autre valeur = ancien chemin.
 - Diagnostic du chien de garde : la ligne `verify window: ...` affiche aussi `ple rows (P)`.
 
 ### (b) Linux : lectures concurrentes (`src/platform/direct_file.cpp`)
@@ -43,19 +44,35 @@ réveille un `wait` bloqué) :
 |-----------|------------------------------------------------------------------------------------------|-----------------|
 | `uring`   | io_uring par appels système bruts (pas de liburing), anneaux dimensionnés sur `--ple-inflight` | **défaut** si le noyau l'accepte (≥ 5.6) |
 | `threads` | pool de `min(--ple-inflight, 16)` threads `pread` (profondeur 16 avec le défaut 64)       | repli automatique si `io_uring_setup` échoue |
-| `sync`    | `pread` dans `submit`, l'ancien chemin                                                   | A/B uniquement  |
+| `sync`    | `pread` dans `submit`, appelé sous le verrou du lecteur : l'ancien chemin exact          | A/B uniquement  |
 
 - Sélection : **`STRATA_PLE_IO_BACKEND=uring|threads|sync`** ; **`STRATA_PLE_IO_THREADS=N`** (1..64) règle la
   taille du pool `threads`.
 - La ligne `ple io: ...` se termine maintenant par `backend <nom>` (`iocp` sous Windows).
 - Windows n'est pas modifié (IOCP était déjà parallèle).
 
-### (b bis) Plus de `pread` sous le verrou du lecteur (`src/ngram/ple_reader.cpp`)
+### (b bis) Plus de `submit` sous le verrou du lecteur, sauf avec `sync` (`src/ngram/ple_reader.cpp`)
 
-Le thread d'E/S de `PleReader` prend les emplacements sous `mu`, puis fait ses appels `submit` **sans** le verrou
-(`pump_worker`). Avec les backends asynchrones `submit` ne lit plus rien ; avec `sync`, le `pread` ne bloque plus
-`issue`/`collect` du thread hôte. Corrigé au passage : `issue` lisait `ts.pending` après avoir relâché le verrou
-(course signalée par ThreadSanitizer, sans effet visible mais réelle).
+Avec `uring` et `threads` (et `iocp`), le thread d'E/S de `PleReader` prend les emplacements sous `mu`, puis fait
+ses appels `submit` **sans** le verrou (`pump_worker`) : un `submit` ne retient plus `issue`/`collect` du thread
+hôte. Le backend `sync` garde **l'ancienne pompe sous verrou** (`pread` sous `mu`, et `finish` relance aussitôt la
+lecture suivante) : c'est ce qui en fait un bras B fidèle à `perf/base`.
+
+Corrigé au passage :
+
+- `issue` lisait `ts.pending` après avoir relâché le verrou (course signalée par ThreadSanitizer, sans effet
+  visible mais réelle) ;
+- injection de délai seulement (`--ple-delay-us`) : le thread d'E/S libère les complétions retenues **avant** de
+  pomper, sinon les emplacements qu'elles libèrent restaient vides jusqu'à la complétion suivante ;
+- `pump` (mode sans thread d'E/S, et `sync`) rend l'emplacement d'une lecture que `submit` a refusée (aucune
+  complétion ne viendrait le libérer) ;
+- **erreur de lecture** (lecture échouée ou courte) : avant, `finish` sortait sans rendre l'emplacement et
+  `process` abandonnait les complétions suivantes du même lot ; le thread d'E/S tournait alors à vide pour
+  toujours et `close()` (donc la fin du programme) ne revenait jamais. Défaut présent depuis `perf/base`, atteint
+  seulement si une lecture échoue ; il rendait faux le « l'appel échoue ensuite » de (a), puisque le programme
+  restait ensuite bloqué à sa fermeture. Maintenant chaque complétion rend son emplacement, et après une erreur plus rien n'est copié (tout
+  `collect` échoue de toute façon, et le tampon d'un ticket en échec peut déjà être libéré). Aucun effet sur le
+  chemin sans erreur.
 
 ### API
 
@@ -81,7 +98,18 @@ Sur la machine de développement (CPU seulement) :
   toute la matrice existante (thread d'E/S oui/non, cache, profondeur 1/8/64, lignes à cheval sur deux pages,
   doublons, hors bornes, gros lot, deux tickets croisés, injection de délai), vérifie que le backend demandé est
   celui utilisé, et compare sur un GGUF synthétique `issue_batch`+`collect_batch` à `gather_batch` (Direct) et au
-  mode mmap, au bit près. **OK** (aussi sous ThreadSanitizer et AddressSanitizer/UBSan, compilé à la main).
+  mode mmap, au bit près. Nouveau cas : injection de délai avec plus de pages que d'emplacements (4 emplacements,
+  32 pages, 1 ms) : octets identiques, 32 lectures, durée ≥ 8 ms. Nouveau cas : erreur de lecture (table tronquée
+  sous le lecteur, avec et sans thread d'E/S, pour chaque backend) : le ticket échoue et `close()` revient (sinon
+  le test s'arrête en échec au bout de 20 s au lieu de rester bloqué ; vérifié : lié à l'ancien `ple_reader.cpp`,
+  il échoue ainsi, « close() hangs after a read error »). Le test écrit maintenant ses fichiers dans
+  un sous-dossier unique du dossier temporaire : deux arbres de construction qui le lançaient en même temps
+  réécrivaient la même table sous le lecteur de l'autre (c'est ainsi que le défaut ci-dessus est apparu ici). Le
+  délai injecté du cas « lecture retenue » passe de 3 à 100 ms : sur une machine surchargée (charge 40 à 60 sur
+  4 coeurs pendant ces essais), le thread qui récolte les lectures pouvait rester hors CPU plus de 3 ms, et même
+  plus de 20 ms, et plus aucune complétion n'arrivait assez tôt pour être retenue (échec intermittent, sans rapport
+  avec le code testé).
+  **OK** (aussi sous ThreadSanitizer et AddressSanitizer/UBSan, compilé à la main).
 - `platform_memory_test`, `pool_stress`, `expert_multi_test`, `suffix_drafter_test`, `draft_policy_test`,
   `controller_test`, `conv_cache_test` : **OK**.
 
@@ -108,33 +136,85 @@ done
 
 Benchmark A/B : 3 prompts × 3 exécutions, glouton, 256 tokens, résidence statique. Remplacer `<OPTS>` par la ligne
 habituelle (`--pack`, `--ple-gguf`, `--native`, `--expert-profile`, `--expert-cache`, `--spec`, `--mtp`, ...).
+`--stats` est nécessaire pour la ligne `ple io`.
+
+Trois bras :
+
+- **old** : `STRATA_OLD_PLE_STAGING=1 STRATA_PLE_IO_BACKEND=sync`, le comportement de `perf/base` (lecture bloquante
+  avant le lancement, `pread` en série sous le verrou du lecteur). Seule différence restante : la course sur
+  `ts.pending` corrigée dans `issue`, sans effet sur les octets ni sur l'ordre des lectures ;
+- **io** : `STRATA_OLD_PLE_STAGING=1`, seulement les lectures concurrentes (b et b bis) ;
+- **new** : défaut, tout.
 
 ```bash
-OPTS="<OPTS> --greedy --max-new 256 --adapt-every 100000"
-for p in p1 p2 p3; do for r in 1 2 3; do
-  # B : ancien chemin complet (lecture avant lancement + pread séquentiel)
-  STRATA_OLD_PLE_STAGING=1 STRATA_PLE_IO_BACKEND=sync STRATA_STATE_HASH=1 \
-    ./build/strata $OPTS --tokens-file prompts/$p.txt > ab/old_${p}_$r.txt 2>&1
-  # A1 : seulement les lectures concurrentes
-  STRATA_OLD_PLE_STAGING=1 STRATA_STATE_HASH=1 \
-    ./build/strata $OPTS --tokens-file prompts/$p.txt > ab/io_${p}_$r.txt 2>&1
-  # A2 : nouveau chemin complet (défaut)
-  STRATA_STATE_HASH=1 ./build/strata $OPTS --tokens-file prompts/$p.txt > ab/new_${p}_$r.txt 2>&1
+mkdir -p ab
+OPTS="<OPTS> --greedy --max-new 256 --adapt-every 100000 --stats"
+run() {  # run <bras> <suffixe> <options en plus> : écrit ab/<bras><suffixe>_<prompt>_<exécution>.txt
+  local arm=$1 sfx=$2; shift 2
+  local env=""
+  case $arm in
+    old) env="STRATA_OLD_PLE_STAGING=1 STRATA_PLE_IO_BACKEND=sync" ;;
+    io)  env="STRATA_OLD_PLE_STAGING=1" ;;
+  esac
+  env $env ./build/strata $OPTS "$@" --tokens-file prompts/$p.txt > ab/${arm}${sfx}_${p}_$r.txt 2>&1
+}
+# 1. débit (fenêtre non scindée, le défaut), 3 exécutions
+for p in p1 p2 p3; do for r in 1 2 3; do for a in old io new; do run $a "" ; done; done; done
+# 2. exactitude, fenêtre scindée (P est levé après le groupe A de la couche 0)
+for p in p1 p2 p3; do r=1; for a in old new; do run $a _split --spec-split; done; done
+# 3. exactitude quand le graphe attend VRAIMENT P (chaque lecture dure >= 3 ms, plus que la couche 0)
+for p in p1 p2 p3; do r=1; for a in old new; do
+  run $a _slow --ple-delay-us 3000; run $a _slowsplit --ple-delay-us 3000 --spec-split
 done; done
-grep -H "ple io:" ab/*.txt          # "blocked ... ms" doit chuter ; "backend uring" attendu
-grep -H "tok/s\|ms/token\|tokens per round" ab/*.txt   # débit et tokens par tour
+
+# tokens générés : chaque fichier doit donner la même ligne "output  :" que old (même prompt, même découpage)
+for p in p1 p2 p3; do
+  for f in ab/io_${p}_*.txt ab/new_${p}_*.txt ab/old_${p}_[23].txt; do
+    cmp -s <(grep "^output  :" ab/old_${p}_1.txt) <(grep "^output  :" $f) || echo "DIFF $f"
+  done
+  for s in _split _slow _slowsplit; do
+    cmp -s <(grep "^output  :" ab/old${s}_${p}_1.txt) <(grep "^output  :" ab/new${s}_${p}_1.txt) \
+      || echo "DIFF new${s} $p"
+  done
+done
+grep -H "ple io:" ab/*.txt       # "blocked ... ms" doit chuter en new ; "backend uring" en io/new, "sync" en old
+grep -H "^decode \|tokens per round" ab/*.txt   # débit et tokens par tour
+```
+
+Empreinte d'état : `STRATA_STATE_HASH` n'est imprimé qu'en mode `--serve` (après chaque requête, cache de prompts
+actif, le défaut). Même requête dans les deux bras, fenêtre scindée ou non :
+
+```bash
+for p in p1 p2 p3; do
+  ids=$(tr -s ' ,\n\r\t' ',' < prompts/$p.txt | sed 's/^,//; s/,$//')
+  for split in "" --spec-split; do
+    for a in old new; do
+      env=""; [ $a = old ] && env="STRATA_OLD_PLE_STAGING=1 STRATA_PLE_IO_BACKEND=sync"
+      printf 'GEN 256 %s\nQUIT\n' "$ids" | env $env STRATA_STATE_HASH=1 \
+        ./build/strata <OPTS> --adapt-every 100000 $split --serve 2>&1 | grep "STATE_HASH" > ab/hash_${a}${split}_$p.txt
+    done
+    cmp -s ab/hash_old${split}_$p.txt ab/hash_new${split}_$p.txt || echo "HASH DIFF $p $split"
+  done
+done
 ```
 
 Critères :
 
-- tokens générés et empreintes `STRATA_STATE_HASH` **identiques** entre `old`, `io` et `new` (même prompt) ;
+- aucune ligne `DIFF` ni `HASH DIFF` : tokens générés et empreintes identiques entre `old`, `io` et `new`, avec et
+  sans `--spec-split`, et avec `--ple-delay-us 3000` (le cas où le graphe attend à coup sûr `P` devant la
+  couche 1 : il valide le placement de l'attente et la barrière hôte) ;
 - `blocked ... ms` de la ligne `ple io` nettement plus bas en `new` (il ne mesure plus que l'attente résiduelle
   après la couche 0) ;
-- débit : attendu +6 à 15 % en `new` sur la 5090 (ESTIMÉ).
-- Pour isoler (a) sous Windows : `STRATA_OLD_PLE_STAGING=1` contre défaut.
+- débit : attendu +6 à 15 % en `new` sur la 5090 (ESTIMÉ) ;
+- pour isoler (a) sous Windows : `STRATA_OLD_PLE_STAGING=1` contre défaut.
 
 ## Ce qui reste
 
+- `ple_stage_parity` ne teste la poignée de main (attente de `P`, copie tardive) que sur un graphe synthétique de
+  3 noeuds : `Verifier::run` et `record_window` eux-mêmes (P placé dans `pre(1, groupe 0)`, levé après `post` de
+  `k == 0`, fenêtre scindée, garde `PleGuard`, erreur de lecture rendue après la synchronisation) ne sont couverts
+  que par l'A/B ci-dessus. Un test au niveau du vérificateur demanderait des poids (un `WeightTable` complet) :
+  pas faisable sans modèle ni GPU ici. **À faire avant fusion : l'A/B complet ci-dessus sur la 5090.**
 - Le profil `nsys` (`--cuda-graph-trace=node`) doit confirmer que le noeud `wait_flag_ge` avant la couche 1 attend
   peu ou pas ; s'il attend, le SSD est plus lent que la couche 0 + experts CPU, et il faudrait lancer les lectures
   de la fenêtre suivante plus tôt (dès que ses tokens sont connus, pendant le brouillon MTP), ce qui touche au code
