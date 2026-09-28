@@ -1,10 +1,13 @@
 // src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
 #include "strata/prefill/gemm.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
+#include "strata/prefill/moe_mmq.hpp"
 
 #include <cublas_v2.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -17,6 +20,28 @@ void ck(cublasStatus_t s, const char* what) {
         std::exit(1);
     }
 }
+
+void ck(cudaError_t e, const char* what) {
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "prefill gemm: %s: %s\n", what, cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
+
+// Issue #39: MMQ's quantizer reads FP32 rows; an FP16 activation (no FP32 copy kept) is widened first.
+__global__ void widen_kernel(const __half* __restrict__ x, float* __restrict__ y, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = __half2float(x[i]);
+}
+
+size_t align256(size_t n) { return (n + 255) / 256 * 256; }
+
+// MMQ reads a weight row in K tiles of 256 values (llama.cpp pads every quantized row to MATRIX_ROW_PADDING = 512
+// for it): with a row length that is not a multiple of 512 the last row's tile runs past the matrix, into whatever
+// follows it.  Those values meet zero activations - harmless only if they decode to finite numbers - so such a
+// weight is copied into the scratch with this many zeroed bytes after it (512 values of the widest block: 544 B).
+constexpr int64_t kRowPad = 512;
+constexpr size_t kTail = 4096;
 
 }  // namespace
 
@@ -109,6 +134,50 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     }
     strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
     f16(X, scratch_, Y, T, N, K, ldy, beta);
+}
+
+bool Gemm::native_mmq(const float* X32, const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T,
+                      int64_t N, int64_t K, int64_t ldy, float beta) {
+    if (mmq_ == nullptr || beta != 0.0f || K % 4 != 0 || !mmq::dense_supported(ggml_type)) return false;
+    if (T <= 0 || N <= 0) return true;
+    if (ldy <= 0) ldy = N;
+    const cudaStream_t s = (cudaStream_t) stream_;
+    // the scratch: [W again with a zeroed tail, if its last K tile overruns] [the q8_1 rows] [X widened, if FP16]
+    uint8_t* base = (uint8_t*) scratch_;
+    const size_t cap = (size_t) scratch_elems_ * 2;
+    const bool copy_w = K % kRowPad != 0;
+    const size_t w_bytes = mmq::matrix_bytes(ggml_type, N, K);
+    const size_t w_region = copy_w ? align256(w_bytes + kTail) : 0;
+    // q8_bytes is linear in the rows: a per-row part and a fixed tail (MMQ's last column tile reads past the rows)
+    const size_t q8_row = mmq::q8_bytes(1, K) - mmq::q8_bytes(0, K), q8_tail = mmq::q8_bytes(0, K);
+    const size_t x_row = X32 != nullptr ? 0 : (size_t) K * 4;
+    const size_t fixed = w_region + q8_tail + 2 * 256;
+    if (base == nullptr || cap <= fixed) return false;
+    int64_t rows = (int64_t) ((cap - fixed) / (q8_row + x_row));
+    if (rows <= 0) return false;
+    if (rows < T && rows >= 128) rows -= rows % 128;   // whole column tiles in every slice but the last
+    rows = std::min(rows, T);
+    const void* w = W_blocks;
+    if (copy_w) {
+        ck(cudaMemcpyAsync(base, W_blocks, w_bytes, cudaMemcpyDeviceToDevice, s), "mmq weight copy");
+        ck(cudaMemsetAsync(base + w_bytes, 0, w_region - w_bytes, s), "mmq weight tail");
+        w = base;
+    }
+    void* xq = base + w_region;
+    float* xf = (float*) (base + w_region + align256(mmq::q8_bytes(rows, K)));
+    // token slices (one when the chunk's rows fit): every output row depends on its own activation row only
+    for (int64_t t0 = 0; t0 < T; t0 += rows) {
+        const int64_t n = std::min(rows, T - t0);
+        const float* x = X32 != nullptr ? X32 + t0 * K : xf;
+        if (X32 == nullptr) {
+            const int64_t e = n * K;
+            widen_kernel<<<(unsigned) ((e + 255) / 256), 256, 0, s>>>((const __half*) (X + t0 * K), xf, e);
+            ck(cudaGetLastError(), "widen");
+        }
+        mmq::quantize(x, nullptr, xq, ggml_type, K, K, n, s);
+        mmq_->dense(w, ggml_type, N, K, xq, n, Y + t0 * ldy, ldy, s);
+    }
+    return true;
 }
 
 }  // namespace strata::prefill

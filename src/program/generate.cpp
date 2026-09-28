@@ -223,6 +223,9 @@ struct Options {
     /// Plan v0.3 P5: the prompt path borrows the top expert-cache slots for its buffers and refills them after
     /// the prompt (default); `--no-prefill-borrow` reserves the buffers' VRAM for the whole session instead.
     bool no_prefill_borrow = false;
+    /// Issue #39: the prompt path's dense GGUF projections through MMQ (q8_1 activations) instead of FP16 cuBLAS.
+    /// Opt-in: it changes the rounding.
+    bool prefill_dense_mmq = false;
     /// Plan v0.3 P5 validation: batch only positions [0, P) and run the rest of the prompt through the token path
     /// (teacher-forced), so the logits of positions >= P - which depend on the batched state - can be scored
     /// against the oracle at many positions.  0 = the whole prompt but the last position.
@@ -368,6 +371,8 @@ void usage() {
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
                  "                       the largest chunk up to 8192 whose buffers the expert cache can lend\n"
+                 "  --prefill-dense-mmq  the prompt path's dense GGUF projections through MMQ (int8, q8_1 activations)\n"
+                 "                       instead of FP16 cuBLAS; changes the rounding (STRATA_PREFILL_DENSE_MMQ=1 too)\n"
                  "  --no-pool            skip the CPU expert pool (the GPU-only floor)\n"
                  "  --sync-every-layer   debug: synchronise after every layer\n"
                  "  --ple-gguf PATH      the n-gram/PLE shard.  WITHOUT IT LAYER 1's PLE IS SILENTLY SKIPPED,\n"
@@ -905,6 +910,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--no-split-rows") o.no_split_rows = true;
         else if (a == "--no-prefill-borrow") o.no_prefill_borrow = true;
+        else if (a == "--prefill-dense-mmq") o.prefill_dense_mmq = true;
         else if (a == "--prefill-until") o.prefill_until = std::atoll(next("--prefill-until"));
         else if (a == "--dump-final-r") o.dump_final_r = next("--dump-final-r");
         else if (a == "--spec") o.spec = std::atoi(next("--spec"));
@@ -993,6 +999,7 @@ int main(int argc, char** argv) {
         o.prefill_auto = false;       // nothing to lend from: the buffers are reserved for the session, so keep them small
         o.prefill_chunk = 2048;
     }
+    strata::prefill::Prefill::set_dense_mmq(o.prefill_dense_mmq);   // issue #39 (opt-in)
     if (!have_tokens && o.serve) {   // plan v0.3 P8: requests bring their own tokens
         o.tokens = {248045};
         o.max_new = 1;

@@ -14,6 +14,9 @@ namespace strata::prefill::mmq {
 bool built();
 /// MMQ covers this ggml type (the i-quants and Q2_0 the packs use; IQ1_M is not covered).
 bool supported(int ggml_type);
+/// Issue #39: MMQ covers this ggml type for the dense projections (`--prefill-dense-mmq`): the experts' types and
+/// the legacy and k-quant ones the GGUF's dense tensors may use (Q4_0, Q5_0, Q8_0, Q3_K..Q6_K; not IQ1_M).
+bool dense_supported(int ggml_type);
 /// Bytes of one expert's gate+up ([2*n_ff, n_embd]) or down ([n_embd, n_ff]) weights in `ggml_type`.
 size_t matrix_bytes(int ggml_type, int64_t rows, int64_t cols);
 /// Bytes of `rows` activation rows of `cols` values quantized for MMQ (the row padded to 512 values).
@@ -50,6 +53,11 @@ public:
     Context(const Context&) = delete;
     Context& operator=(const Context&) = delete;
     void run(const Product& p, void* stream);
+    /// Issue #39: a dense product in MMQ's plain (non-MoE) mode, the launch llama.cpp makes for a dense mat-mul:
+    /// dst rows [0, n) (`ld_dst` floats apart) = the n q8_1 rows of `xq` (from `quantize` for `type`) times
+    /// W[w_rows, w_cols]^T.  MMQ reads W in 256-value K tiles: past the last row unless w_cols is a multiple of them.
+    void dense(const void* w, int type, int64_t w_rows, int64_t w_cols, const void* xq, int64_t n, float* dst,
+               int64_t ld_dst, void* stream);
 
 private:
     void* ctx_ = nullptr;

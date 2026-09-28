@@ -41,12 +41,14 @@
 namespace strata::prefill::mmq {
 bool built() { return false; }
 bool supported(int) { return false; }
+bool dense_supported(int) { return false; }
 size_t matrix_bytes(int, int64_t, int64_t) { return 0; }
 size_t q8_bytes(int64_t, int64_t) { return 0; }
 void quantize(const float*, const int32_t*, void*, int, int64_t, int64_t, int64_t, void*) {}
 Context::Context() {}
 Context::~Context() {}
 void Context::run(const Product&, void*) {}
+void Context::dense(const void*, int, int64_t, int64_t, const void*, int64_t, float*, int64_t, void*) {}
 void gather_native(const void*, const void*, size_t, const void*, size_t, void*, void*, void*) {}
 void gather_strata_q2(const uint8_t*, void*, void*, void*) {}
 void swiglu(const float*, float*, int64_t, int64_t, bool, void*) {}
@@ -70,6 +72,16 @@ constexpr int STAGE = 8;           // host->device expert staging ring (chunks b
 constexpr int RING_MAX = 512;           // the arrays; the ring itself is ring_slots()
 constexpr int64_t STREAM_ALL_MIN = 2048;
 double g_pinned_share = 1.0;
+// Issue #39: the dense projections through MMQ (`--prefill-dense-mmq`, or STRATA_PREFILL_DENSE_MMQ=1); off by
+// default - the activations are rounded to q8_1 instead of FP16, which moves the logits.
+bool g_dense_mmq = false;
+bool dense_mmq_on() {
+    static const bool env = [] {
+        const char* v = std::getenv("STRATA_PREFILL_DENSE_MMQ");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return g_dense_mmq || env;
+}
 // The streamed ring: 384 slots when (nearly) every streamed expert is DMA'd from pinned RAM - measured on Q2_0,
 // 8192-token chunks: 96 slots 1153 tok/s, 384 1294 (the next layer's experts arrive during its attention half) -
 // and 96 when a large share goes through host copies (IQ3_S on 64 GB, a third unpinned: 96 slots 1216, 256 1070 -
@@ -484,6 +496,20 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         if (!ok) { err = "prefill: GEMM scratch does not fit"; return false; }
         if (!m.gemm.init_external(stream, gs, GEMM_SCRATCH, ws, GEMM_WS, err)) return false;
     }
+    // issue #39: the dense projections through MMQ share the experts' launch context (its stream-k scratch pool)
+    if (dense_mmq_on()) {
+        static bool noted = false;
+        if (!noted)
+            std::fprintf(stderr, mmq::built() ? "strata prefill: dense projections through MMQ (q8_1 activations, "
+                                                "--prefill-dense-mmq)\n"
+                                              : "strata prefill: --prefill-dense-mmq: this build has no MMQ, the "
+                                                "dense projections stay on cuBLAS\n");
+        noted = true;
+        if (mmq::built()) {
+            if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
+            m.gemm.set_mmq(m.mmq_ctx.get());
+        }
+    }
     if (!carve(T, &o)) {
         err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit";
         return false;
@@ -599,6 +625,7 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
 int64_t Prefill::chunk() const { return impl_->T; }
 void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
 double Prefill::pinned_share() { return g_pinned_share; }
+void Prefill::set_dense_mmq(bool on) { g_dense_mmq = on; }
 
 uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {
     // the same allocation sequence as `init`, counted
@@ -642,9 +669,20 @@ const core::WeightRef* need(const core::LayerView& v, const char* suffix, std::s
     if (!r) err = v.name(suffix) + " is missing";
     return r;
 }
-bool native_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
-                 std::string& err, int64_t ldy = 0) {
+// `X32`: the FP32 rows X was rounded from, or null (issue #39: MMQ quantizes those rather than the FP16 ones)
+bool native_proj(Gemm& gm, const core::WeightRef* w, const float* X32, const uint16_t* X, float* Y, int64_t T,
+                 const std::string& name, std::string& err, int64_t ldy = 0) {
     if (!w->native_data) { err = "prefill: " + name + " has no native GGUF blocks (run with --native)"; return false; }
+    // --prefill-dense-mmq: through MMQ when it covers the weight's type, else (and by default) the FP16 GEMM
+    if (gm.native_mmq(X32, X, w->native_type, w->native_data, Y, T, w->ne1, w->ne0, ldy)) return true;
+    if (dense_mmq_on()) {   // once per type: what stays on the FP16 GEMM (IQ1_M, or a build without MMQ)
+        static bool told[64] = {};
+        const int t = w->native_type;
+        if (t >= 0 && t < 64 && !told[t])
+            std::fprintf(stderr, "strata prefill: --prefill-dense-mmq: %s (GGML type %d) stays on the FP16 GEMM\n",
+                         name.c_str(), t);
+        if (t >= 0 && t < 64) told[t] = true;
+    }
     gm.native(X, w->native_type, w->native_data, Y, T, w->ne1, w->ne0, ldy);
     return true;
 }
@@ -934,14 +972,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     pt.mark(kPfGdn, cs);
                     float* state = ss.gdn_state + (size_t) gdn_index * gdn_floats;
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                    if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
+                    if (!native_proj(m.gemm, wqkv, m.mixed, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
+                    if (!native_proj(m.gemm, wg, m.mixed, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV)) return false;
                     if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV)) return false;
                     gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
                     gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
                     gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs);
-                    if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err)) return false;
+                    if (!native_proj(m.gemm, wo, m.y, m.y_h, m.bo, T, v.name("ssm_out.weight"), err)) return false;
                     ++gdn_index;
                 } else if (half == 0) {
                     // ======================= QSA =======================
@@ -955,9 +993,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                           *wikn = need(v, "indexer.k_norm.weight", err);
                     if (!wq || !wk || !wv || !wo || !wik || !wiq || !wqn || !wkn || !wiqn || !wikn) return false;
                     pt.mark(kPfQsa, cs);
-                    if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
+                    if (!native_proj(m.gemm, wk, m.mixed, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
+                    if (!native_proj(m.gemm, wv, m.mixed, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
+                    if (!native_proj(m.gemm, wq, m.mixed, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err)) return false;
                     rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, m.cs);
@@ -1083,7 +1121,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (st.kv_q4) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
                     pt.mark(kPfQsa, cs);
                     gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs);
-                    if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;
+                    if (!native_proj(m.gemm, wo, nullptr, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;
                     ++qsa_index;
                 } else {
                     // ======================= MoE =======================
@@ -1097,10 +1135,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
                     // the shared expert and its scalar gate
-                    if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
+                    if (!native_proj(m.gemm, wsg, m.mixed, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
+                    if (!native_proj(m.gemm, wsu, m.mixed, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
                     swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
-                    if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
+                    if (!native_proj(m.gemm, wsd, nullptr, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
                     if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
                     m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
                     // group the (token, k) pairs by expert on the host
