@@ -84,8 +84,8 @@ Toutes les variables se lisent une fois au démarrage ; `=1` active, absente ou 
   `mixed_h`, K/V FP16 et échelles INT8, `to_f16`) : avec `STRATA_PREFILL_F16_SAT=1`, une valeur finie au-delà de la
   plage FP16 devient ±65 504 ; NaN et ±inf passent tels quels (un débordement FP32 en amont reste visible). Toute
   valeur qui était finie garde ses bits.
-- Mécanisme : un `__constant__` lu par `hf` (une comparaison prédiquée), écrit une fois sur le flux du prompt avant le
-  premier kernel concerné. Désactivé : `hf` est exactement `__float2half_rn`.
+- Mécanisme : un `__constant__` lu par `hf` (une comparaison prédiquée), écrit une fois avant le premier kernel
+  concerné, par une copie synchrone suivie d'une synchronisation du GPU (visible quel que soit le flux). Désactivé : `hf` est exactement `__float2half_rn`.
 
 ### B8 — routeur aligné sur le décodage, opt-in ; NaN comptés (#7)
 
