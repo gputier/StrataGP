@@ -19,7 +19,8 @@ construction, voir plus bas). Ils sont donc actifs par défaut, les anciens rest
 
 Le noyau d'un bloc par ligne (`sampler_one_block_kernel`) sert aussi de **repli automatique** du chemin réparti :
 flux en cours de capture de graphe (le chemin échantillonné n'est capturé nulle part aujourd'hui), vocabulaire de
-plus de 262 144 (64 blocs), plus de 65 535 lignes, ou mémoire de travail impossible à obtenir.
+plus de 262 144 (64 blocs), plus de 64 lignes par appel (le moteur en échantillonne au plus une fenêtre de
+vérification, T ≤ 8), ou mémoire de travail impossible à obtenir.
 
 ### Pourquoi c'est identique au bit près
 
@@ -45,11 +46,16 @@ plus de 262 144 (64 blocs), plus de 65 535 lignes, ou mémoire de travail imposs
 
 - `src/kernels/cuda/sampler.cu` : `sampled_tail_warp`, `sampler_one_block_kernel`, `sampler_split_part_kernel`
   (étape 1), `warp_merge_lists`, `sampler_split_merge_kernel` (étape 2), choix du chemin et mémoire de travail
-  (`split_scratch` : un tampon par (périphérique, flux), agrandi à la demande, ~0,5 Mo pour 16 lignes). L'ancien
+  (`split_scratch` : un tampon par (périphérique, flux), agrandi à la demande en doublant au moins, ~0,5 Mo pour
+  16 lignes, 2 Mo au plus pour 64 lignes). Un tampon remplacé n'est pas libéré mais mis de côté (un pointeur remis
+  à un autre thread hôte sur le même flux peut encore attendre son lancement) : au plus ~4 Mo par flux. Un échec de
+  `cudaMalloc` est mémorisé : les appels suivants de cette taille passent directement au noyau d'un bloc sans
+  réessayer l'allocation. L'ancien
   `sampler_kernel` est inchangé.
-- `src/kernels/sampler_parity.cpp` : fixtures 16 et 17, `--bench`.
+- `src/kernels/sampler_parity.cpp` : fixtures 16, 17 et 18, `--bench`.
 - `CMakeLists.txt` : `sampler_parity_one_block` et `sampler_parity_old` (le même binaire avec la variable
-  d'environnement de chaque chemin).
+  d'environnement de chaque chemin). Chaque test fixe les deux variables (`STRATA_OLD_SAMPLER` et
+  `STRATA_SAMPLER_ONE_BLOCK`, à 0 ou 1) : une variable exportée dans le shell pour l'A/B ne change pas le chemin testé.
 
 Registres (ptxas, sm_120, 0 spill) : étape 1 : 80 registres, 128 threads, 2,5 Ko de mémoire partagée ; étape 2 :
 52 registres, 32 threads, 33,8 Ko ; un bloc : 59 registres, 1,3 Ko + masque dynamique ; ancien : 55 (inchangé).
@@ -72,6 +78,12 @@ Registres (ptxas, sm_120, 0 spill) : étape 1 : 80 registres, 128 threads, 2,5 K
   tête de la ligne), 17 lignes (la mémoire de travail est d'abord taillée pour 16 : elle est agrandie), sur le flux
   par défaut et sur un flux créé. Observabilité exigée : des tirages doivent tomber sur un jeton à égalité avec un
   autre jeton gardé.
+- **18 — les replis automatiques du chemin par défaut.** Un flux créé, capturé en mode `ThreadLocal` :
+  `sample_tokens` (top_k 20, top_p 0,9, pénalités, V = 248 320, 3 lignes) doit passer par le noyau d'un bloc (masque
+  de pénalités en mémoire partagée dynamique) dans le graphe ; le graphe rejoué deux fois doit donner les tirages du
+  miroir, puis le même flux hors capture (chemin réparti, mémoire de travail allouée après la capture) aussi. Puis
+  64 lignes (réparti, le maximum) et 70 lignes (repli un bloc) à V = 512. L'échec d'allocation n'est pas provoqué
+  (il faudrait épuiser la VRAM) ; son repli est le même noyau d'un bloc, testé par `sampler_parity_one_block`.
 
 ctest lance le binaire une fois par chemin : `sampler_parity` (réparti), `sampler_parity_one_block`,
 `sampler_parity_old`. Les trois doivent passer : même référence, donc mêmes jetons.
@@ -80,8 +92,9 @@ Fait ici, sans GPU (hors dépôt) : une émulation hôte voie par voie des nouve
 papillon XOR, les deux fusions, sentinelles, fin) comparée à l'ancien noyau transcrit, sur 3 600 cas aléatoires
 (égalités, ±0, −inf, NaN, +inf, pénalités, V de 1 à 262 144) : 0 écart, voies toujours d'accord ; des mutations
 volontaires (règle d'égalité inversée, seuil `>=`, fusion qui n'avance pas) sont détectées. Puis le source de
-`sampler_parity` lié à un runtime CUDA factice dont `sample_tokens` est cette émulation : les 17 groupes de
-fixtures passent sur les trois chemins (dont 280 positions sentinelles et 1 057 tirages à égalité). Cela valide la
+`sampler_parity` lié à un runtime CUDA factice dont `sample_tokens` est cette émulation : les 18 groupes de
+fixtures passent sur les trois chemins (dont 280 positions sentinelles et 1 057 tirages à égalité ; pour la
+fixture 18, le runtime factice enregistre l'appel capturé et le rejoue au lancement du graphe). Cela valide la
 logique et les fixtures, pas le code CUDA lui-même : c'est le rôle de `sampler_parity` sur la 5090.
 
 ## Gains attendus
