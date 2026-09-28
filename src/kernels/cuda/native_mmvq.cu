@@ -144,8 +144,10 @@ __global__ void native_quantize_q8_1_kernel(const float* __restrict__ x,
     const float xi = x[i];
     const float amax = warp_max(fabsf(xi));
     const float sum = warp_sum(xi);
-    const float d = amax / 127.0f;
-    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    // B5 (#4): the division spelled as the --use_fast_math flag makes it (div.approx.ftz, the same PTX), so the
+    // contract survives a change of the file's flags; iq_kernels.cu's quantizer matches it under STRATA_IQ_FASTDIV.
+    const float d = __fdividef(amax, 127.0f);
+    const int8_t q = amax == 0.0f ? 0 : roundf(__fdividef(xi, d));
     y[i / Q8K].qs[i % Q8K] = q;
     if (i % Q8K == 0) y[i / Q8K].ds = make_half2(d, sum);
 }
