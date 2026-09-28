@@ -41,8 +41,12 @@ struct QsaAttnPools {
 /// A cell whose page did not resolve (page table < 0: KV streaming overflow, `kv_stream.hpp` ctl[3]) is masked with
 /// weight 0 in every variant instead of being read from before the pool (B14, #12).
 enum QsaAttnVariant : int { kQsaAttnPrefetch = 0, kQsaAttnOld = 1, kQsaAttnChunk32 = 2 };
-/// Read from the environment on first use.  The scratch size depends on it: a test that switches variants sizes
-/// its scratch for kQsaAttnChunk32 (the largest); the engine never switches.
+///   STRATA_QSA_ATTN_BATCH_OLD=1  the previous kernel for n_q > 1 only (batched prefill, verify), bitwise neutral:
+///                    the prefetching kernel's 48 KB of shared memory allow 2 blocks per SM, to A/B on prefill
+/// Read from the environment on first use.  The scratch size depends on it, so qsa_decode_attn_set_variant must come
+/// BEFORE any qsa_decode_attn_scratch_floats: a test that switches variants sizes its scratch for kQsaAttnChunk32 (the
+/// largest); the engine never switches.  A variant set later whose chunks are smaller than the smallest ever sized
+/// runs with 64-cell chunks instead of overrunning that scratch (one warning).
 int qsa_decode_attn_variant();
 void qsa_decode_attn_set_variant(int variant);
 

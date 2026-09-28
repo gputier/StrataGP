@@ -440,6 +440,9 @@ namespace {
 
 // The kernel variant, read once from the environment unless a test sets it (qsa_decode_attn_set_variant).
 std::atomic<int> g_variant{-1};
+// The smallest chunk any scratch was sized for (qsa_decode_attn_scratch_floats), 0 before the first sizing: a
+// smaller chunk has more partials per query than such a scratch holds.
+std::atomic<int> g_sized_chunk{0};
 
 bool env_on(const char* name) {
     const char* v = std::getenv(name);
@@ -447,6 +450,20 @@ bool env_on(const char* name) {
 }
 
 int chunk_of(int variant) { return variant == kQsaAttnChunk32 ? 32 : CHUNK; }
+
+uint64_t scratch_floats_for(int ch, int64_t cap, const QsaShapes& s) {
+    const int64_t chunks = (cap + ch - 1) / ch;
+    return (uint64_t) chunks * (uint64_t) s.n_head * (HD + 2) + 64;
+}
+
+// STRATA_QSA_ATTN_BATCH_OLD=1: the previous kernel for n_q > 1 only (batched prefill, MTP and verify windows), the
+// prefetching one for decode.  The prefetching kernel's 48 KB of static shared memory leave 2 blocks per SM against
+// ~5 for the previous one's 16 KB; both chunk by 64 with the same stride and partials, so the choice is bitwise
+// neutral and only an A/B of STRATA_PREFILL_TIMING can say which the batch should take.
+bool batch_old() {
+    static const bool on = env_on("STRATA_QSA_ATTN_BATCH_OLD");
+    return on;
+}
 
 // cp.async copies whole 16-byte pieces of a V row (8 bytes for the int8 scales): every row length is a multiple of
 // that, so the pool base decides.  A pool that is not aligned keeps the previous kernel rather than faulting.
@@ -462,11 +479,21 @@ void launch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const
             const QsaShapes& s, float* scratch, float* attn, int64_t n_q, cudaStream_t st, const QsaAttnGate& gate) {
     const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr ? 1 : 0);
     int variant = qsa_decode_attn_variant();
+    const int sized = g_sized_chunk.load(std::memory_order_relaxed);
+    if (sized > 0 && chunk_of(variant) < sized) {
+        // set after a scratch was sized for bigger chunks (qsa_decode_attn_set_variant): it would not hold these
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true))
+            std::fprintf(stderr, "qsa_decode_attn: variant %d needs more scratch than was sized; using 64-cell chunks\n",
+                         variant);
+        variant = kQsaAttnPrefetch;
+    }
+    if (variant == kQsaAttnPrefetch && n_q > 1 && batch_old()) variant = kQsaAttnOld;
     if (variant != kQsaAttnOld && !prefetch_aligned(pools, kv_mode)) variant = kQsaAttnOld;
     const int ch = chunk_of(variant);
     const int n_chunks = (int) ((cap + ch - 1) / ch);
     // per query: [acc: n_chunks*n_head*HD][m: n_chunks*n_head][l: n_chunks*n_head], all offsets from one stride
-    const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
+    const long long stride = (long long) scratch_floats_for(ch, cap, s);
     float* part_acc = scratch;
     float* part_m = scratch + (size_t) n_chunks * s.n_head * HD;
     float* part_l = part_m + (size_t) n_chunks * s.n_head;
@@ -553,8 +580,9 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
 
 uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s) {
     const int ch = chunk_of(qsa_decode_attn_variant());
-    const int64_t chunks = (cap + ch - 1) / ch;
-    return (uint64_t) chunks * (uint64_t) s.n_head * (HD + 2) + 64;
+    int prev = g_sized_chunk.load(std::memory_order_relaxed);
+    while ((prev == 0 || ch < prev) && !g_sized_chunk.compare_exchange_weak(prev, ch, std::memory_order_relaxed)) {}
+    return scratch_floats_for(ch, cap, s);
 }
 
 void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* step,
