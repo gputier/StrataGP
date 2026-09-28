@@ -101,6 +101,15 @@ rend l'ancien kernel. Un pool V non aligné sur 16 octets repasse automatiquemen
 
   En CHUNK 32 : 48 à 62 registres, sans spill. La fusion est inchangée : 40 registres (38 avec porte). À 48,6 Ko, le
   noyau FP16 tient 2 blocs par SM, ce qui ne limite pas une grille de 66 blocs.
+- **Lots (prompt, vérification, MTP)** : le même `launch()` sert `qsa_decode_attn_batch`, dont la grille compte `n_q`
+  fois plus de blocs ; là, 2 blocs par SM (contre ~5 pour l'ancien kernel à 15,9 Ko) peuvent coûter. Non mesuré.
+  `STRATA_QSA_ATTN_BATCH_OLD=1` garde l'ancien kernel pour `n_q > 1` seulement et le nouveau pour le décodage : même
+  découpe de 64 cellules, même scratch, donc bit à bit neutre. Si le prompt régresse (commande 3 ci-dessous), ce
+  choix par `n_q` deviendra le défaut.
+- **Scratch** : sa taille dépend du variant, figé au premier usage. `qsa_decode_attn_set_variant` doit précéder tout
+  `qsa_decode_attn_scratch_floats` (seuls les tests changent de variant). Si un variant à chunks plus petits que le
+  plus petit jamais dimensionné est demandé après coup, `launch()` repasse en chunks de 64 (un avertissement) au lieu
+  de déborder du scratch.
 
 **Gain (ESTIMÉ, audit) :** ~10 µs par couche QSA, soit 0,1 à 0,2 ms par token. La sélection sature à 2 051 cellules,
 donc le gain vaut pour tout contexte supérieur à ~2K, pas seulement à 128K. Porte intégrée : 12 lancements de moins
@@ -122,7 +131,9 @@ par token (HYPOTHÈSE : 10 à 30 µs par token).
   prompt (`prefill.cpp`), qui voient ainsi la même clé.
 - **Opt-in** : `--idx-fp16` ou `STRATA_IDX_FP16=1` (message au démarrage). **La sélection change** près de la frontière
   (`qsa.hpp`, INDEXER KEYS). Sans l'option, rien n'est alloué ni écrit, et le résultat est identique.
-- Non concerné : le chemin `--no-fast-select` (scores FP64 par cellule), qui lit toujours la copie FP32.
+- Non concerné : le chemin `--no-fast-select` (scores FP64 par cellule), qui lit toujours la copie FP32. Avec
+  `--no-fast-select`, `--idx-fp16` est donc ignoré (avertissement au démarrage, rien n'est alloué) : sinon le prompt
+  et la vérification noteraient en FP16 et le décodage en FP32.
 
 **Gain (ESTIMÉ, audit) :** ~0,15 ms par token à 128K, rien à 4K. **Mesures à faire avant tout passage par défaut** :
 % de cellules sélectionnées différentes à 32K et 128K, KL forcé par l'enseignant, aiguilles 5/5.
@@ -248,9 +259,12 @@ Comparer les tokens/s et `tokens_per_round`. **Les tokens générés doivent êt
 ```bash
 STRATA_PREFILL_TIMING=1 STRATA_OLD_TOPK=1 STRATA_OLD_QSA_ATTN=1 ./build/strata $ARGS --tokens-file P3 --max-new 1
 STRATA_PREFILL_TIMING=1 ./build/strata $ARGS --tokens-file P3 --max-new 1
+STRATA_PREFILL_TIMING=1 STRATA_QSA_ATTN_BATCH_OLD=1 ./build/strata $ARGS --tokens-file P3 --max-new 1
 ```
 
-Comparer les phases de sélection et d'attention QSA.
+Comparer les phases de sélection et d'attention QSA. Si la 3e ligne est plus rapide que la 2e sur l'attention QSA,
+le kernel à préchargement (48,6 Ko de mémoire partagée) coûte en occupation sur les lots : le signaler, et garder
+`STRATA_QSA_ATTN_BATCH_OLD=1` (bit à bit, les tokens ne changent pas) en attendant d'en faire le défaut.
 
 **4. #21, précision avant tout passage par défaut** (32K et 128K) :
 
