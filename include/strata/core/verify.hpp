@@ -114,6 +114,7 @@ public:
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
     int64_t windows = 0;
+    int64_t commits_async = 0;   ///< issue #16: commits the host did not wait for (ms_commit: their launch only)
 
 private:
     bool capture(int T, std::string& err);
@@ -166,7 +167,9 @@ private:
     static void raise_flag(uint32_t* flag, uint32_t value);
     // Issue #16: in DMA mode flag B is raised by a stream write (cuStreamWriteValue32) queued behind the copies, not
     // by a host function (STRATA_OLD_DMA_FLAG=1 keeps the host function).  Once one raise of a window is queued on
-    // the copy stream, every later one of that window is queued too, so the flag still only rises.
+    // the copy stream, every later one of that window is queued too, so the flag still only rises.  That rule holds
+    // with STRATA_OLD_DMA_FLAG=1 as well: it also closes a race of the old code, where in a split window a direct
+    // raise for (l + 1, A) could release (l, B) before that group's copies had landed.
     void raise_b(uint32_t value);
     bool queue_raise_b(uint32_t value);
     void* write_value32_ = nullptr;   // the driver's cuStreamWriteValue32, null = host functions

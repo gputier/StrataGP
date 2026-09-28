@@ -995,6 +995,7 @@ bool Verifier::commit(int n_keep, std::string& err, bool wait) {
         const cudaError_t re = cudaEventRecord(commit_ev_, cs_);
         if (re != cudaSuccess) { err = std::string("verify: commit event: ") + cudaGetErrorString(re); return false; }
         commit_pending_ = true;
+        ++commits_async;
     }
     for (int t = 0; t < n_keep; ++t) {
         ss_->ple_prev[0] = ss_->ple_prev[1];
