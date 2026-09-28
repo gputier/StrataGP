@@ -74,6 +74,16 @@ class AbOneshot(unittest.TestCase):
         self.assertEqual(AB.set_flags(["--spec", "4", "--x"], ["--spec", "5", "--y", "--z", "1"]),
                          ["--x", "--spec", "5", "--y", "--z", "1"])
 
+    def test_split_flags(self):
+        self.assertEqual(AB.split_flags("--mtp '/a b/c' --spec 5"), ["--mtp", "/a b/c", "--spec", "5"])
+        saved = AB.os.name
+        AB.os.name = "nt"                                                    # Windows paths keep their backslashes
+        try:
+            self.assertEqual(AB.split_flags(r"--mtp C:\Strata\rt-exact"), ["--mtp", r"C:\Strata\rt-exact"])
+            self.assertEqual(AB.split_flags(r'--mtp "C:\S t\x" --spec 5'), ["--mtp", r"C:\S t\x", "--spec", "5"])
+        finally:
+            AB.os.name = saved
+
 
 if __name__ == "__main__":
     unittest.main()

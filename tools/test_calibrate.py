@@ -141,6 +141,14 @@ class CalibrateSpec(unittest.TestCase):
         res, _ = self.run_with(lambda f, p, w, s: {4: 50.0, 5: 51.0, 6: 51.4}[s])
         self.assertNotIn("--spec", res["settings"])
 
+    def test_hand_edited_window_kept(self):
+        # a config at --spec 6 where 6 wins: apply() must keep 6, the window the worker counts were measured with
+        base = CAL.with_arg(BASE, "--spec", "6")
+        res, starts = self.run_with(lambda f, p, w, s: {4: 50.0, 5: 50.5, 6: 55.0}[s], base=base)
+        self.assertEqual(res["settings"].get("--spec"), "6")
+        self.assertTrue(all(CAL.arg_value(a, "--spec") == "6" for a in starts[4:]))
+        self.assertEqual(CAL.arg_value(CAL.apply(base, res["settings"]), "--spec"), "6")
+
     def test_with_the_chosen_pcie_share(self):
         res, starts = self.run_with(lambda f, p, w, s: 50.0 + (10.0 if abs(f - 0.2) < 1e-6 else 0.0) + (s == 6) * 5)
         self.assertEqual(res["settings"].get("--pcie-frac"), "0.20")

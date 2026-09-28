@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shlex
 import statistics
@@ -68,6 +69,15 @@ def parse(text: str) -> dict:
             "output": o.group(1).split()}
 
 
+def split_flags(flags: str) -> list[str]:
+    """FLAGS as arguments.  On Windows the non-POSIX split keeps the backslashes of a path (C:\\Strata\\rt-exact);
+    it keeps the quotes around a quoted token too, so they are removed here."""
+    if os.name != "nt":
+        return shlex.split(flags)
+    return [t[1:-1] if len(t) >= 2 and t[0] == t[-1] and t[0] in "'\"" else t
+            for t in shlex.split(flags, posix=False)]
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("config", help="a run config written by setup (strata-*.json)")
@@ -81,7 +91,7 @@ def main(argv=None) -> int:
     variants = []
     for v in a.variant:
         name, _, flags = v.partition("=")
-        variants.append((name, set_flags(cfg["args"], shlex.split(flags) + FIXED)))
+        variants.append((name, set_flags(cfg["args"], split_flags(flags) + FIXED)))
     ids = prompt_ids(cfg)
     runs = {name: [] for name, _ in variants}
     with tempfile.TemporaryDirectory() as tmp:

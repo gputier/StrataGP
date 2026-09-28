@@ -211,8 +211,8 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, specs=()) -
                 close(e)
         s_best = pick(by_spec, int(d_spec))
         report["spec"] = {str(k): v for k, v in by_spec.items()}
-        if s_best != int(d_spec):
-            settings["--spec"] = str(s_best)
+        if s_best != int(SPEC_DEFAULT):                # apply() writes SPEC_DEFAULT for a window left unset, so a
+            settings["--spec"] = str(s_best)           # hand-edited window the measure kept is recorded too
         base_rate = statistics.median(by_spec[s_best])
         tuned = with_arg(tuned, "--spec", str(s_best))
     # 5. fewer CPU workers (a restart each), with the chosen settings

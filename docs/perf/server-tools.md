@@ -150,8 +150,9 @@ rien : vérifié ici, la sortie de l'ancien outil avec une trace est identique �
 - une fenêtre n'est gardée que si sa médiane bat `--spec 4` de plus de 3 % (même règle `MIN_GAIN`) ;
 - le nombre de workers est ensuite mesuré avec la fenêtre choisie.
 
-`apply()` remet `--spec` à 4 (la valeur de `setup.py`) quand la calibration ne l'a pas choisi, pour qu'une ancienne
-valeur ne reste pas. Il n'ajoute jamais `--spec` à une config qui ne spécule pas. Désactivé par défaut, parce que
+`apply()` remet `--spec` à 4 (la valeur de `setup.py`) quand la calibration ne l'a pas mesuré, pour qu'une ancienne
+valeur ne reste pas. Une fenêtre mesurée et gardée (y compris une valeur éditée à la main, par exemple 6) est
+toujours enregistrée, donc jamais ramenée à 4. Il n'ajoute jamais `--spec` à une config qui ne spécule pas. Désactivé par défaut, parce que
 chaque valeur coûte un redémarrage. **Gain :** à mesurer sur la 5090.
 
 ### #52 (S4) : quantification du brouillon MTP
@@ -284,6 +285,8 @@ python3 tools/mtp_rt.py --gguf "$MTP/mtp-q2_0-exact.gguf" --out "$MTP/rt-exact"
 cp data/draft_vocab.bin "$MTP/rt-exact/"
 python3 tools/ab_oneshot.py strata-q2_0.json --runs 3 --variant grid= --variant exact="--mtp '$MTP/rt-exact'" \
         --json mtp.json
+#   (sous Windows : --variant exact="--mtp C:\chemin\rt-exact" ; les antislashs sont gardés, guillemets doubles
+#    autour d'un chemin avec espaces)
 #   (idem avec --q2-search wide si exact gagne : les deux sont à 0,3 % l'un de l'autre en erreur RMS)
 ```
 
