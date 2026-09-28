@@ -484,9 +484,19 @@ void cpu_require_expert_support() {
     std::exit(1);
 }
 
+// O8c (b): the seeds of the integer correction, -sum of chunk 2b in lane 0 and of chunk 2b+1 in lane 8.  Written by
+// both quantizers: the GGUF-layout Q2_0 rows read them whichever activation contract produced the sums.
+static void write_seeds(ActQ& a) {
+    for (int b = 0; 2 * b + 1 < a.nchunks && b < SC_D; ++b)
+        _mm512_store_si512((void*) a.seed[b],
+                           _mm512_mask_set1_epi32(_mm512_maskz_set1_epi32((__mmask16) 0x0001, -a.sum[2 * b]),
+                                                  (__mmask16) 0x0100, -a.sum[2 * b + 1]));
+}
+
 void act_quant_q8_1(const float* x, int n, ActQ& a) {
     if (oracle_q8_0.load(std::memory_order_relaxed)) {
         quantize_oracle_q8_0(x, n, a);
+        if (int_corr.load(std::memory_order_relaxed)) write_seeds(a);
         return;
     }
     a.nchunks = n / QKA;
@@ -517,13 +527,7 @@ void act_quant_q8_1(const float* x, int n, ActQ& a) {
             a.sum[k] = sum;
             a.hx[k] = s * (float) sum;
         }
-        if (int_corr.load(std::memory_order_relaxed)) {
-            // O8c (b): the seeds of the integer correction, -sum of chunk 2b in lane 0 and of chunk 2b+1 in lane 8
-            for (int b = 0; 2 * b + 1 < a.nchunks && b < SC_D; ++b)
-                _mm512_store_si512((void*) a.seed[b],
-                                   _mm512_mask_set1_epi32(_mm512_maskz_set1_epi32((__mmask16) 0x0001, -a.sum[2 * b]),
-                                                          (__mmask16) 0x0100, -a.sum[2 * b + 1]));
-        }
+        if (int_corr.load(std::memory_order_relaxed)) write_seeds(a);
         return;
     }
     for (int k = 0; k < a.nchunks; ++k) {
