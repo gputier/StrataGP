@@ -23,8 +23,9 @@ import prefill_chunk_check as PCC  # noqa: E402
 # The stand-in: logits row of position p = a function of p (and of the chunk when the prompt is longer than it, the
 # boundary effect under test); the token path and every chunk that holds the whole prompt give the same rows.
 FAKE = r'''#!/usr/bin/env python3
-import sys, struct, re
+import os, sys, struct, re
 a = sys.argv[1:]
+perturb = os.environ.get("FAKE_PERTURB") == "1"
 def val(f, d=None):
     return a[a.index(f) + 1] if f in a else d
 ids = [int(t) for t in re.split(r"[\s,]+", open(val("--tokens-file")).read().strip()) if t]
@@ -36,7 +37,8 @@ first = 0 if chunk == 0 else (until if 0 < until < n - 1 else n - 1)
 split = chunk > 0 and chunk < n - 1
 rows = []
 for p in range(first, n - 1 + max_new):
-    rows.append([((p * 7 + j * 3) % 11) * 0.5 + (0.01 * j if split and p < n else 0.0) for j in range(nv)])
+    rows.append([((p * 7 + j * 3) % 11) * 0.5 + (0.01 * j if split and p < n else 0.0)
+                 + (3.0 if perturb and j == p % nv else 0.0) for j in range(nv)])
 with open(val("--dump-logits"), "wb") as f:
     f.write(struct.pack("<ii", nv, n - 1 + max_new))
     for r in rows:
@@ -108,6 +110,14 @@ class PrefillChunkCheck(unittest.TestCase):
         self.assertIn("layers differ", lines["chunk 16"])
         self.assertIn("differ from token 4", lines["chunk 16"])
         self.assertNotIn("NOT bit-identical", out)
+
+    def test_ab_env_run(self):
+        # the stand-in perturbs its logits when FAKE_PERTURB is set: the extra run must show it, the others not
+        rc, out = self.run_tool("--ids", self.ids(40), "--chunks", "64", "--tail", "4", "--ab-env", "FAKE_PERTURB=1")
+        self.assertEqual(rc, 0, out)
+        line = next(ln for ln in out.splitlines() if ln.startswith("chunk 64 FAKE_PERTURB=1"))
+        self.assertNotIn("100.0%", line)
+        self.assertIn("identical (36 layers)", line)                   # the hash is the prompt path's, unperturbed
 
     def test_tail_one_compares_the_last_position(self):
         rc, out = self.run_tool("--ids", self.ids(40), "--chunks", "64,16")

@@ -20,6 +20,8 @@ prompt short, so for it only the hash and the generated tokens are compared (the
     python tools/prefill_chunk_check.py --config strata-q2_0.json
     python tools/prefill_chunk_check.py --config strata-q2_0.json --length 9000 --tail 256 --token-path
     python tools/prefill_chunk_check.py --exe build/strata -- --pack pack/full --ple-gguf M-2.gguf ...
+    python tools/prefill_chunk_check.py --config strata-q2_0.json --chunks 8192 --length 131072 --tail 256 \\
+        --ab-env STRATA_ROPE_F64=1          # any environment switch, A/B against the same reference
 
 The prompt is a deterministic pseudo-random id sequence (--length, --seed), or --ids FILE (commas or whitespace).
 A chunk only splits the prompt when the prompt is longer than it: the default length, 9000, gives 2 chunks at 8192,
@@ -179,7 +181,13 @@ def main(argv: list[str] | None = None) -> int:
                     help="also read the whole prompt token by token and use it as the reference (slow: one "
                          "decode step per prompt token; canonical packs only)")
     ap.add_argument("--keep", help="keep the logs and dumps in this directory")
+    ap.add_argument("--ab-env", action="append", default=[], metavar="KEY=VALUE",
+                    help="also run the first chunk size with this environment variable set, compared like the "
+                         "others (e.g. STRATA_ROPE_F64=1 at --length 131072 --tail 256); repeatable")
     a = ap.parse_args(argv)
+    for kv in a.ab_env:
+        if "=" not in kv or not kv.split("=", 1)[0]:
+            ap.error(f"--ab-env wants KEY=VALUE, got {kv!r}")
 
     exe, cwd, base = a.exe, None, list(engine_args)
     if a.config:
@@ -223,6 +231,10 @@ def main(argv: list[str] | None = None) -> int:
     for c in chunks[1:]:
         runs.append(run(exe, common + ["--prefill", str(c)] + until, cwd, env, f"chunk {c}", workdir, print, pos0, n,
                         tail))
+    for kv in a.ab_env:
+        key, value = kv.split("=", 1)
+        runs.append(run(exe, common + ["--prefill", str(chunks[0])] + until, cwd, dict(env, **{key: value}),
+                        f"{ref_label} {kv}", workdir, print, pos0, n, tail))
     if a.token_path and not first["native"]:
         runs.insert(0, run(exe, common, cwd, env, "token path", workdir, print, 0, n, tail))
 
