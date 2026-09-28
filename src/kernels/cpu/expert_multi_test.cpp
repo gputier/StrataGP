@@ -115,6 +115,54 @@ int main(int argc, char** argv) {
                 ++fail;
             }
         }
+        // the GGUF-layout Q2_0 rows (the native packs' down projection): one token vs MAXT at once, prefetch on and
+        // off, in both arithmetics; and the integer correction against the default
+        {
+            constexpr int NB = c::SC_D, RB = NB * 18, R = 256;
+            std::vector<uint8_t> w((size_t) R * RB);
+            for (size_t i = 0; i < w.size(); ++i) w[i] = (uint8_t) rng();
+            for (size_t i = 0; i < w.size(); i += 18) {
+                const uint16_t h = (uint16_t) (0x1C00 + rng() % 0x0800);
+                std::memcpy(&w[i], &h, 2);
+            }
+            static c::ActQ h[c::MAXT];
+            static float hx[c::MAXT][c::FF], q2g[2][2][c::MAXT][R];
+            const c::ActQ* hp[c::MAXT];
+            float* op[c::MAXT];
+            float one[R];
+            float* onep[1] = {one};
+            for (int t = 0; t < c::MAXT; ++t) for (float& v : hx[t]) v = nd(rng);
+            for (int ic = 0; ic < 2; ++ic) {
+                c::expert_set_int_corr(ic == 1);
+                for (int t = 0; t < c::MAXT; ++t) { c::act_quant_q8_1(hx[t], c::FF, h[t]); hp[t] = &h[t]; }
+                for (int pf = 0; pf < 2; ++pf) {
+                    c::expert_set_prefetch(pf ? 2048 : 0, pf ? 2048 : 0);
+                    for (int t = 0; t < c::MAXT; ++t) op[t] = q2g[ic][pf][t];
+                    c::q2_0_gguf_rows_multi(w.data(), RB, NB, hp, c::MAXT, op, 0, R);
+                    for (int t = 0; t < c::MAXT; ++t) {
+                        c::q2_0_gguf_rows_multi(w.data(), RB, NB, hp + t, 1, onep, 0, R);
+                        if (std::memcmp(one, q2g[ic][pf][t], sizeof one) != 0) {
+                            std::fprintf(stderr, "FAIL GGUF Q2_0 rows: token %d alone differs (int corr %d, prefetch %d)\n", t, ic, pf);
+                            ++fail;
+                        }
+                    }
+                }
+                if (std::memcmp(q2g[ic][0], q2g[ic][1], sizeof q2g[ic][0]) != 0) {
+                    std::fprintf(stderr, "FAIL GGUF Q2_0 rows: the prefetch changed a result (int corr %d)\n", ic);
+                    ++fail;
+                }
+            }
+            double num = 0, den = 0;
+            for (int t = 0; t < c::MAXT; ++t)
+                for (int r = 0; r < R; ++r) {
+                    num += std::fabs((double) q2g[1][0][t][r] - q2g[0][0][t][r]);
+                    den += std::fabs((double) q2g[0][0][t][r]);
+                }
+            const bool same = std::memcmp(q2g[0][0], q2g[1][0], sizeof q2g[0][0]) == 0;
+            std::printf("GGUF Q2_0 rows, integer correction vs default: rel %.2e%s\n", num / (den + 1e-30),
+                        same ? " (bitwise equal: the mode did not take effect)" : "");
+            if (!(num / (den + 1e-30) < 1e-5) || same) ++fail;
+        }
         c::expert_set_int_corr(false);
         c::expert_set_prefetch(0, 0);
         std::printf("expert_multi_test: %s\n", fail ? "FAILED" : "OK (every token bitwise equal to the single-token kernel)");

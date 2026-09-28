@@ -23,15 +23,20 @@ namespace {
 
 std::atomic<bool> oracle_q8_0{false};
 
-// O8c (#29).  (a) Software prefetch of the scale stream, this many bytes ahead of the row being computed (0 = off,
-// STRATA_CPU_PREFETCH=<bytes>); and of the code stream (STRATA_CPU_PREFETCH_CODES=<bytes>).  Neither changes a bit.
-// (b) The down rows' Q2_0 offset removed in integer (STRATA_CPU_INT_CORR=1): changes the last bits, so opt-in.
+// O8c (#29).  (a) Software prefetch of the scale stream and of the code stream, this many bytes ahead of the row
+// being computed: 2 KB each by default, STRATA_CPU_PREFETCH=<bytes> / STRATA_CPU_PREFETCH_CODES=<bytes> (0 = off),
+// STRATA_OLD_CPU_PREFETCH=1 turns both off (the A/B arm).  Neither changes a bit.  Measured on synthetic experts
+// (expert_multi_test --bench, pool_test --bench): the code stream is the one that matters, the scales alone gain
+// little.  (b) The down rows' Q2_0 offset removed in integer (STRATA_CPU_INT_CORR=1): changes the last bits, so
+// opt-in.
 int env_int(const char* name, int dflt) {
     const char* e = std::getenv(name);
     return e != nullptr && e[0] != 0 ? std::atoi(e) : dflt;
 }
-std::atomic<int> pf_scales{env_int("STRATA_CPU_PREFETCH", 0)};
-std::atomic<int> pf_codes{env_int("STRATA_CPU_PREFETCH_CODES", 0)};
+constexpr int kPrefetchDefault = 2048;
+const bool pf_old = env_int("STRATA_OLD_CPU_PREFETCH", 0) == 1;
+std::atomic<int> pf_scales{pf_old ? 0 : env_int("STRATA_CPU_PREFETCH", kPrefetchDefault)};
+std::atomic<int> pf_codes{pf_old ? 0 : env_int("STRATA_CPU_PREFETCH_CODES", kPrefetchDefault)};
 std::atomic<bool> int_corr{env_int("STRATA_CPU_INT_CORR", 0) == 1};
 
 // `n` bytes starting `dist` bytes past `p`, one prefetch per 64: over consecutive rows the prefetched addresses then
@@ -715,14 +720,18 @@ inline void q2g_row_multi(const uint8_t* row, const ActQ* const* a, int nblocks,
 template<int NT>
 void q2g_rows(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, float* const* out, int r0, int r1) {
     float res[NT];
+    // O8c (a): the GGUF layout interleaves scales and codes, so there is one stream, prefetched at the codes' distance
+    const int pf = pf_codes.load(std::memory_order_relaxed);
     if (nblocks <= SC_D && int_corr.load(std::memory_order_relaxed)) {
         for (int r = r0; r < r1; ++r) {
+            if (pf > 0) prefetch_ahead(w + (size_t) r * row_bytes, (int) row_bytes, pf);
             q2g_row_multi<NT, true>(w + (size_t) r * row_bytes, a, nblocks, res);
             for (int t = 0; t < NT; ++t) out[t][r] = res[t];
         }
         return;
     }
     for (int r = r0; r < r1; ++r) {
+        if (pf > 0) prefetch_ahead(w + (size_t) r * row_bytes, (int) row_bytes, pf);
         q2g_row_multi<NT, false>(w + (size_t) r * row_bytes, a, nblocks, res);
         for (int t = 0; t < NT; ++t) out[t][r] = res[t];
     }

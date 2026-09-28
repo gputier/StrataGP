@@ -107,9 +107,10 @@ void cpu_require_expert_support();
 /// reject combining it with that cache. No allocation occurs in either mode.
 void expert_set_oracle_q8_0(bool enabled);
 
-/// O8c (a) (#29): software prefetch in the AVX-512 expert kernels, `scales_bytes` ahead in the scale stream and
-/// `codes_bytes` ahead in the code stream (0 = off; STRATA_CPU_PREFETCH / STRATA_CPU_PREFETCH_CODES at startup).
-/// Changes no result.  Set it while no expert runs.
+/// O8c (a) (#29): software prefetch in the AVX-512 Q2_0 kernels, `scales_bytes` ahead in the scale stream and
+/// `codes_bytes` ahead in the code stream (0 = off).  At startup 2048 and 2048, or STRATA_CPU_PREFETCH /
+/// STRATA_CPU_PREFETCH_CODES; STRATA_OLD_CPU_PREFETCH=1 turns both off.  Changes no result.  Set it while no expert
+/// runs.
 void expert_set_prefetch(int scales_bytes, int codes_bytes);
 /// O8c (b) (#29), opt-in (STRATA_CPU_INT_CORR=1 at startup): the down rows of the 512-bit kernels remove the Q2_0
 /// code offset in integer (vpdpbusd seeded with -sum) instead of with a float correction.  The single-token and
