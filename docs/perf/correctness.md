@@ -12,7 +12,7 @@ quand c'était possible, vérifié par une simulation hôte), pas d'une mesure. 
 |---|---|---|---|---|
 | #2 | B2 | `s_gemv_q8_split_kernel` : la barrière avant le `return` des warps sans ligne | **oui** (identique au bit) | aucun (même kernel) |
 | #13 | B15 | `bf16_from_f32` et `f2bf` (dequant_bf16) : un NaN reste un NaN, comme ggml | **oui** (identique hors NaN) | aucun |
-| #10 | B11 | `--spec` sans `--mtp` ni `--spec-oracle` : fenêtres de 1 token, plus de brouillons 0 | **oui** (sortie inchangée) | `STRATA_OLD_SPEC_FILL=1` |
+| #10 | B11 | `--spec` sans `--mtp` ni `--spec-oracle` : fenêtres de 1 token, plus de brouillons 0 | **non** (opt-in tant que l'A/B GPU n'a pas confirmé la sortie identique) | `STRATA_SPEC_T1=1` |
 | #3 | B4 | `rope_parity` : RoPE natif de 0 à 262 144 contre FP64 ; angle FP64 en option | test ; option **non** | `STRATA_ROPE_F64=1` |
 | #5 | B6 | softplus natif = llama.cpp, vérifié et documenté ; pas de changement de calcul | — | — |
 | #8 | B9 | 5 tests étendus, 4 nouveaux tests GPU, 1 test CPU | — | — |
@@ -51,10 +51,12 @@ Non modifiés (fichiers d'autres paquets, même défaut) : `bf16_bits` de `src/k
 Sans MTP ni oracle, chaque fenêtre contenait T−1 brouillons `0`, rejetés aussitôt, chacun un token entier de travail
 de vérification. Maintenant la fenêtre sans brouillon est le dernier token seul (T = 1) ; la recherche de suffixe
 (`--suffix-draft`) peut toujours l'élargir (la `DraftPolicy` compare alors T = 1 et la fenêtre de recherche). Un
-brouillon rejeté n'émet jamais rien : **la sortie est inchangée** (le moteur garantit déjà que le résultat d'une ligne
-ne dépend pas de T, à confirmer par l'A/B ci-dessous). Une ligne sur stderr indique le mode.
+brouillon rejeté n'émet jamais rien : la sortie ne reste identique que si le résultat d'une ligne de vérification ne
+dépend pas de T au bit près (T = 1 et T = 4 passent par des kernels multi-token et un batching CPU différents). Rien
+ne l'assure dans le code et rien ne l'a vérifié sur GPU : le changement est donc **opt-in**, à passer par défaut
+seulement après l'A/B ci-dessous (tokens identiques). Une ligne sur stderr indique le mode.
 
-- Ancien comportement : **`STRATA_OLD_SPEC_FILL=1`**.
+- Nouveau comportement : **`STRATA_SPEC_T1=1`** (par défaut : fenêtres complétées de token 0, comme avant).
 - Le mode serveur n'est pas concerné (`--serve` exige `--mtp`), ni la configuration de `setup.py` (elle passe `--mtp`).
 - Gain **ESTIMÉ** pour cette configuration (pack natif sans `--mtp`, `--spec 4`) : une fenêtre de 4 coûte ~2,05× une
   fenêtre de 1 (`kShape` de `draft_policy.cpp`, mesuré sur RTX 5070 avec les experts manqués sur CPU) pour le même
@@ -118,7 +120,7 @@ Tous enregistrés dans ctest, tous compilés ; aucun n'a pu tourner ici (sauf le
 | `bf16_gemv_parity` (étendu) | le MMVF natif (`bf16_gemv_fp32_mmvf`) **bit à bit** contre une émulation hôte de son ordre (paires, deux fmaf ordonnés, papillon xor par warp puis entre warps), tailles de bloc 32/128/160/256, et à 1e-5 du FP64 |
 | `quantize_act_parity` (étendu) | `quantize_q8_0_scaled` **bit à bit** contre le vrai `act_quant_q8_1` du CPU (codes int8 et échelles fp32 ; forme AVX2 sans AVX-512), dont un cas d'égalités exactes k + 0,5 (lie désormais `strata_kernels_cpu`) |
 | `kv_q4_parity` (étendu) | la reconstruction est **affirmée** : bit à bit la déquantification hôte du bloc hôte, et sous la borne Q4_0 (1,01 × |d16| + |x|/1024) |
-| `s_gemv_q8k_parity` (étendu) | #2 : `n_out` = 1, 7, 9, 61 pour les deux kernels split, contre la référence hôte, avec une bande de garde après `n_out` qui doit rester intacte |
+| `s_gemv_q8k_parity` (étendu) | #2 : `n_out` = 1, 7, 9, 61 pour les deux kernels split, contre la référence hôte, erreur L1 normalisée par Σ\|w·x\| de chaque ligne (une ligne dont la somme s'annule ne fait pas échouer un kernel correct), avec une bande de garde après `n_out` qui doit rester intacte |
 | `rope_parity` (étendu) | #3, ci-dessus |
 | `elementwise_parity` (étendu) | #13 sur GPU : `f32_to_bf16_bulk` contre la règle ggml (NaN, inf, motifs aléatoires), et un bloc Q8_0 à échelle NaN via `dequant_bf16` |
 
@@ -209,10 +211,10 @@ grep -H "tok/s\|tokens per round" ab/*.txt
 ```bash
 OPTS_NOMTP="<OPTS sans --mtp> --greedy --max-new 256 --adapt-every 100000"
 for p in p1 p2 p3; do for r in 1 2 3; do
-  ./build/strata $OPTS_NOMTP --tokens-file prompts/$p.txt > ab/nomtp_new_${p}_$r.txt 2>&1
-  STRATA_OLD_SPEC_FILL=1 ./build/strata $OPTS_NOMTP --tokens-file prompts/$p.txt > ab/nomtp_old_${p}_$r.txt 2>&1
+  STRATA_SPEC_T1=1 ./build/strata $OPTS_NOMTP --tokens-file prompts/$p.txt > ab/nomtp_new_${p}_$r.txt 2>&1
+  ./build/strata $OPTS_NOMTP --tokens-file prompts/$p.txt > ab/nomtp_old_${p}_$r.txt 2>&1
 done; done
-grep -H "^output" ab/nomtp_*.txt   # tokens identiques entre old et new
+grep -H "^output" ab/nomtp_*.txt   # tokens identiques entre old et new : condition pour le passer par défaut
 grep -H "decode\|speculation" ab/nomtp_*.txt   # new : "rounds of", tok/s nettement plus haut
 ```
 
