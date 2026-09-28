@@ -3836,7 +3836,19 @@ int main(int argc, char** argv) {
         std::vector<int32_t> window((size_t) o.spec), outv((size_t) o.spec);
         std::vector<int64_t> accepted_hist((size_t) o.spec, 0);
         int64_t rounds = 0, drafts_total = 0, drafts_ok = 0, corrupt_counter = 0;
-        const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
+        // #10: WITHOUT --mtp AND WITHOUT --spec-oracle THERE IS NO DRAFTER, and every window used to be padded to T
+        // with token 0 - drafts that are rejected at once, each one a full token of verify work (~+10 ms per token
+        // when the missed experts go to the CPU, draft_policy.cpp).  A native pack needs --spec but not --mtp, so
+        // this was the default of that configuration.  The drafter-less window is the last token alone (T = 1), and
+        // the suffix lookup below still widens it when it proposes a repeat.  The output is unchanged: a rejected
+        // draft never emits.  STRATA_OLD_SPEC_FILL=1 restores the padded windows (A/B).
+        const bool no_drafter = !use_mtp && oracle.empty() && std::getenv("STRATA_OLD_SPEC_FILL") == nullptr;
+        if (!use_mtp && oracle.empty())
+            std::fprintf(stderr, "strata generate: --spec without --mtp or --spec-oracle: %s\n",
+                         no_drafter ? (o.suffix_draft > 0 ? "windows of 1 token, widened by the suffix lookup"
+                                                           : "windows of 1 token (no drafter)")
+                                    : "windows padded with token 0 (STRATA_OLD_SPEC_FILL)");
+        const int S_mtp = no_drafter ? 1 : o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
