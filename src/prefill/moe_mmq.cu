@@ -68,6 +68,72 @@ __global__ void strata_q2_kernel(const uint8_t* __restrict__ blob, uint16_t* __r
     for (int k = 0; k < 8; ++k) out[1 + k] = qh[k];
 }
 
+// Issue #36: a group's gathers in one launch, blockIdx.y = the expert - byte for byte what the kernels above write
+// when launched once per expert.
+struct GatherArgs {
+    const uint8_t* blob[kGatherBatch];
+    int32_t q[kGatherBatch];
+};
+__global__ void copy16_batch_kernel(GatherArgs b, int64_t up, int64_t down, int64_t na, int64_t nc,
+                                    uint4* __restrict__ gu_dst, int64_t gu_stride, uint4* __restrict__ d_dst,
+                                    int64_t d_stride) {
+    const int x = blockIdx.y;
+    const uint4* blob = (const uint4*) b.blob[x];
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    uint4* gu = gu_dst + b.q[x] * gu_stride;
+    if (i < na) gu[i] = blob[i];
+    else if (i < 2 * na) gu[i] = blob[up + i - na];
+    else if (i < 2 * na + nc) d_dst[b.q[x] * d_stride + i - 2 * na] = blob[down + i - 2 * na];
+}
+__global__ void copy1_batch_kernel(GatherArgs b, int64_t up, int64_t down, int64_t na, int64_t nc,
+                                   uint8_t* __restrict__ gu_dst, int64_t gu_stride, uint8_t* __restrict__ d_dst,
+                                   int64_t d_stride) {
+    const int x = blockIdx.y;
+    const uint8_t* blob = b.blob[x];
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    uint8_t* gu = gu_dst + b.q[x] * gu_stride;
+    if (i < na) gu[i] = blob[i];
+    else if (i < 2 * na) gu[i] = blob[up + i - na];
+    else if (i < 2 * na + nc) d_dst[b.q[x] * d_stride + i - 2 * na] = blob[down + i - 2 * na];
+}
+__global__ void strata_q2_batch_kernel(GatherArgs b, uint8_t* __restrict__ gu_dst, int64_t gu_stride,
+                                       uint8_t* __restrict__ d_dst, int64_t d_stride) {
+    constexpr size_t O_D_CODES = (size_t) 1280 * 640, O_GU_SC = O_D_CODES + (size_t) 2560 * 160,
+                     O_D_SC = O_GU_SC + (size_t) 1280 * 40 * 2;
+    const int x = blockIdx.y;
+    const uint8_t* blob = b.blob[x];
+    uint16_t* gu = (uint16_t*) (gu_dst + b.q[x] * gu_stride);
+    uint16_t* dn = (uint16_t*) (d_dst + b.q[x] * d_stride);
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;   // one GGUF block
+    const int64_t n_gu = 1280LL * 40, n_d = 2560LL * 10;
+    const uint8_t* codes;
+    const uint16_t* scale;
+    uint16_t* out;
+    if (i < n_gu) {
+        const int64_t row = i / 40, c = i % 40;
+        codes = blob + row * 640 + c * 16;
+        scale = (const uint16_t*) (blob + O_GU_SC) + row * 40 + c;
+        out = gu + i * 9;
+    } else if (i < n_gu + n_d) {
+        const int64_t j = i - n_gu, row = j / 10, c = j % 10;
+        codes = blob + O_D_CODES + row * 160 + c * 16;
+        scale = (const uint16_t*) (blob + O_D_SC) + row * 10 + c;
+        out = dn + j * 9;
+    } else {
+        return;
+    }
+    const uint4 q = *(const uint4*) codes;
+    const uint16_t* qh = (const uint16_t*) &q;
+    out[0] = *scale;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) out[1 + k] = qh[k];
+}
+GatherArgs args_of(const GatherBatch& gb) {
+    GatherArgs a = {};
+    for (int i = 0; i < gb.n; ++i) { a.blob[i] = gb.blob[i]; a.q[i] = gb.q[i]; }
+    return a;
+}
+
 __global__ void swiglu_kernel(const float* __restrict__ gu, float* __restrict__ h, int64_t rows, int64_t n_ff,
                               bool interleaved) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -169,6 +235,38 @@ void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stre
     strata_q2_kernel<<<blocks(1280LL * 40 + 2560LL * 10), 256, 0, (cudaStream_t) stream>>>(blob, (uint16_t*) gu_dst,
                                                                                          (uint16_t*) d_dst);
     ck(cudaGetLastError(), "gather_strata_q2");
+}
+
+void gather_native_batch(const GatherBatch& gb, size_t up_off, size_t down_off, size_t gu_half_bytes, size_t d_bytes,
+                         void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride, void* stream) {
+    if (gb.n <= 0) return;
+    if (gb.n > kGatherBatch) { std::fprintf(stderr, "prefill mmq: a gather batch of %d experts\n", gb.n); std::exit(1); }
+    const cudaStream_t s = (cudaStream_t) stream;
+    bool a16 = ((uintptr_t) gu_dst | (uintptr_t) d_dst | gu_stride | d_stride | up_off | down_off | gu_half_bytes |
+                d_bytes) % 16 == 0;
+    for (int i = 0; i < gb.n; ++i) a16 = a16 && (uintptr_t) gb.blob[i] % 16 == 0;
+    const GatherArgs a = args_of(gb);
+    if (a16) {
+        const int64_t na = (int64_t) gu_half_bytes / 16, nc = (int64_t) d_bytes / 16;
+        copy16_batch_kernel<<<dim3(blocks(2 * na + nc), (unsigned) gb.n), 256, 0, s>>>(
+            a, (int64_t) up_off / 16, (int64_t) down_off / 16, na, nc, (uint4*) gu_dst, (int64_t) gu_stride / 16,
+            (uint4*) d_dst, (int64_t) d_stride / 16);
+    } else {
+        const int64_t na = (int64_t) gu_half_bytes, nc = (int64_t) d_bytes;
+        copy1_batch_kernel<<<dim3(blocks(2 * na + nc), (unsigned) gb.n), 256, 0, s>>>(
+            a, (int64_t) up_off, (int64_t) down_off, na, nc, (uint8_t*) gu_dst, (int64_t) gu_stride, (uint8_t*) d_dst,
+            (int64_t) d_stride);
+    }
+    ck(cudaGetLastError(), "gather_native_batch");
+}
+
+void gather_strata_q2_batch(const GatherBatch& gb, void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride,
+                            void* stream) {
+    if (gb.n <= 0) return;
+    if (gb.n > kGatherBatch) { std::fprintf(stderr, "prefill mmq: a gather batch of %d experts\n", gb.n); std::exit(1); }
+    strata_q2_batch_kernel<<<dim3(blocks(1280LL * 40 + 2560LL * 10), (unsigned) gb.n), 256, 0, (cudaStream_t) stream>>>(
+        args_of(gb), (uint8_t*) gu_dst, (int64_t) gu_stride, (uint8_t*) d_dst, (int64_t) d_stride);
+    ck(cudaGetLastError(), "gather_strata_q2_batch");
 }
 
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream) {

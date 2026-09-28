@@ -63,6 +63,22 @@ void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const
 /// Q2_0 blocks: gate/up [1280, 2560] at `gu_dst` (rows stay interleaved), down [2560, 640] at `d_dst`.  Same values.
 void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream);
 
+/// Issue #36: up to kGatherBatch gathers in one launch - expert i from the device blob `blob[i]` (streamed or
+/// resident) into group slot `q[i]` (gu_dst + q * gu_stride, d_dst + q * d_stride) - byte for byte what one
+/// gather_native / gather_strata_q2 per expert writes.
+constexpr int kGatherBatch = 16;
+struct GatherBatch {
+    const uint8_t* blob[kGatherBatch] = {};
+    int32_t q[kGatherBatch] = {};
+    int n = 0;
+};
+/// A native pack's experts: gate at the blob, up at `up_off`, down at `down_off`.
+void gather_native_batch(const GatherBatch& b, size_t up_off, size_t down_off, size_t gu_half_bytes, size_t d_bytes,
+                         void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride, void* stream);
+/// Strata-pack Q2_0 blobs, converted as gather_strata_q2 converts them.
+void gather_strata_q2_batch(const GatherBatch& b, void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride,
+                            void* stream);
+
 /// h[r, k] = silu(gate) * up of GU rows [2 n_ff wide]: interleaved (gate 2k, up 2k+1: the Strata pack) or split
 /// (gate k, up n_ff + k: GGUF).  FP32 out (the down product's quantizer reads floats).
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream);

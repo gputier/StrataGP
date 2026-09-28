@@ -260,12 +260,19 @@ if(STRATA_ENABLE_CUDA)
   # against llama.cpp on the SAME ids and a tokenizer on one side of that comparison is a second variable.
   # plan v0.3 P5: batched prompt processing (tensor-core GEMMs through cuBLAS).
   add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
+  target_sources(strata_prefill PRIVATE src/prefill/moe_group.cu)   # issue #36: the experts grouped on the device
   target_include_directories(strata_prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(strata_prefill PUBLIC strata_engine CUDA::cublas CUDA::cudart)
 
   add_executable(strata src/program/generate.cpp)
   target_include_directories(strata PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec CUDA::cudart)
+
+  # Issue #36: the prompt path's expert grouping on the device and its batched gathers vs the host sort and the
+  # per-expert gathers, entry for entry and byte for byte (GPU, synthetic, no model).
+  add_executable(moe_group_parity src/prefill/moe_group_parity.cpp)
+  target_link_libraries(moe_group_parity PRIVATE strata_prefill CUDA::cudart)
+  add_test(NAME moe_group_parity COMMAND moe_group_parity)
 
   add_executable(dequant_s2_parity src/kernels/dequant_s2_parity.cpp)
   # The tests are HOST C++ files that call cudaMalloc/cudaMemcpy themselves, so they need the toolkit headers

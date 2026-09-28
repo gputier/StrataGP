@@ -18,6 +18,7 @@
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/prefill/gemm.hpp"
+#include "strata/prefill/moe_group.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/kernels.hpp"
 
@@ -49,6 +50,8 @@ Context::~Context() {}
 void Context::run(const Product&, void*) {}
 void gather_native(const void*, const void*, size_t, const void*, size_t, void*, void*, void*) {}
 void gather_strata_q2(const uint8_t*, void*, void*, void*) {}
+void gather_native_batch(const GatherBatch&, size_t, size_t, size_t, size_t, void*, size_t, void*, size_t, void*) {}
+void gather_strata_q2_batch(const GatherBatch&, void*, size_t, void*, size_t, void*) {}
 void swiglu(const float*, float*, int64_t, int64_t, bool, void*) {}
 void iota(int32_t*, int64_t, void*) {}
 }  // namespace strata::prefill::mmq
@@ -280,6 +283,16 @@ struct Prefill::Impl {
     std::unique_ptr<Stager> stager;          // the unpinned experts' host copies (step 4)
     cudaEvent_t copied[RING_MAX] = {}, used[RING_MAX] = {};
     bool stage_live[RING_MAX] = {};
+    // issue #36: the experts grouped on the device - the counts come back in `grp_host` (pinned, n_expert + 1),
+    // `grp_ev` marks them; the group bounds go up from `bounds_pin` (pinned).  `stage_stride`: the ring's slots are
+    // this far apart, all of them (0 = not evenly spaced: one copy per expert).  `ring_dirty`: a chunk of the
+    // grouped walk stopped before giving every slot its `used` event back
+    int32_t* grp_host = nullptr;
+    int32_t* bounds_pin = nullptr;
+    size_t bounds_pin_cap = 0;
+    cudaEvent_t grp_ev = nullptr;
+    int64_t stage_stride = 0;
+    bool ring_dirty = false;
     // PLE
     float* ple_emb = nullptr;
     std::vector<float> ple_pageable[2];      // the fallback when no more RAM can be pinned
@@ -344,6 +357,9 @@ Prefill::~Prefill() {
         if (impl_->ple_copied[b]) cudaEventDestroy(impl_->ple_copied[b]);
         if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty()) cudaFreeHost(impl_->ple_emb_host[b]);
     }
+    if (impl_->grp_ev) cudaEventDestroy(impl_->grp_ev);
+    if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
+    if (impl_->bounds_pin) cudaFreeHost(impl_->bounds_pin);
     if (impl_->copy) cudaStreamDestroy(impl_->copy);
     for (void* p : impl_->owned) cudaFree(p);
 }
@@ -381,6 +397,9 @@ constexpr int MMQ_GROUP = 16;                  // experts per MMQ launch (the ga
 // product: 640 values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
 // llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert.
 constexpr size_t MMQ_TAIL = 4096;
+// issue #36: STRATA_OLD_MOE_GROUP=1 - the routed pairs grouped on the host after a sync, the experts walked one by
+// one (the A/B of the device grouping and the grouped walk; the same numbers either way)
+bool old_moe_group() { static const bool v = std::getenv("STRATA_OLD_MOE_GROUP") != nullptr; return v; }
 struct MmqPlan {
     bool any = false, fallback = true;
     std::vector<char> layer;                   // per layer: MMQ
@@ -463,6 +482,18 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             ok = false;
         m.ple_rows[b].resize(T * strata::kernels::PLE_N_HEADS);
     }
+    // issue #36: the device grouping's pinned counts and bounds (without them the host sorts, as before)
+    if (!m.grp_ev && cudaEventCreateWithFlags(&m.grp_ev, cudaEventDisableTiming) != cudaSuccess) ok = false;
+    if (!m.grp_host && cudaHostAlloc((void**) &m.grp_host, (size_t) (m.g->n_expert + 1) * 4, cudaHostAllocDefault) != cudaSuccess) {
+        cudaGetLastError();
+        m.grp_host = nullptr;
+    }
+    const size_t bounds_cap = (size_t) (m.g->n_expert + 1 + (m.g->n_expert / MMQ_GROUP + 1) * (MMQ_GROUP + 1));
+    if (!m.bounds_pin && cudaHostAlloc((void**) &m.bounds_pin, bounds_cap * 4, cudaHostAllocDefault) != cudaSuccess) {
+        cudaGetLastError();
+        m.bounds_pin = nullptr;
+    }
+    m.bounds_pin_cap = m.bounds_pin ? bounds_cap : 0;
     if (ss.qsa_states[0].kv_mode == 1) {   // KV streaming: the staging pool's identity page table
         const int64_t pages = ss.qsa_states[0].n_pages;
         std::vector<int32_t> ident((size_t) pages);
@@ -564,6 +595,13 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.stage_dev[i] = o.take<uint8_t>((size_t) MAXBLOB(), ok);
         m.stage_live[i] = false;                        // a new buffer: nothing of an earlier layout to wait for
     }
+    // issue #36: consecutive experts of a layer lie back to back in the arena, so a run of them lands in consecutive
+    // ring slots with one 2D copy - when the slots are evenly spaced (one borrowed region, not separate cudaMallocs)
+    m.stage_stride = m.ring >= 2 && m.stage_dev[0] != nullptr ? (int64_t) (m.stage_dev[1] - m.stage_dev[0]) : 0;
+    for (int i = 1; i < m.ring && m.stage_stride != 0; ++i)
+        if (m.stage_dev[i] != m.stage_dev[0] + (size_t) i * (size_t) m.stage_stride) m.stage_stride = 0;
+    if (m.stage_stride < MAXBLOB()) m.stage_stride = 0;
+    m.ring_dirty = false;                               // (a relayout synchronizes both streams first)
     m.ple_emb = o.take<float>(T * N, ok);
     m.ple_norm = o.take<float>((size_t) strata::kernels::NG_HC_DIM, ok);
     take_stage(o, ss, s, m.stage, ok);
@@ -686,15 +724,17 @@ struct PfTimer {
         ++used;
     }
     // every recorded mark has completed (the stream was synchronized): charge the gaps, keep the last mark
-    void fold() {
-        if (!on || used < 2) return;
-        for (size_t i = 0; i + 1 < used; ++i) {
+    void fold() { fold(used); }
+    // the first `upto` marks have completed (an event recorded after them has): charge their gaps, keep the rest
+    void fold(size_t upto) {
+        if (!on || upto < 2 || upto > used) return;
+        for (size_t i = 0; i + 1 < upto; ++i) {
             float t = 0.0f;
             if (cudaEventElapsedTime(&t, ev[i], ev[i + 1]) == cudaSuccess) ms[ph[i]] += t;
         }
-        std::swap(ev[0], ev[used - 1]);
-        std::swap(ph[0], ph[used - 1]);
-        used = 1;
+        std::rotate(ev.begin(), ev.begin() + (std::ptrdiff_t) (upto - 1), ev.begin() + (std::ptrdiff_t) used);
+        std::rotate(ph.begin(), ph.begin() + (std::ptrdiff_t) (upto - 1), ph.begin() + (std::ptrdiff_t) used);
+        used -= upto - 1;
     }
     ~PfTimer() {
         for (cudaEvent_t e : ev) cudaEventDestroy(e);
@@ -800,10 +840,24 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
         const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
         const bool stream_all = m.ring > STAGE && T >= STREAM_ALL_MIN && m.src != nullptr;
+        // issue #36: the grouped walk (every layer through MMQ, the pairs grouped on the device) - a group of experts
+        // waits for its copies once, is gathered in one launch and gives its slots back with one event, and experts
+        // that lie back to back in pinned RAM come in with one copy.  STRATA_OLD_MOE_GROUP=1: expert by expert.
+        const bool walk_groups = stream_all && !old_moe_group() && m.grp_host != nullptr && mmq_plan().any &&
+                                 !mmq_plan().fallback;
         struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; };
         std::vector<StreamEntry> seq;
         std::vector<size_t> seq_start;
         size_t issued = 0, consumed = 0;
+        // the grouped walk: for entry k, the ring slot whose `copied` event follows its copy and the one whose `used`
+        // event follows its release; entries [0, released) are released, in order
+        std::vector<int32_t> cp_ev, rel_ev;
+        size_t released = 0;
+        if (m.ring_dirty) {   // a chunk of the grouped walk stopped early: let every reader of the ring finish
+            cudaStreamSynchronize(m.cs);
+            cudaStreamSynchronize(m.copy);
+            m.ring_dirty = false;
+        }
         if (stream_all) {
             seq_start.resize((size_t) g.n_layers + 1);
             std::vector<Stager::Job> js;
@@ -823,6 +877,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             }
             seq_start[(size_t) g.n_layers] = seq.size();
             m.stager->start(std::move(js));
+            if (walk_groups) {
+                cp_ev.assign(seq.size(), 0);
+                rel_ev.assign(seq.size(), 0);
+                m.ring_dirty = true;
+            }
         }
         struct StagerDone {
             Stager* st;
@@ -851,7 +910,56 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 ++issued;
             }
         };
-        if (stream_all) issue_until((size_t) m.ring);   // layer 0's first experts, behind the embedding and the PLE
+        // the grouped walk's copies of entries [issued, limit), limit <= released + ring (every slot they land in
+        // has been given back): runs of up to MMQ_GROUP experts of one layer, back to back in pinned RAM and in the
+        // ring, in one 2D copy (STRATA_PREFILL_COALESCE=0: one copy per expert)
+        static const bool coalesce = [] {
+            const char* v = std::getenv("STRATA_PREFILL_COALESCE");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        const size_t run_max = m.stage_stride != 0 && coalesce ? (size_t) MMQ_GROUP : 1;
+        auto issue_runs = [&](size_t limit) {
+            limit = std::min(limit, seq.size());
+            const size_t ring = (size_t) m.ring;
+            while (issued < limit) {
+                const size_t k = issued, sl = k % ring;
+                const StreamEntry& en = seq[k];
+                const size_t bytes = (size_t) lay0.blob_bytes(en.l);
+                size_t r = 1;
+                if (en.job < 0)
+                    while (r < run_max && k + r < limit && sl + r < ring && seq[k + r].l == en.l && seq[k + r].job < 0 &&
+                           seq[k + r].blob == en.blob + r * bytes)
+                        ++r;
+                const auto th = Clock::now();
+                // the slots' last readers: an earlier chunk's for the chunk's first `ring` entries (each slot's own
+                // `used`), else this chunk's, released in order - the last one's event covers the others
+                for (size_t i = 0; i < r && k + i < ring; ++i)
+                    if (m.stage_live[sl + i]) cudaStreamWaitEvent(m.copy, m.used[sl + i], 0);
+                if (k + r > ring) cudaStreamWaitEvent(m.copy, m.used[rel_ev[k + r - 1 - ring]], 0);
+                if (r > 1) {
+                    cudaMemcpy2DAsync(m.stage_dev[sl], (size_t) m.stage_stride, en.blob, bytes, bytes, r,
+                                      cudaMemcpyHostToDevice, m.copy);
+                    stats_.experts_dma += (int64_t) r;
+                } else if (en.job < 0) {
+                    cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
+                    ++stats_.experts_dma;
+                } else {
+                    const uint8_t* hb = m.stager->wait(en.job);
+                    cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy);
+                    m.stager->issued_one(en.job, m.copy);
+                }
+                cudaEventRecord(m.copied[sl], m.copy);
+                for (size_t i = 0; i < r; ++i) {
+                    cp_ev[k + i] = (int32_t) sl;
+                    m.stage_live[sl + i] = true;
+                }
+                stats_.ms_experts_host += ms_since(th);
+                stats_.experts_streamed += (int64_t) r;
+                issued += r;
+            }
+        };
+        if (walk_groups) issue_runs((size_t) m.ring);             // layer 0's first experts, behind the embedding
+        else if (stream_all) issue_until((size_t) m.ring);        // and the PLE
         for (int64_t l = 0; l < g.n_layers; ++l) {
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
             const core::LayerView v(*m.wt, l);
@@ -1106,6 +1214,17 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     pt.mark(kPfRouter, cs);
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
+                    // issue #36: the (token, k) pairs grouped by expert on the device - the host sort's tables, entry
+                    // for entry - into the scratch of Dm (the products below overwrite it); only the counts come back,
+                    // and the host waits for them while the shared expert runs.  STRATA_OLD_MOE_GROUP=1: the host sort
+                    const bool dev_group = !old_moe_group() && m.grp_host != nullptr && m.g->n_expert <= 1024 &&
+                                           moe_group_scratch_bytes(T * K, m.g->n_expert) <= (size_t) (T * K * N) * 4;
+                    size_t pt_grouped = 0;
+                    if (dev_group) {
+                        moe_group(m.ids, T * K, K, m.g->n_expert, m.slot_dev, m.src_dev, m.Dm, m.grp_host, m.cs);
+                        cudaEventRecord(m.grp_ev, m.cs);
+                        pt_grouped = pt.used;
+                    }
                     // the shared expert and its scalar gate
                     if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
                     if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
@@ -1113,28 +1232,39 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
                     if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
                     m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
-                    // group the (token, k) pairs by expert on the host
                     pt.mark(kPfHostGroup, cs);
-                    cudaMemcpyAsync(m.ids_host.data(), m.ids, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
-                    cudaStreamSynchronize(m.cs);
-                    pt.fold();
-                    std::fill(m.cnt.begin(), m.cnt.end(), 0);
-                    for (int64_t i = 0; i < T * K; ++i) {
-                        const int32_t e = m.ids_host[(size_t) i];
-                        if (e < 0 || e >= m.g->n_expert) { err = "prefill: routed id out of range"; return false; }
-                        ++m.cnt[(size_t) e];
+                    if (dev_group) {
+                        cudaEventSynchronize(m.grp_ev);
+                        pt.fold(pt_grouped);
+                        if (m.grp_host[m.g->n_expert] != 0) { err = "prefill: routed id out of range"; return false; }
+                        m.off[0] = 0;
+                        for (int64_t e = 0; e < m.g->n_expert; ++e) {
+                            m.cnt[(size_t) e] = m.grp_host[e];
+                            m.off[(size_t) e + 1] = m.off[(size_t) e] + m.cnt[(size_t) e];
+                        }
+                    } else {
+                        // group the (token, k) pairs by expert on the host
+                        cudaMemcpyAsync(m.ids_host.data(), m.ids, (size_t) T * K * 4, cudaMemcpyDeviceToHost, m.cs);
+                        cudaStreamSynchronize(m.cs);
+                        pt.fold();
+                        std::fill(m.cnt.begin(), m.cnt.end(), 0);
+                        for (int64_t i = 0; i < T * K; ++i) {
+                            const int32_t e = m.ids_host[(size_t) i];
+                            if (e < 0 || e >= m.g->n_expert) { err = "prefill: routed id out of range"; return false; }
+                            ++m.cnt[(size_t) e];
+                        }
+                        m.off[0] = 0;
+                        for (int64_t e = 0; e < m.g->n_expert; ++e) m.off[(size_t) e + 1] = m.off[(size_t) e] + m.cnt[(size_t) e];
+                        std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
+                        for (int64_t i = 0; i < T * K; ++i) {
+                            const int32_t e = m.ids_host[(size_t) i];
+                            const int32_t p = fill[(size_t) e]++;
+                            m.slot_host[(size_t) i] = p;
+                            m.src_host[(size_t) p] = (int32_t) (i / K);
+                        }
+                        cudaMemcpyAsync(m.slot_dev, m.slot_host.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, m.cs);
+                        cudaMemcpyAsync(m.src_dev, m.src_host.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, m.cs);
                     }
-                    m.off[0] = 0;
-                    for (int64_t e = 0; e < m.g->n_expert; ++e) m.off[(size_t) e + 1] = m.off[(size_t) e] + m.cnt[(size_t) e];
-                    std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
-                    for (int64_t i = 0; i < T * K; ++i) {
-                        const int32_t e = m.ids_host[(size_t) i];
-                        const int32_t p = fill[(size_t) e]++;
-                        m.slot_host[(size_t) i] = p;
-                        m.src_host[(size_t) p] = (int32_t) (i / K);
-                    }
-                    cudaMemcpyAsync(m.slot_dev, m.slot_host.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, m.cs);
-                    cudaMemcpyAsync(m.src_dev, m.src_host.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, m.cs);
                     // the experts, in id order: resident ones from VRAM, the others through the staging ring
                     std::vector<int32_t> order;
                     for (int32_t e = 0; e < m.g->n_expert; ++e) if (m.cnt[(size_t) e] > 0) order.push_back(e);
@@ -1158,8 +1288,16 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             for (size_t i = 0; i <= MMQ_GROUP; ++i)
                                 m.bounds_host[n + 1 + g * (MMQ_GROUP + 1) + i] =
                                     m.bounds_host[std::min(n, g * MMQ_GROUP + i)] - m.bounds_host[g * MMQ_GROUP];
-                        cudaMemcpyAsync(m.bounds_dev, m.bounds_host.data(), m.bounds_host.size() * 4,
-                                        cudaMemcpyHostToDevice, m.cs);
+                        // from pinned memory when the stream is still busy with the shared expert (a pageable source
+                        // may hold the host until the stream reaches the copy); the previous layer's copy has run by
+                        // now - it precedes this layer's grouping, which the host waited for
+                        if (dev_group && m.bounds_host.size() <= m.bounds_pin_cap) {
+                            std::memcpy(m.bounds_pin, m.bounds_host.data(), m.bounds_host.size() * 4);
+                            cudaMemcpyAsync(m.bounds_dev, m.bounds_pin, m.bounds_host.size() * 4, cudaMemcpyHostToDevice, m.cs);
+                        } else {
+                            cudaMemcpyAsync(m.bounds_dev, m.bounds_host.data(), m.bounds_host.size() * 4,
+                                            cudaMemcpyHostToDevice, m.cs);
+                        }
                     } else {
                         gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
                     }
@@ -1210,6 +1348,33 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         ++stats_.experts_streamed;
                         return true;
                     };
+                    // the products of the group of experts [j0, j1) gathered in the group buffer: gate/up, swiglu, the
+                    // group's H to q8_1, down
+                    auto group_products = [&](size_t j0, size_t j1) {
+                        const size_t g = j0 / MMQ_GROUP, n = order.size();
+                        const int ngx = (int) (j1 - j0);
+                        const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j1] - r0;
+                        int64_t maxr = 0;
+                        for (size_t i = j0; i < j1; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
+                        pt.mark(kPfGemmGU, cs);
+                        // the zeroed tail after the group's last expert (see MMQ_TAIL)
+                        cudaMemsetAsync(m.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, m.cs);
+                        cudaMemsetAsync(m.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, m.cs);
+                        mmq::Product gu;
+                        gu.w = m.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
+                        gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
+                        gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
+                        m.mmq_ctx->run(gu, m.cs);
+                        mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, !lay.native, m.cs);
+                        pt.mark(kPfGemmD, cs);
+                        mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs);
+                        mmq::Product dn;
+                        dn.w = m.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = mmq_db;
+                        dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1);
+                        dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
+                        dn.ld_dst = N;
+                        m.mmq_ctx->run(dn, m.cs);
+                    };
                     // one expert's products from its blob on the device; `slot` (a ring slot, or -1 for a resident
                     // expert) is released once the blob is read
                     auto compute = [&](size_t j, const uint8_t* blob_dev, int slot) -> bool {
@@ -1227,30 +1392,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             }
                             if (slot >= 0) cudaEventRecord(m.used[slot], m.cs);
                             if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
-                            // the group's products: gate/up, swiglu, the group's H to q8_1, down
-                            const size_t j0 = j - q, g = j0 / MMQ_GROUP, n = order.size();
-                            const int ngx = (int) (q + 1);
-                            const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j + 1] - r0;
-                            int64_t maxr = 0;
-                            for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
-                            pt.mark(kPfGemmGU, cs);
-                            // the zeroed tail after the group's last expert (see MMQ_TAIL)
-                            cudaMemsetAsync(m.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, m.cs);
-                            cudaMemsetAsync(m.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, m.cs);
-                            mmq::Product gu;
-                            gu.w = m.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
-                            gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
-                            gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
-                            m.mmq_ctx->run(gu, m.cs);
-                            mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, !lay.native, m.cs);
-                            pt.mark(kPfGemmD, cs);
-                            mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs);
-                            mmq::Product dn;
-                            dn.w = m.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = mmq_db;
-                            dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1);
-                            dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
-                            dn.ld_dst = N;
-                            m.mmq_ctx->run(dn, m.cs);
+                            group_products(j - q, j + 1);
                             return true;
                         }
                         const int q = (int) (j % DQ);
@@ -1290,6 +1432,67 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 if (!compute(j, m.stage_dev[stage_of[j]], stage_of[j])) return false;
                             }
                         }
+                    } else if (walk_groups) {
+                        // issue #36, the grouped walk: this layer's entries [k, kend) in id order.  A group's experts join
+                        // a batch; the batch waits once for the copies up to its last entry (the copy stream runs in
+                        // order), is gathered in one launch, and gives back every entry up to that one - with those the
+                        // routing did not pick - with one `used` event.  An entry whose slot is still held by the entry
+                        // `ring` before it flushes the batch first.  The group buffer and the products are the
+                        // per-expert walk's, launch for launch.
+                        const size_t ring = (size_t) m.ring, kend = seq_start[(size_t) l + 1];
+                        size_t k = seq_start[(size_t) l];
+                        mmq::GatherBatch batch;
+                        int64_t kmax = -1;   // the batch's last streamed entry
+                        auto flush = [&](size_t rel_min) {
+                            if (kmax >= 0) {
+                                issue_runs((size_t) kmax + 1);
+                                pt.mark(kPfWaitCopy, cs);
+                                cudaStreamWaitEvent(m.cs, m.copied[cp_ev[(size_t) kmax]], 0);
+                            }
+                            if (batch.n > 0) {
+                                pt.mark(kPfDequant, cs);
+                                if (lay.native) {
+                                    const auto& f = lay.fmt[(size_t) l];
+                                    mmq::gather_native_batch(batch, (size_t) f.up_off, (size_t) f.down_off, mmq_gub / 2,
+                                                             mmq_db, m.grp_gu, mmq_gub, m.grp_d, mmq_db, m.cs);
+                                } else {
+                                    mmq::gather_strata_q2_batch(batch, m.grp_gu, mmq_gub, m.grp_d, mmq_db, m.cs);
+                                }
+                            }
+                            const size_t rel_to = std::max(rel_min, (size_t) (kmax + 1));
+                            if (rel_to > released) {
+                                const size_t ev = (rel_to - 1) % ring;
+                                cudaEventRecord(m.used[ev], m.cs);
+                                for (size_t i = released; i < rel_to; ++i) rel_ev[i] = (int32_t) ev;
+                                released = rel_to;
+                                issue_runs(released + ring);
+                            }
+                            batch.n = 0;
+                            kmax = -1;
+                        };
+                        const size_t n = order.size();
+                        for (size_t j0 = 0; j0 < n; j0 += MMQ_GROUP) {
+                            const size_t j1 = std::min(n, j0 + MMQ_GROUP);
+                            for (size_t j = j0; j < j1; ++j) {
+                                const int32_t e = order[j];
+                                while (k < kend && seq[k].e < e) ++k;   // not routed: given back with the next flush
+                                const uint8_t* blob_dev;
+                                if (k < kend && seq[k].e == e) {
+                                    if (k >= released + ring) flush(k - ring + 1);
+                                    blob_dev = m.stage_dev[k % ring];
+                                    kmax = (int64_t) k++;
+                                } else {
+                                    ++stats_.experts_resident;
+                                    blob_dev = m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]);
+                                }
+                                batch.blob[batch.n] = blob_dev;
+                                batch.q[batch.n] = (int32_t) (j - j0);
+                                ++batch.n;
+                            }
+                            flush(0);
+                            group_products(j0, j1);
+                        }
+                        flush(kend);
                     } else {
                         // the streamed walk: this layer's entries [k, kend) in id order; an entry the routing did not
                         // pick only gives its slot back
@@ -1349,6 +1552,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
             }
         }
+        if (walk_groups) {   // every slot's own `used` follows its last reader again, as the per-expert walks expect
+            for (int i = 0; i < m.ring; ++i)
+                if (m.stage_live[i]) cudaEventRecord(m.used[i], m.cs);
+            m.ring_dirty = false;
+        }
         stats_.tokens += T;
         pt.mark(kPfStart, cs);
         if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R")) {   // debug: the final residuals, every 64th
@@ -1392,7 +1600,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         bad(ss.gdn_state, 64 * 1024);
         std::fprintf(stderr, "\n");
     }
-    if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
+    // the copy stream too: a streamed expert the routing did not pick is never waited for, and its copy lands in the
+    // borrowed slots that the caller refills (or lends out again) once this returns
+    if (cudaStreamSynchronize(m.cs) != cudaSuccess || cudaStreamSynchronize(m.copy) != cudaSuccess) {
         err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
