@@ -322,6 +322,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
     groups_[T] = G;
     SharedGate sh_mode[2] = {SharedGate::Applied, SharedGate::Applied};   // what pre() left post() to apply (#19)
+    // #44: the in-place combination takes 2..15 experts (the native kernel's range) and at most 128 rows a group
+    // (group A is the larger); any other K keeps the copy + moe_hit_add + per-token combination, and the shared
+    // expert then applies its own gate, as with STRATA_OLD_WINDOW_COMBINE=1.
+    const bool row_combine = !g_old_combine && K >= 2 && K <= 15 && (int64_t) (te_[0] - tb_[0]) * K <= 128;
 
     // ---- the window's inputs, from mapped staging
     copy_i32_from_mapped(tok_, m_tok_, T, cs);
@@ -580,7 +584,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     if (!shared_expert_native_bf16()) f32_to_bf16_bulk(xm, sh_bf16_ + tb * N, (int64_t) n * N, cs);
                     sh_mode[grp] = shared_expert_multi_batched(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data,
                                                                sh_gate_ + (size_t) tb * g.n_ff, sh_up_ + (size_t) tb * g.n_ff,
-                                                               sh_g_ + tb, shared_ + tb * N, N, g.n_ff, cs, !g_old_combine);
+                                                               sh_g_ + tb, shared_ + tb * N, N, g.n_ff, cs, row_combine);
                 }
             } catch (const std::exception& e) {
                 err = std::string("verify shared expert: ") + e.what();
@@ -635,7 +639,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         grouped(p_ptr2, p_start2, p_counts + 2);
         wait_flag_ge(m_flag_, ring, cs);                       // the CPU's share is in the mapped rows
-        if (g_old_combine) {
+        if (!row_combine) {
             copy_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
             moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
             for (int t = tb; t < te; ++t) {

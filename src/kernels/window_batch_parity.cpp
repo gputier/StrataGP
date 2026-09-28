@@ -9,6 +9,8 @@
 //                                      vs copy_from_mapped + moe_hit_add + one combine per token, with the CPU's
 //                                      rows in mapped pinned memory, the GPU's rows listed in any order, -0 and
 //                                      denormals in both, NaN in the rows that must not be read, and no hit list
+//                                      and per token group as --spec-split records it (rows offset by the group's
+//                                      first token, a group-relative hit list)
 //   4. shared_expert_multi_batched     vs shared_expert_multi (native and BF16 gate): the gated output and the
 //                                      Q8_1 of the SwiGLU; then deferred gate + window combine vs the old chain
 //                                      end to end, for both combine kernels
@@ -164,6 +166,7 @@ struct Window {
     float *hit_out = nullptr, *weights = nullptr, *shared = nullptr, *parts = nullptr;
     int32_t *dst = nullptr, *count = nullptr;
     int n_hits = 0;
+    std::vector<int32_t> hit_rows;   // the GPU rows, window-relative, as uploaded to `dst`
 };
 
 // The pool's contract: a GPU row of y_miss is zero, the CPU's rows are its results; the GPU rows of hit_out
@@ -194,6 +197,7 @@ Window make_window(std::mt19937& rng, int T, int K, int64_t N, double hit_rate) 
     }
     std::shuffle(hit_rows.begin(), hit_rows.end(), rng);   // the plan lists groups, not rows in order
     w.n_hits = (int) hit_rows.size();
+    w.hit_rows = hit_rows;
     std::vector<float> wt(rows), sh((size_t) T * (size_t) N);
     for (int t = 0; t < T; ++t) {
         double s = 0.0;
@@ -263,6 +267,59 @@ void test_combine(std::mt19937& rng) {
                           (hits ? "" : ", no hit list"));
             }
         }
+        cudaFree(o1); cudaFree(o2);
+        free_window(w);
+    }
+}
+
+// As record_window's post(l, grp) with --spec-split: group [tb, te) reads y_miss, hit_out, the weights, the shared
+// rows and the output at row tb, while its plan's hit list is group-relative (0..n*K-1).  Old = the group's copy,
+// moe_hit_add over n*K rows and one combine per token; new = one window combination of n tokens.
+void test_combine_groups(std::mt19937& rng) {
+    std::printf("the window combination per token group (offset rows, group-relative hit list)\n");
+    const int64_t N = 2560;
+    const int K = 10;
+    const int Ts[] = {7, 8, 2};
+    for (int T : Ts) {
+        Window w = make_window(rng, T, K, N, 0.8);
+        float* o1 = dalloc<float>((size_t) T * N);
+        float* o2 = dalloc<float>((size_t) T * N);
+        const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {(T + 1) / 2, T};
+        int32_t* gdst[2] = {dalloc<int32_t>((size_t) T * K), dalloc<int32_t>((size_t) T * K)};
+        int32_t* gcnt[2] = {dalloc<int32_t>(1), dalloc<int32_t>(1)};
+        for (int grp = 0; grp < 2; ++grp) {
+            std::vector<int32_t> rel;
+            for (int32_t r : w.hit_rows)
+                if (r >= tb_[grp] * K && r < te_[grp] * K) rel.push_back(r - tb_[grp] * K);
+            const int32_t nr = (int32_t) rel.size();
+            if (nr) up(gdst[grp], rel);
+            ck(cudaMemcpy(gcnt[grp], &nr, 4, cudaMemcpyHostToDevice), "count");
+        }
+        for (int native = 0; native < 2; ++native) {
+            ck(cudaMemset(o1, 0xFF, (size_t) T * N * 4), "m");
+            ck(cudaMemset(o2, 0x7F, (size_t) T * N * 4), "m");
+            for (int grp = 0; grp < 2; ++grp) {
+                const int tb = tb_[grp], te = te_[grp], n = te - tb;
+                const size_t ro = (size_t) tb * K * (size_t) N;
+                k::copy_from_mapped(w.parts + ro, w.m_ymiss + ro, (int64_t) n * K * N, g_cs);
+                k::moe_hit_add(w.parts + ro, w.hit_out + ro, gdst[grp], gcnt[grp], (int64_t) n * K, N, g_cs);
+                for (int t = tb; t < te; ++t) {
+                    const float* p = w.parts + (size_t) t * K * N;
+                    if (native) k::native_moe_combine(p, w.weights + t * K, w.shared + t * N, o1 + t * N, N, K, g_cs);
+                    else k::moe_combine(p, w.weights + t * K, w.shared + t * N, o1 + t * N, N, K, g_cs);
+                }
+                if (native)
+                    k::native_moe_combine_window(w.m_ymiss + ro, w.hit_out + ro, gdst[grp], gcnt[grp], w.weights + tb * K,
+                                                 w.shared + tb * N, nullptr, 0, o2 + tb * N, N, K, n, g_cs);
+                else
+                    k::moe_combine_window(w.m_ymiss + ro, w.hit_out + ro, gdst[grp], gcnt[grp], w.weights + tb * K,
+                                          w.shared + tb * N, nullptr, k::SharedGate::Applied, o2 + tb * N, N, K, n, g_cs);
+            }
+            check(same(down(o1, (size_t) T * N), down(o2, (size_t) T * N)),
+                  std::string(native ? "native" : "double") + " combine, " + std::to_string(T) + " tokens in groups of " +
+                      std::to_string(te_[0] - tb_[0]) + " + " + std::to_string(te_[1] - tb_[1]));
+        }
+        for (int grp = 0; grp < 2; ++grp) { cudaFree(gdst[grp]); cudaFree(gcnt[grp]); }
         cudaFree(o1); cudaFree(o2);
         free_window(w);
     }
@@ -427,6 +484,7 @@ int main(int argc, char** argv) {
         test_mmvf(rng);
         test_router(rng);
         test_combine(rng);
+        test_combine_groups(rng);
         test_shared(rng);
         test_qsa_rows(rng);
     } catch (const std::exception& e) {

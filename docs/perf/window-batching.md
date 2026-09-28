@@ -26,6 +26,12 @@ sélectionnable par variable d'environnement pour l'A/B. Rien de ce paquet ne ch
 `STRATA_OLD_WINDOW=1` rétablit d'un coup 1 à 5 (la fenêtre entière comme en 0.1.20). Les variables sont lues une
 fois ; un graphe déjà capturé garde son choix.
 
+Garde-fou de la ligne 5 : la combinaison en place n'est prise que si 2 ≤ K ≤ 15 et (taille du plus grand groupe) × K
+≤ 128 (plages des deux kernels, comme le graphe « un token » de `session.cpp`). Sinon (modèle avec K = 1 ou K > 15 dans
+le GGUF) la fenêtre reprend d'elle-même l'ancienne suite copie + `moe_hit_add` + combinaison par token, et l'expert
+partagé applique alors sa propre porte (`defer_gate = false`), exactement comme avec `STRATA_OLD_WINDOW_COMBINE=1`.
+Les modèles livrés (K = 10, fenêtre ≤ 8 tokens) prennent toujours le nouveau chemin.
+
 ### Nouveaux kernels et pourquoi ils sont identiques au bit près
 
 - **`bf16_gemv_fp32_mmvf_multi`** (`native_bf16.cu`) : un bloc par ligne de sortie comme `bf16_gemv_fp32_mmvf`, un
@@ -119,7 +125,8 @@ Nouveau test GPU, **compilé, pas exécuté** : `window_batch_parity` (ctest). T
 2. les deux routeurs, groupés contre un appel par token (égalités de logits incluses, 1 à 20 tokens) ;
 3. la combinaison en place contre copie + `moe_hit_add` + combinaison par token, native et double, 1 à 8 tokens,
    0 à 100 % de lignes GPU, liste de hits mélangée, `-0` et dénormaux, NaN dans les lignes qui ne doivent pas être
-   lues, sans liste de hits ;
+   lues, sans liste de hits ; puis par groupe de tokens comme `--spec-split` l'enregistre (lignes décalées du
+   premier token du groupe, liste de hits relative au groupe, 2, 7 et 8 tokens) ;
 4. l'expert partagé groupé contre `shared_expert_multi` (porte native et BF16) : sortie, et Q8_1 de la SwiGLU ;
    puis la chaîne complète porte différée + combinaison contre l'ancienne chaîne, pour les deux combinaisons ;
 5. copie q/porte, norme, RoPE, FWHT et porte de sortie groupées contre par token (noyaux natifs et non natifs).
