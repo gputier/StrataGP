@@ -57,7 +57,7 @@ PREBUILT_ASSET = "strata-windows-x64.zip" if WIN else "strata-linux-x64.zip"
 # the CUDA libraries the ready-made engine loads (the same CUDA 13.0 it is built with), from NVIDIA's pip packages
 CUDA_WHEELS = ["nvidia-cublas==13.0.2.14", "nvidia-cuda-runtime==13.0.96"]
 MIN_DRIVER = 580                       # CUDA 13.0
-MIN_ENGINE = (0, 1, 17)                # v0.1.17: one sampler penalties stage (#53); v0.1.16: the Coder (PR #54)
+MIN_ENGINE = (0, 1, 20)                # v0.1.20: system-prompt checkpoint, PCIe probe, hit rate; v0.1.19: penalties
 PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "cmake", "ninja", "pillow", "psutil"]
 
 MODELS = {
@@ -181,22 +181,37 @@ def mark(path: Path, text=""):
 
 
 # ------------------------------------------------------------------------------------------------ the PC
+def _memory_status():
+    """Windows' GlobalMemoryStatusEx: RAM, and the commit limit (ullTotalPageFile = RAM + page file)."""
+    class MS(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+    m = MS()
+    m.dwLength = ctypes.sizeof(MS)
+    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+    return m
+
+
 def ram_gb():
     if WIN:
-        class MS(ctypes.Structure):
-            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
-                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
-                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
-                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
-                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-        m = MS()
-        m.dwLength = ctypes.sizeof(MS)
-        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
-        return m.ullTotalPhys / 2**30
+        return _memory_status().ullTotalPhys / 2**30
     for line in open("/proc/meminfo"):
         if line.startswith("MemTotal"):
             return int(line.split()[1]) * 1024 / 2**30
     return 0.0
+
+
+def page_file_gb():
+    """The page file's current size (GB) on Windows, None elsewhere.  The graphics card's memory needs room there
+    too: under Windows' driver model every allocation on the card is also charged to the commit (RAM + page file),
+    so with the page file off or tiny the engine cannot use the free VRAM (issue #60)."""
+    if not WIN:
+        return None
+    m = _memory_status()
+    return max(0.0, (m.ullTotalPageFile - m.ullTotalPhys) / 2**30)
 
 
 def cpu_info():
@@ -404,7 +419,18 @@ def get_llama_cpp():
         f.extractall(tmp)
     top = next(tmp.iterdir())
     shutil.rmtree(llama, ignore_errors=True)
-    top.replace(llama)
+    # PR #63: on Windows a rename can fail with PermissionError while an antivirus scanner still holds a file of the
+    # fresh unpack; shutil.move falls back to copy-and-delete, and a few retries let the scanner finish.  The target
+    # is `llama` itself - moving into its parent would keep the zip's `llama.cpp-<sha>` folder name.
+    for attempt in range(5):
+        try:
+            shutil.move(str(top), str(llama))
+            break
+        except PermissionError:
+            if attempt == 4:
+                raise
+            shutil.rmtree(llama, ignore_errors=True)   # a partial copy from the failed attempt
+            time.sleep(2)
     shutil.rmtree(tmp, ignore_errors=True)
     z.unlink(missing_ok=True)
     z.with_name(z.name + ".done").unlink(missing_ok=True)
@@ -928,6 +954,50 @@ def is_wsl() -> bool:
     return sys.platform.startswith("linux") and "microsoft" in platform.uname().release.lower()
 
 
+def hardware_key(cfg: dict) -> str:
+    """What a calibration is valid for: this GPU, CPU and RAM, and the model with its context and images setting
+    (the context's KV cache and the image encoder take VRAM from the expert cache)."""
+    g = gpu_info(cfg.get("gpu")) or {}
+    a = cfg.get("args", [])
+    ctx = a[a.index("--max-context") + 1] if "--max-context" in a else "?"
+    return "|".join([g.get("name", "?"), f"{g.get('vram_gb', 0):.0f}GB", cpu_info()[0], f"{ram_gb():.0f}GB",
+                     cfg.get("model_name", "?"), ctx, "images" if "--vision" in a else "text"])
+
+
+def calibrate_config(cfg_path: Path) -> bool:
+    """Measure the engine's hardware-dependent settings on this PC (tools/calibrate.py), write them into the run
+    config and remember them per PC and model in the settings file, so an update or a reinstall keeps them."""
+    sys.path.insert(0, str(ROOT / "tools"))
+    import calibrate as CAL
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    say()
+    say("  Tuning StrataGP for this PC: the output speed is measured with a few engine settings (the PCIe share, the")
+    say("  draft depth, the CPU threads). It takes about 5-10 minutes; the PC is busy meanwhile.")
+    try:
+        res = CAL.run(cfg, say=say)
+    except Exception as e:                             # never stops an install: the defaults stay
+        warn(f"the tuning did not finish ({e}): the default settings stay")
+        return False
+    cfg["args"] = CAL.apply(cfg["args"], res["settings"])
+    cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    st = load_settings()
+    st.setdefault("calibration", {})[hardware_key(cfg)] = {"settings": res["settings"], "tok_s": res["report"].get("tok_s"),
+                                                           "date": time.strftime("%Y-%m-%d")}
+    save_settings(st)
+    if res["settings"]:
+        ok("tuned for this PC: " + ", ".join(f"{k} {v}" for k, v in res["settings"].items())
+           + (f" ({res['report']['tok_s']} tok/s)" if res["report"].get("tok_s") else ""))
+    else:
+        ok("tuned for this PC: the default settings are already the fastest here"
+           + (f" ({res['report']['tok_s']} tok/s)" if res["report"].get("tok_s") else ""))
+    return True
+
+
+def saved_calibration(cfg: dict) -> dict | None:
+    """The settings an earlier calibration found for this PC and model, if any."""
+    return (load_settings().get("calibration") or {}).get(hardware_key(cfg))
+
+
 def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
     """Configs written before v0.1.13 read prompts in fixed 2048-token chunks; the engine now picks the chunk
     itself (`--prefill auto`: up to 8192, as the free VRAM allows - about 2x faster on long prompts).  Under WSL,
@@ -1029,6 +1099,8 @@ def main() -> int:
     ap.add_argument("--prebuilt", default=os.environ.get("STRATA_PREBUILT_URL", PREBUILT_URL),
                     help="where the ready-made engine is (a URL folder or a local folder)")
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="tune the engine's settings for this PC (about 5-10 minutes), then start the model")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
     say("StrataGP - Qwen3.8-Flash-Next on a normal PC (NVIDIA GPU + system RAM + CPU)")
@@ -1058,6 +1130,17 @@ def main() -> int:
     global GPU_PICK
     GPU_PICK = a.gpu
     port = a.port or 8080                              # a new install's port (issue #32: --port for an existing one)
+    if have and a.calibrate and not (a.setup or a.model or a.family or a.check):
+        if not a.build:
+            update_installed_engine(a.prebuilt)
+        pick_cfg = have[0]
+        if len(have) > 1:
+            say()
+            for i, c in enumerate(have, 1):
+                say(f"  {i}) {json.loads(c.read_text(encoding='utf-8-sig')).get('model_name', c.stem)}")
+            pick_cfg = have[int(ask("Tune which one?", [str(i) for i in range(1, len(have) + 1)], "1", a.yes)) - 1]
+        calibrate_config(pick_cfg)
+        return 0 if a.no_start else start(pick_cfg, a.port, a.gpu)
     if have and not (a.setup or a.model or a.family or a.check or a.no_start):
         if not a.build:
             update_installed_engine(a.prebuilt)
@@ -1101,6 +1184,11 @@ def main() -> int:
              "StrataGP keeps all of the model's experts in RAM (23-50 GB, whatever the GPU) and the GPU holds a copy "
              "of the most-used ones: it needs 32 GB of RAM or more (48 GB for the full model)")
     ok(f"RAM: {ram:.0f} GB" if ram >= need - 4 else f"RAM: {ram:.0f} GB (less than the {need} GB the smallest model needs)")
+    pf = page_file_gb()
+    if pf is not None and pf < 4:
+        warn(f"Windows' page file is {pf:.1f} GB: the graphics card's memory needs room there too (issue #60), so "
+             "the model may not start or may use less VRAM. Set it to \"System managed\": System > About > "
+             "Advanced system settings > Performance > Advanced > Virtual memory")
     ok(f"CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2' if avx2 else 'no AVX2'})")
     if not avx2:
         fail("this CPU has no AVX2; StrataGP needs at least AVX2")
@@ -1337,8 +1425,19 @@ def main() -> int:
         if vision == "cpu":
             cfg["vision"]["threads"] = max(1, (os.cpu_count() or 8) // 2)
     cfg_path = ROOT / f"strata-{tag.lower()}.json"
+    cal = saved_calibration(cfg)
+    if cal is not None:
+        sys.path.insert(0, str(ROOT / "tools"))
+        import calibrate as CAL
+        cfg["args"] = CAL.apply(cfg["args"], cal.get("settings") or {})
+        ok("the settings tuned for this PC earlier are used" + (f" ({cal['date']})" if cal.get("date") else ""))
     cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
     script = write_run_script(tag, cfg_path, port)
+    # offered only when someone answers: --yes installs and adopted earlier installs are not held up by it
+    if cal is None and not a.no_start and not a.yes and ask(
+            "Tune StrataGP for this PC now? It measures a few engine settings (about 5-10 minutes; the PC is busy "
+            "meanwhile; later: START-HERE --calibrate)", ["y", "n"], "y", a.yes) == "y":
+        calibrate_config(cfg_path)
     ok(f"start script: {script.name}")
 
     say()

@@ -41,6 +41,9 @@ A card with more VRAM is faster, because more of the model fits on the GPU: an R
 100-140 tokens per second. All measurements, long-context numbers and estimates for other cards are in the
 [details](docs/DETAILS.md#speed-measured).
 
+Every PC is different: `START-HERE.bat --calibrate` measures a few engine settings on yours and keeps the fastest
+(about 5-10 minutes; on the PC above it made the Coder 7% faster).
+
 ## Which model should I pick?
 
 **The size** (the same model, compressed more or less):
@@ -72,6 +75,9 @@ lower the RAM needed.
 
 Not sure? Take **IQ2_XS** - or the **Coder** if you mainly write code, or have 32-48 GB of RAM. You can add another
 one later with `SETUP.bat` (the same as `START-HERE.bat --setup`; on Linux `./setup.sh --setup`).
+
+For **OrcaRouter's Flash-Next Uncensored IQ3_XXS**, see the [manual compatibility setup](docs/ORCA.md).
+It needs an explicit packing conversion and is not an installer menu option.
 
 ## Install
 

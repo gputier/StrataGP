@@ -1,6 +1,15 @@
 # StrataGP : audit de performance et de précision du moteur
 
-*28 septembre 2026. Base : `upstream/main` au commit `b38c183` (moteur 0.1.18), identique à `gputier/StrataGP`.*
+*28 septembre 2026. Base : `upstream/main` au commit `b38c183` (moteur 0.1.18), identique à `gputier/StrataGP`. Les
+numéros de ligne renvoient à ce commit.*
+
+> **Mise à jour, moteur 0.1.19 et 0.1.20 (fusionnés depuis Strata).** Déjà corrigés en amont par `a49e810` :
+> - **B1** : historique de pénalités, une ligne par token de fenêtre ;
+> - **B3** : `top_k` 0 ou > 64 vaut 64, toutes les lignes sont écrites ;
+> - l'échantillonnage hors `--serve` (section B11).
+>
+> Couvert en partie par `setup --calibrate` (`09bff3f`) et la PR #44 : le réglage de `--pcie-frac` et de
+> `--spec-min-p` (section 7). Tout le reste de ce rapport s'applique toujours à la 0.1.20.
 
 ## Ce qu'il faut retenir
 
