@@ -198,6 +198,7 @@ if(STRATA_ENABLE_CUDA)
                           src/kernels/cuda/dequant_bf16.cu
                           src/kernels/cuda/qsa_select.cu
                           src/kernels/cuda/verify_kernels.cu
+                          src/kernels/cuda/mtp_chain.cu
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
@@ -386,6 +387,11 @@ if(STRATA_ENABLE_CUDA)
   target_include_directories(cvec_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(cvec_parity PRIVATE strata_kernels CUDA::cudart)
   add_test(NAME cvec_parity COMMAND cvec_parity)
+  # Issue #16: the MTP draft chain as one WHILE-node graph vs the host loop it replaces (GPU, synthetic, no model).
+  add_executable(mtp_chain_parity src/kernels/mtp_chain_parity.cpp)
+  target_include_directories(mtp_chain_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(mtp_chain_parity PRIVATE strata_kernels CUDA::cudart)
+  add_test(NAME mtp_chain_parity COMMAND mtp_chain_parity)
 
   # Plan v0.3 P3: native MMVQ for 1..8 tokens (bitwise selftest + --bench timing); synthetic data, no model.
   if(STRATA_BUILD_TESTS AND STRATA_HAVE_MICRO)
