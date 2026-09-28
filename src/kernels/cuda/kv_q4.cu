@@ -3,6 +3,7 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/kv_stream.hpp"
+#include "strata/kernels/qsa_prep.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -115,6 +116,36 @@ __global__ void kv_append_q4_kernel(uint8_t* __restrict__ k_q4, uint8_t* __restr
                  d, byte);
 }
 
+// O6e (qsa_prep.hpp): K (blockIdx.y == 0) normalized and rotated, or V (1), of KV head blockIdx.x of token
+// blockIdx.z, then the Hadamard transform (fwht256_kernel's butterfly) and kv_append_q4_kernel's quantizer: 256
+// threads, warp b holds group b with lane = element, as that kernel's block (h, b) does.
+template <bool NATIVE_NORM, bool NATIVE_ROPE>
+__global__ void __launch_bounds__(qsa_prep::kThreads)
+kv_append_q4_prep_kernel(uint8_t* __restrict__ k_q4, uint8_t* __restrict__ v_q4, const int32_t* __restrict__ table,
+                         const int32_t* __restrict__ step, float* __restrict__ kcur, float* __restrict__ vcur,
+                         const float* __restrict__ k_gamma, const int32_t* __restrict__ rope_pos, int pos_stride,
+                         qsa_prep::RowArgs ra, int kv_heads, int head_dim, int page_size, KvHostPools host) {
+    __shared__ float sh[qsa_prep::kShared];
+    const int h = blockIdx.x, t = threadIdx.x, tok = blockIdx.z;
+    const bool is_v = blockIdx.y == 1;
+    const long long pos = (long long) __ldg(step + (size_t) tok * kStepCount + kStepPos);
+    float* row_p = (is_v ? vcur : kcur) + ((size_t) tok * kv_heads + h) * head_dim;
+    float x = row_p[t];
+    if (!is_v)   // block-uniform
+        x = qsa_prep::norm_rope_row<NATIVE_NORM, NATIVE_ROPE>(x, head_dim, k_gamma,
+                                                              rope_pos[(size_t) tok * pos_stride + h], ra, sh);
+    x = qsa_prep::fwht256_row(x, sh);   // Q4_0: rotated K and V (kv_q4.hpp)
+    row_p[t] = x;
+    const int b = t / QK4_0, lane = t % QK4_0;
+    uint8_t byte;
+    const uint16_t d = q4_group(x, lane, byte);
+    const long long page = (long long) table[pos / page_size];
+    if (page >= 0) q4_store(is_v ? v_q4 : k_q4, (page * kv_heads + h) * page_size + (pos % page_size), b, lane, d, byte);
+    if (host.k_q4 != nullptr)
+        q4_store(is_v ? host.v_q4 : host.k_q4, ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size), b,
+                 lane, d, byte);
+}
+
 // The prompt path: grid (T, kv_heads, groups), K then V; also into the staging pool (identity layout) when given.
 __global__ void kv_append_q4_batch_kernel(uint8_t* __restrict__ k_q4, uint8_t* __restrict__ v_q4,
                                           const int32_t* __restrict__ table, int64_t pos0,
@@ -199,6 +230,23 @@ void kv_append_q4_step(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, 
         k_q4, v_q4, page_table, step, kcur, vcur, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size,
         host ? *host : KvHostPools{});
     check("kv_append_q4 launch");
+}
+
+void kv_append_q4_prep_step(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step,
+                            float* kcur, float* vcur, const float* k_gamma, const int32_t* pos, int64_t pos_stride,
+                            int64_t n_tok, const QsaNormRope& nr, const QsaShapes& s, void* stream,
+                            const KvHostPools* host) {
+    need_256(s, "kv_append_q4_prep");
+    if (!qsa_prep_supported(s, nr) || step == nullptr || k_gamma == nullptr || pos == nullptr || n_tok < 1 ||
+        n_tok > 65535) {
+        std::fprintf(stderr, "kv_append_q4_prep: geometry, arithmetic or arguments outside the fused path\n");
+        std::exit(1);
+    }
+    const dim3 grid((unsigned) s.n_head_kv, 2, (unsigned) n_tok);
+    STRATA_QSA_PREP_LAUNCH(nr, kv_append_q4_prep_kernel, grid, stream, k_q4, v_q4, page_table, step, kcur, vcur,
+                           k_gamma, pos, (int) pos_stride, qsa_prep::row_args(nr, s), (int) s.n_head_kv,
+                           (int) s.head_dim, (int) s.page_size, host ? *host : KvHostPools{});
+    check("kv_append_q4_prep launch");
 }
 
 void kv_append_q4(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, int64_t pos0, int64_t T, const float* K,

@@ -7,6 +7,7 @@
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/gdn.hpp"
 #include "strata/kernels/qsa.hpp"
+#include "strata/kernels/qsa_prep.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/quantize_act.hpp"
@@ -838,6 +839,17 @@ const auto normalize_rotate = [&](float* data, const WeightRef* norm, int rows, 
         return false;
     }
 };
+// O6e (qsa_prep.hpp): K's norm and rotation (Q4: and both transforms) go into its append, and both queries are
+// prepared by one launch - bitwise the separate launches, which STRATA_OLD_QSA_PREP=1 keeps for the A/B
+static const bool old_prep = std::getenv("STRATA_OLD_QSA_PREP") != nullptr;
+QsaNormRope nr;
+nr.eps = RMS_EPS;
+nr.native_norm = native_qsa_enabled();
+nr.native_rope = native_rope_enabled();
+nr.freq_base = (float) qsa_freq_base();
+nr.cos_tab = st.cos_tab;
+nr.sin_tab = st.sin_tab;
+const bool prep = !old_prep && qsa_prep_supported(s, nr);
 // ---- resolve every tensor by name, and REFUSE rather than reading a null.  `check_layer` has already
 // asserted the shapes at load time; a missing name here is a wiring mistake.
 struct Req { const char* suf; };    const WeightRef* w_idxk = v.get("indexer.k_proj.weight");    const WeightRef* w_attnq = v.get("attn_q.weight");    const WeightRef* w_attnk = v.get("attn_k.weight");    const WeightRef* w_attnv = v.get("attn_v.weight");    const WeightRef* w_attno = v.get("attn_output.weight");    const WeightRef* w_idxq = v.get("indexer.q_proj.weight");    const WeightRef* w_qn = v.get("attn_q_norm.weight");    const WeightRef* w_kn = v.get("attn_k_norm.weight");    const WeightRef* w_iqn = v.get("indexer.q_norm.weight");    const WeightRef* w_ikn = v.get("indexer.k_norm.weight");    const char* missing = !w_idxk ? "indexer.k_proj.weight" : !w_attnq ? "attn_q.weight"                          : !w_attnk ? "attn_k.weight" : !w_attnv ? "attn_v.weight"                          : !w_attno ? "attn_output.weight" : !w_idxq ? "indexer.q_proj.weight"                          : !w_qn ? "attn_q_norm.weight" : !w_kn ? "attn_k_norm.weight"                          : !w_iqn ? "indexer.q_norm.weight" : !w_ikn ? "indexer.k_norm.weight" : nullptr;    if (missing) { err = v.name(missing) + " is missing"; return false; }    if (pos < 0 || pos >= st.max_cells) {        err = "qsa_layer: pos " + std::to_string(pos) + " is outside the state's 0.." +              std::to_string(st.max_cells - 1);        return false;    }
@@ -878,12 +890,18 @@ SForm f_k, f_v, f_o, f_q;    if (!sform_of(*w_attnk, f_k, v.name("attn_k.weight"
 // k and v, with the activation THIS layer's tensors ask for.  Both are K-quants in every QSA layer of this
 // artifact, but the dispatch is here for the same reason it is in `gdn_layer`: the pack decides per tensor,
 // and "it happens to be uniform here" is the assumption that was wrong for `attn_q`.
-if (!gemv_quantized(*w_attnk, p_k, f_k, b.x_q8_0, b.x_q8k, b.kcur, g.n_embd, g.n_head_kv * g.head_dim,                        v.name("attn_k.weight"), stream, err, x)) return false;    if (!gemv_quantized(*w_attnv, p_v, f_v, b.x_q8_0, b.x_q8k, b.vcur, g.n_embd, g.n_head_kv * g.head_dim,                        v.name("attn_v.weight"), stream, err, x, w_attnk->native_data && w_attnv->native_data)) return false;    dump_slot(dump, g, layer, b.vcur,                            (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim,                            (uint64_t) g.n_head_kv * g.head_dim, stream);    if (!normalize_rotate(b.kcur, w_kn, (int) g.n_head_kv, (int) g.head_dim)) return false;
+if (!gemv_quantized(*w_attnk, p_k, f_k, b.x_q8_0, b.x_q8k, b.kcur, g.n_embd, g.n_head_kv * g.head_dim,                        v.name("attn_k.weight"), stream, err, x)) return false;    if (!gemv_quantized(*w_attnv, p_v, f_v, b.x_q8_0, b.x_q8k, b.vcur, g.n_embd, g.n_head_kv * g.head_dim,                        v.name("attn_v.weight"), stream, err, x, w_attnk->native_data && w_attnv->native_data)) return false;    dump_slot(dump, g, layer, b.vcur,                            (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim,                            (uint64_t) g.n_head_kv * g.head_dim, stream);    if (!prep && !normalize_rotate(b.kcur, w_kn, (int) g.n_head_kv, (int) g.head_dim)) return false;
 // ---- 5. into the cache, and the indexer's append (which pools AND rotates on a block completion).
 // EVERY ENTRY POINT FROM HERE ON IS THE CAPTURABLE ONE: the per-token counts come from `st.step` and every
 // launch is sized from a capacity in `st`/`b`, so this sequence can be captured and replayed.  The
 // host-scalar wrappers would be correct here today and silently wrong in a graph.
-if (st.kv_q4) {
+if (prep) {
+    // one launch per format; kcur (Q4: and vcur) end as the separate launches leave them, for the dumps below
+    const float* k_gamma = (const float*) w_kn->data;
+    if (st.kv_q4) kv_append_q4_prep_step(st.k_q4, st.v_q4, st.page_table, st.step, b.kcur, b.vcur, k_gamma, st.pos_dev, 0, 1, nr, s, stream, &st.host);
+    else if (st.kv_int8) kv_append_q8_prep_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, st.step, b.kcur, b.vcur, k_gamma, st.pos_dev, 0, 1, nr, s, stream, &st.host);
+    else kv_append_prep_step(st.k_pool, st.v_pool, st.page_table, st.step, b.kcur, b.vcur, k_gamma, st.pos_dev, 0, 1, nr, s, stream, &st.host);
+} else if (st.kv_q4) {
     strata::kernels::fwht256_inplace_cuda(b.kcur, g.n_head_kv, stream);   // Q4_0: rotated K and V (kv_q4.hpp)
     strata::kernels::fwht256_inplace_cuda(b.vcur, g.n_head_kv, stream);
     strata::kernels::kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);
@@ -904,6 +922,13 @@ if (st.kv_q4) {
 // S4 code plane with a Q8_0 activation.  Both are "a quantized activation", both produce a plausible
 // vector, and the difference is 0.6-1.4%.
 if (!gemv_quantized(*w_attnq, p_q, f_q, b.x_q8_0, b.x_q8k, b.q_full, g.n_embd, g.n_head * 2 * g.head_dim,                        v.name("attn_q.weight"), stream, err, x, w_attnv->native_data && w_attnq->native_data)) return false;
+if (prep) {
+    // O6e: the indexer's query is projected FIRST, so that one launch prepares both queries, reading q's half
+    // straight from `q_full` (no 2-D copy); for Q4 it also applies q's transform, which step 8 then skips
+    project_bf16(x, b.x_bf16, (const uint16_t*) w_idxq->data, b.q_idx, g.n_embd, g.idx_q_heads * g.idx_key_dim, false, stream);
+    qsa_q_prep(b.q_full, b.qcur, (const float*) w_qn->data, b.q_idx, (const float*) w_iqn->data, st.pos_dev, 0, 1,
+               st.kv_q4, nr, s, stream);
+} else {
 // `per_head[:, :head_dim]` - the FIRST half of each head's 2*head_dim block, copied out contiguously so
 // the norm and the rotation see whole rows.  A 2-D copy is a memcpy node, which captures (`pinned_capture`
 // case A) and needs no kernel.
@@ -911,6 +936,7 @@ if (cudaMemcpy2DAsync(b.qcur, (size_t) g.head_dim * 4, b.q_full, (size_t) g.head
 // ---- 7. the indexer's query: BF16, then norm and rotate
 project_bf16(x, b.x_bf16, (const uint16_t*) w_idxq->data, b.q_idx, g.n_embd, g.idx_q_heads * g.idx_key_dim, false, stream);
 if (!normalize_rotate(b.q_idx, w_iqn, (int) g.idx_q_heads, (int) g.idx_key_dim)) return false;
+}
 // ---- 8. score, select, gather, attend.  `max_blocks` and `cap` are CAPACITIES from the state, not this
 // token's counts: a grid or a shared-memory size that follows the sequence length is baked into a captured
 // graph, and the kernels guard for the surplus.    const
@@ -924,7 +950,7 @@ int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
     }
     // KV streaming: every block the selection names is made resident before anything reads it
     qsa_kv_resolve(st, g, b.ids, st.step, 1, cap, stream);
-    if (st.kv_q4) strata::kernels::fwht256_inplace_cuda(b.qcur, g.n_head, stream);   // <Hq, Hk> = <q, k>
+    if (st.kv_q4 && !prep) strata::kernels::fwht256_inplace_cuda(b.qcur, g.n_head, stream);   // <Hq, Hk> = <q, k>
     if (g_fast_attn && !native_flash_attn_short && dump == nullptr) {
         const strata::kernels::QsaAttnPools pools = qsa_attn_pools(st);
         strata::kernels::qsa_decode_attn_step(b.qcur, pools, b.ids, st.step, cap, s, b.attn_scratch, b.attn, stream);

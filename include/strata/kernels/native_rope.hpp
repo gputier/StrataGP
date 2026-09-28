@@ -11,4 +11,9 @@ bool native_rope_enabled();
 // Explicit stream required. No allocation or synchronization.
 void native_rope_apply(const float* x, float* out, int rows, int head_dim,
                        int n_rot, float freq_base, const int* positions, void* stream);
+
+// The per-pair frequency ratio the rotation raises to the pair index, computed on the
+// host once per call: shared with the fused QSA preparation (qsa_prep.hpp) so both
+// start from the same float.
+float native_rope_theta_scale(float freq_base, int n_rot);
 }
