@@ -428,8 +428,16 @@ class Vision:
 
     def encode(self, source: str) -> tuple[Path, int]:
         """-> (embeddings file, number of image tokens)."""
-        data = self.normalize(self.load(source))
-        key = hashlib.sha256(data).hexdigest()[:32]
+        raw = self.load(source)
+        # Issue #35: the cache key is the hash of the bytes AS SENT, so an image already encoded (every turn it stays
+        # in the conversation) is found before Pillow decodes and re-encodes a WebP or TIFF to PNG again.  The same
+        # bytes always normalize to the same PNG, so the embeddings are the ones the normalized image would give.
+        key = hashlib.sha256(raw).hexdigest()[:32]
+        with self.lock:
+            if key in self.cache:
+                self.cache[key] = self.cache.pop(key)                  # most recently used last
+                return self.cache[key]
+        data = self.normalize(raw)
         with self.lock:
             if key in self.cache:
                 return self.cache[key]
@@ -443,7 +451,7 @@ class Vision:
                 raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
                                                                      "the vision encoder stopped"))
             self.cache[key] = (out, int(line.split()[1]))
-            if len(self.cache) > 64:                                   # oldest first
+            if len(self.cache) > 64:                                   # least recently used first
                 old = next(iter(self.cache))
                 self.cache.pop(old)[0].unlink(missing_ok=True)
             return self.cache[key]
@@ -678,8 +686,22 @@ class Service:
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
+            combined = self.vision.dir / f"req-{uuid.uuid4().hex[:12]}.sve"
             with self.fifo:
                 encoded = [self.vision.encode(src) for src in images]
+                # the request's embeddings file, while no other encode can evict the cached files it is made of;
+                # one image (issue #35): a hard link to its cached file instead of a copy of its ~10 MB
+                linked = False
+                if len(encoded) == 1:
+                    try:
+                        os.link(encoded[0][0], combined)
+                        linked = True
+                    except OSError:                     # a file system without hard links: copy
+                        pass
+                if not linked:
+                    with open(combined, "wb") as f:
+                        for path, _ in encoded:
+                            f.write(path.read_bytes())
             out, k = [], 0
             for t in ids:                               # one <|image_pad|> per image -> one per image token
                 if t == pad and k < len(encoded):
@@ -688,12 +710,9 @@ class Service:
                 else:
                     out.append(t)
             if k != len(encoded):
+                combined.unlink(missing_ok=True)
                 raise ValueError("the prompt and its images do not match")
             ids = out
-            combined = self.vision.dir / f"req-{uuid.uuid4().hex[:12]}.sve"
-            with open(combined, "wb") as f:
-                for path, _ in encoded:
-                    f.write(path.read_bytes())
             self.embeddings.path = combined
         room = self.engine.max_context - CTX_SLACK - len(ids)
         if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):

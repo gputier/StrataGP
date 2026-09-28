@@ -645,5 +645,71 @@ class IncrementalPrompts(unittest.TestCase):
             del os.environ["STRATA_OLD_PROMPT_ENCODE"]
 
 
+class VisionCache(unittest.TestCase):
+    """Issue #35: an image already encoded is found by its raw bytes, before any conversion, and a request with one
+    image links its cached embeddings instead of copying them."""
+
+    def make_vision(self):
+        import tempfile
+        from serve.server import Vision
+
+        class FakeProc:
+            def __init__(self):
+                self.stdin, self.stdout, self.encodes = self, self, 0
+
+            def write(self, line):
+                _, img, out = line.split()
+                Path(out).write_bytes(b"EMB" + Path(img).read_bytes())
+                self.encodes += 1
+
+            def flush(self):
+                pass
+
+            def readline(self):
+                return "OK 3\n"
+        v = Vision.__new__(Vision)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        v.dir, v.lock, v.cache, v.proc = Path(tmp.name), __import__("threading").Lock(), {}, FakeProc()
+        v.normalized = 0
+
+        def normalize(data):
+            v.normalized += 1
+            return b"PNG:" + data
+        v.normalize = normalize
+        return v
+
+    def test_raw_bytes_hit_before_normalize(self):
+        import base64
+        v = self.make_vision()
+        src = "data:image/webp;base64," + base64.b64encode(b"RIFF....WEBPVP8 fake").decode()
+        a = v.encode(src)
+        b = v.encode(src)
+        self.assertEqual(a, b)
+        self.assertEqual(v.normalized, 1)
+        self.assertEqual(v.proc.encodes, 1)
+        self.assertEqual(a[0].read_bytes(), b"EMBPNG:RIFF....WEBPVP8 fake")
+
+    def test_one_image_request_links(self):
+        import base64
+        v = self.make_vision()
+        tok = ByteTokenizer()
+        svc = Service(RecordingPrompt(tok, "</think>\n\nok", max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"), vision=v)
+        src = "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\nimage").decode()
+        msgs = [{"role": "user", "content": [{"type": "image", "source": src}, {"type": "text", "text": "what?"}]}]
+        ids, _, _ = svc.prepare(msgs, None, {}, 16)
+        self.assertEqual(ids.count(256 + ByteTokenizer.SPECIALS.index("<|image_pad|>")), 3)
+        req = Path(svc.embeddings.path)
+        cached = v.cache[next(iter(v.cache))][0]
+        self.assertEqual(req.read_bytes(), cached.read_bytes())
+        req.unlink()                                     # what Service.run does after the request
+        self.assertTrue(cached.exists())
+        msgs[0]["content"].append({"type": "image", "source": src})      # two images: one file, both in order
+        ids, _, _ = svc.prepare(msgs, None, {}, 16)
+        self.assertEqual(Path(svc.embeddings.path).read_bytes(), cached.read_bytes() * 2)
+        self.assertEqual(v.proc.encodes, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
