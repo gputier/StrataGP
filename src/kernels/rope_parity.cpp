@@ -211,59 +211,69 @@ int main(int argc, char** argv) {
         check(cudaMalloc(&d_npos, nrow_pos.size() * sizeof(int)), "malloc npos");
         check(cudaMemcpy(d_nx, nx.data(), nx.size() * sizeof(float), cudaMemcpyHostToDevice), "copy nx");
         check(cudaMemcpy(d_npos, nrow_pos.data(), nrow_pos.size() * sizeof(int), cudaMemcpyHostToDevice), "copy npos");
-        strata::kernels::native_rope_apply(d_nx, d_nout, 2 * np, nat_dim, nat_rot, base, d_npos, nst);
-        check(cudaStreamSynchronize(nst), "native rope");
-        std::vector<float> nout(nx.size());
-        check(cudaMemcpy(nout.data(), d_nout, nout.size() * sizeof(float), cudaMemcpyDeviceToHost), "back nout");
-        // in place (x == out), which is how every engine caller uses it, must give the same bits
-        check(cudaMemcpy(d_nout, nx.data(), nx.size() * sizeof(float), cudaMemcpyHostToDevice), "copy inplace");
-        strata::kernels::native_rope_apply(d_nout, d_nout, 2 * np, nat_dim, nat_rot, base, d_npos, nst);
-        check(cudaStreamSynchronize(nst), "native rope in place");
-        std::vector<float> ninp(nx.size());
-        check(cudaMemcpy(ninp.data(), d_nout, ninp.size() * sizeof(float), cudaMemcpyDeviceToHost), "back inplace");
-        const bool inplace_same = std::memcmp(ninp.data(), nout.data(), nout.size() * sizeof(float)) == 0;
+        // Twice: the default (llama.cpp's f32 fast-math angle, the error model above) and the opt-in float64 angle
+        // (STRATA_ROPE_F64, the A/B of #3), which must be exact to the f32 rounding of cos/sin: 1e-6 rad.
+        for (const bool f64 : {false, true}) {
+            strata::kernels::native_rope_set_f64_angle(f64);
+            strata::kernels::native_rope_apply(d_nx, d_nout, 2 * np, nat_dim, nat_rot, base, d_npos, nst);
+            check(cudaStreamSynchronize(nst), "native rope");
+            std::vector<float> nout(nx.size());
+            check(cudaMemcpy(nout.data(), d_nout, nout.size() * sizeof(float), cudaMemcpyDeviceToHost), "back nout");
+            // in place (x == out), which is how every engine caller uses it, must give the same bits
+            check(cudaMemcpy(d_nout, nx.data(), nx.size() * sizeof(float), cudaMemcpyHostToDevice), "copy inplace");
+            strata::kernels::native_rope_apply(d_nout, d_nout, 2 * np, nat_dim, nat_rot, base, d_npos, nst);
+            check(cudaStreamSynchronize(nst), "native rope in place");
+            std::vector<float> ninp(nx.size());
+            check(cudaMemcpy(ninp.data(), d_nout, ninp.size() * sizeof(float), cudaMemcpyDeviceToHost),
+                  "back inplace");
+            const bool inplace_same = std::memcmp(ninp.data(), nout.data(), nout.size() * sizeof(float)) == 0;
 
-        const double two_pi = 2.0 * 3.14159265358979323846;
-        long long nat_bad = 0, tail_bad = 0;
-        std::printf("\n  native RoPE (fast-math, pinned llama.cpp) vs float64, base %.0e:\n", (double) base);
-        std::printf("    %8s  %12s %5s  %12s  %12s  %10s\n", "position", "max phase", "pair", "tolerance",
-                    "values rel", "|c,s|-1");
-        for (int r = 0; r < np; ++r) {
-            const int pos = npos[(size_t) r];
-            const float* o = &nout[(size_t) r * nat_dim];
-            double worst = 0.0, worst_norm = 0.0;
-            int worst_pair = 0;
-            for (int i = 0; i < nat_half; ++i) {
-                const double th = (double) pos * std::pow((double) base, -2.0 * (double) i / (double) nat_rot);
-                const double got = std::atan2((double) o[nat_half + i], (double) o[i]);
-                const double err = std::fabs(std::remainder(got - th, two_pi));
-                if (!(err <= worst)) { worst = err; worst_pair = i; }
-                const double nrm = std::fabs(std::hypot((double) o[i], (double) o[nat_half + i]) - 1.0);
-                worst_norm = std::max(worst_norm, nrm);
+            const double two_pi = 2.0 * 3.14159265358979323846;
+            long long nat_bad = 0, tail_bad = 0;
+            std::printf("\n  native RoPE (%s) vs float64, base %.0e:\n",
+                        f64 ? "STRATA_ROPE_F64: the float64 angle" : "fast-math, pinned llama.cpp", (double) base);
+            std::printf("    %8s  %12s %5s  %12s  %12s  %10s\n", "position", "max phase", "pair", "tolerance",
+                        "values rel", "|c,s|-1");
+            for (int r = 0; r < np; ++r) {
+                const int pos = npos[(size_t) r];
+                const float* o = &nout[(size_t) r * nat_dim];
+                double worst = 0.0, worst_norm = 0.0;
+                int worst_pair = 0;
+                for (int i = 0; i < nat_half; ++i) {
+                    const double th = (double) pos * std::pow((double) base, -2.0 * (double) i / (double) nat_rot);
+                    const double got = std::atan2((double) o[nat_half + i], (double) o[i]);
+                    const double err = std::fabs(std::remainder(got - th, two_pi));
+                    if (!(err <= worst)) { worst = err; worst_pair = i; }
+                    const double nrm = std::fabs(std::hypot((double) o[i], (double) o[nat_half + i]) - 1.0);
+                    worst_norm = std::max(worst_norm, nrm);
+                }
+                for (int d = nat_rot; d < nat_dim; ++d) tail_bad += o[d] != (float) d;
+                // the random rows: every rotated value against the float64 rotation, over the row's largest input
+                const float* xr = &nx[(size_t) (np + r) * nat_dim];
+                const float* orow = &nout[(size_t) (np + r) * nat_dim];
+                double m = 1e-30, vworst = 0.0;
+                for (int d = 0; d < nat_dim; ++d) m = std::max(m, (double) std::fabs(xr[d]));
+                for (int i = 0; i < nat_half; ++i) {
+                    const double th = (double) pos * std::pow((double) base, -2.0 * (double) i / (double) nat_rot);
+                    const double c = std::cos(th), s = std::sin(th), a = xr[i], b = xr[nat_half + i];
+                    vworst = std::max(vworst, std::fabs(a * c - b * s - (double) orow[i]) / m);
+                    vworst = std::max(vworst, std::fabs(a * s + b * c - (double) orow[nat_half + i]) / m);
+                }
+                for (int d = nat_rot; d < nat_dim; ++d) tail_bad += orow[d] != xr[d];
+                const double tol = f64 ? 1e-6 : 1e-4 + 1e-6 * (double) pos;
+                // |value error| <= |(a, b)| * |phase error| + the sine's own amplitude error, and |(a, b)| <= sqrt(2) m
+                const double amp = f64 ? 1e-6 : 1e-5;
+                const bool ok = worst <= tol && vworst <= 1.5 * tol + amp && worst_norm <= amp;
+                std::printf("    %8d  %12.3e %5d  %12.3e  %12.3e  %10.1e  %s\n", pos, worst, worst_pair, tol, vworst,
+                            worst_norm, ok ? "ok" : "*** OVER ***");
+                if (!ok) ++nat_bad;
             }
-            for (int d = nat_rot; d < nat_dim; ++d) tail_bad += o[d] != (float) d;
-            // the random rows: every rotated value against the float64 rotation, over the row's largest input
-            const float* xr = &nx[(size_t) (np + r) * nat_dim];
-            const float* orow = &nout[(size_t) (np + r) * nat_dim];
-            double m = 1e-30, vworst = 0.0;
-            for (int d = 0; d < nat_dim; ++d) m = std::max(m, (double) std::fabs(xr[d]));
-            for (int i = 0; i < nat_half; ++i) {
-                const double th = (double) pos * std::pow((double) base, -2.0 * (double) i / (double) nat_rot);
-                const double c = std::cos(th), s = std::sin(th), a = xr[i], b = xr[nat_half + i];
-                vworst = std::max(vworst, std::fabs(a * c - b * s - (double) orow[i]) / m);
-                vworst = std::max(vworst, std::fabs(a * s + b * c - (double) orow[nat_half + i]) / m);
-            }
-            for (int d = nat_rot; d < nat_dim; ++d) tail_bad += orow[d] != xr[d];
-            const double tol = 1e-4 + 1e-6 * (double) pos;
-            // |value error| <= |(a, b)| * |phase error| + the sine's own amplitude error, and |(a, b)| <= sqrt(2) m
-            const bool ok = worst <= tol && vworst <= 1.5 * tol + 1e-5 && worst_norm <= 1e-5;
-            std::printf("    %8d  %12.3e %5d  %12.3e  %12.3e  %10.1e  %s\n", pos, worst, worst_pair, tol, vworst,
-                        worst_norm, ok ? "ok" : "*** OVER ***");
-            if (!ok) ++nat_bad;
+            std::printf("  native RoPE%s: %lld positions over tolerance, %lld pass-through values changed, "
+                        "in place %s\n", f64 ? " (float64 angle)" : "", nat_bad, tail_bad,
+                        inplace_same ? "bit-identical" : "*** DIFFERS ***");
+            bad += (int) nat_bad + (tail_bad ? 1 : 0) + (inplace_same ? 0 : 1);
         }
-        std::printf("  native RoPE: %lld positions over tolerance, %lld pass-through values changed, in place %s\n",
-                    nat_bad, tail_bad, inplace_same ? "bit-identical" : "*** DIFFERS ***");
-        bad += (int) nat_bad + (tail_bad ? 1 : 0) + (inplace_same ? 0 : 1);
+        strata::kernels::native_rope_set_f64_angle(false);
         cudaFree(d_nx); cudaFree(d_nout); cudaFree(d_npos);
         check(cudaStreamDestroy(nst), "native stream destroy");
     }
