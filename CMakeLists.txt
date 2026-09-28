@@ -328,7 +328,8 @@ if(STRATA_ENABLE_CUDA)
 
   add_executable(quantize_act_parity src/kernels/quantize_act_parity.cpp)
   target_include_directories(quantize_act_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-  target_link_libraries(quantize_act_parity PRIVATE strata_kernels CUDA::cudart)
+  # strata_kernels_cpu: the scaled Q8_0 quantizer is checked against the CPU's own act_quant_q8_1 (issue #8)
+  target_link_libraries(quantize_act_parity PRIVATE strata_kernels strata_kernels_cpu CUDA::cudart)
   add_test(NAME quantize_act_parity COMMAND quantize_act_parity --selftest)
 
   add_executable(router_top10_parity src/kernels/router_top10_parity.cpp)
