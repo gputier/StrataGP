@@ -1031,6 +1031,10 @@ int main(int argc, char** argv) {
     // O6 (#21): the fp16 indexer keys change which cells are selected, so they are opt-in (flag or environment)
     if (const char* e = std::getenv("STRATA_IDX_FP16"); e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0)
         o.idx_fp16 = true;
+    if (o.idx_fp16 && o.no_fast_select) {   // the legacy decode selection scores only from the fp32 keys
+        std::fprintf(stderr, "strata: --idx-fp16 ignored with --no-fast-select (the legacy selection reads fp32 keys)\n");
+        o.idx_fp16 = false;
+    }
     strata::core::qsa_set_idx_fp16(o.idx_fp16);
     if (o.idx_fp16) std::fprintf(stderr, "strata: QSA block selection scored from fp16 indexer keys (--idx-fp16)\n");
     // Prompt lookup (the suffix drafter, on by default): the MTP keeps its --spec windows and a lookup window may be
