@@ -509,6 +509,12 @@ void routing_commit(Drive& t, int n_keep) {
     std::fill(t.win_n.begin(), t.win_n.end(), 0);
 }
 
+/// Drops the held window unwritten: for the `ver.run` callers that never commit (serve's prompt windows and its
+/// spec loop), so their ids neither pile up nor reach the next `routing_commit` as another window's.
+void routing_drop(Drive& t) {
+    std::fill(t.win_n.begin(), t.win_n.end(), 0);
+}
+
 void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd, int64_t k,
                 float* out) {
     Drive* t = (Drive*) user;
@@ -692,6 +698,8 @@ struct ConvStateSizes {
     size_t gdn = 0, ple = 0, tail = 0;
 };
 
+/// `gdn` is the DEVICE size of `gdn_state` (every layer's full FP32 slice), which is what the state hash walks; a
+/// checkpoint's GDN bytes are `gdn_runs` below, smaller with `--gdn-state-bf16`.
 ConvStateSizes conv_state_sizes(const strata::core::ModelGeometry& g) {
     ConvStateSizes z;
     z.gdn = (size_t) g.n_gdn_layers() *
@@ -3112,6 +3120,7 @@ int main(int argc, char** argv) {
                     drive.d.layers = 0;
                     drive.d.experts = 0;
                     drive.d.failed = false;
+                    routing_drop(drive);
                     if (!ver.run(T, win.data(), q, &drive_pool_multi, &drive, outw.data(), e) || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
@@ -3313,6 +3322,7 @@ int main(int argc, char** argv) {
                                cudaMemcpyHostToDevice);
                 }
                 tr("window", p, T);
+                routing_drop(drive);
                 if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
@@ -3989,6 +3999,7 @@ int main(int argc, char** argv) {
             drive.d.experts = 0;
             drive.d.failed = false;
             apply_pending(false);
+            routing_drop(drive);   // nothing held but this window's ids reaches the commit below
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;

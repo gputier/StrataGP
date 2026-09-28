@@ -108,6 +108,9 @@ pool les reçoit, et une fois l'acceptation connue, **seuls les tokens validés*
 positions : exactement les enregistrements du chemin « token », avec des poids à 0 (la fenêtre ne les publie pas au
 pool ; l'outil compte alors chaque expert pareil). Le format ne change pas (`tools/make_profile.py` le lit toujours).
 Le prompt n'est tracé que s'il passe par le chemin « token » (pas de `--prefill`).
+Les fenêtres qui ne sont jamais validées (fenêtres du prompt et boucle `--spec` du mode serveur) sont jetées avant
+chaque `ver.run` : elles ne s'accumulent pas et n'atteignent jamais l'écriture d'une autre fenêtre. En mode serveur la
+trace ne contient donc que le chemin « token ».
 
 **L'outil** `tools/routing_locality.py TRACE…` (numpy) mesure, sur la partie de chaque trace qui suit celle qui
 apprend les tables (`--train-frac`, 0,5 par défaut) :
