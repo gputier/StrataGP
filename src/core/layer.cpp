@@ -902,9 +902,18 @@ int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
     // KV streaming: every block the selection names is made resident before anything reads it
     qsa_kv_resolve(st, g, b.ids, st.step, 1, cap, stream);
     if (st.kv_q4) strata::kernels::fwht256_inplace_cuda(b.qcur, g.n_head, stream);   // <Hq, Hk> = <q, k>
+    bool gated = false;   // O6c: the merge applied the gate below itself (opt-in, not with Q4_0's rotation)
     if (g_fast_attn && !native_flash_attn_short && dump == nullptr) {
         const strata::kernels::QsaAttnPools pools = qsa_attn_pools(st);
-        strata::kernels::qsa_decode_attn_step(b.qcur, pools, b.ids, st.step, cap, s, b.attn_scratch, b.attn, stream);
+        strata::kernels::QsaAttnGate gate;
+        if (strata::kernels::qsa_decode_attn_gate_fold() && !st.kv_q4) {
+            gate.kind = native_qsa_enabled() ? strata::kernels::kQsaGateNativeF32 : strata::kernels::kQsaGateF64;
+            gate.q_full = b.q_full;
+            gate.out = b.attn32;
+            gated = true;
+        }
+        strata::kernels::qsa_decode_attn_step(b.qcur, pools, b.ids, st.step, cap, s, b.attn_scratch, b.attn, stream,
+                                              gate);
     } else {
     if (st.kv_q4) strata::kernels::kv_gather_q4_step(st.k_q4, st.v_q4, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch, stream);
     else if (st.kv_int8) kv_gather_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, b.ids, st.step, cap, s,                                 b.k_scratch, b.v_scratch, stream);    else kv_gather_step(st.k_pool, st.v_pool, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch,                   stream);    if (native_flash_attn_short) {
@@ -928,7 +937,8 @@ int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
 // sigmoid/multiply arithmetic and uses Q8_1 for the native quantized projection.
 // The canonical fallback retains its prior FP64 gate and Q8_K projection.
 try {
-    if (native_qsa_enabled()) native_qsa_gate_apply(b.attn, b.q_full, b.attn32, (int) g.n_head, (int) g.head_dim, stream);
+    if (gated) {}   // already in b.attn32 (qsa_decode_attn.hpp, QsaAttnGate)
+    else if (native_qsa_enabled()) native_qsa_gate_apply(b.attn, b.q_full, b.attn32, (int) g.n_head, (int) g.head_dim, stream);
     else qsa_gate_apply_f32(b.attn, b.q_full, s, b.attn32, stream);
 } catch (const std::exception& error) { err = v.name("qsa_gate") + ": " + error.what(); return false; }
     if (!w_attno->native_data) quantize_q8_K(b.attn32, b.attn_q8k, g.n_head * g.head_dim, stream);    if (w_attno->native_data) {

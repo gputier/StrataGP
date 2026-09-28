@@ -49,12 +49,29 @@ void qsa_decode_attn_set_variant(int variant);
 /// Scratch floats for `cap` selected cells: partial accumulators, maxima and sums.
 uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s);
 
+/// O6c (#23): the layer's output gate applied by the merge itself, one launch less per QSA layer.  `out` [n_q,
+/// n_head, 256] receives exactly what the gate kernel would write from `attn` (which is still written):
+///   kQsaGateF64        `qsa_gate_apply_f32` (qsa.hpp), the default engine's gate
+///   kQsaGateNativeF32  `native_qsa_gate_apply` (native_qsa.hpp), with its fast-math instructions reproduced
+/// q_full [n_q, n_head, 2 * 256] is the raw `attn_q` projection (the gate is each head's second half).  Not for Q4_0
+/// KV, whose output is rotated back between the attention and the gate.  Opt-in: STRATA_QSA_MERGE_GATE=1
+/// (`qsa_decode_attn_gate_fold`), until `qsa_decode_attn_parity` has confirmed on the device that it is bitwise.
+enum QsaGateFold : int { kQsaGateNone = 0, kQsaGateF64 = 1, kQsaGateNativeF32 = 2 };
+struct QsaAttnGate {
+    int kind = kQsaGateNone;
+    const float* q_full = nullptr;
+    float* out = nullptr;
+};
+bool qsa_decode_attn_gate_fold();
+
 void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* step,
-                          int64_t cap, const QsaShapes& s, float* scratch, float* attn, void* stream);
+                          int64_t cap, const QsaShapes& s, float* scratch, float* attn, void* stream,
+                          const QsaAttnGate& gate = QsaAttnGate{});
 
 /// Plan v0.3 P5: `n_q` queries at once, each with its own selection: q [n_q, n_head, 256], ids [n_q, cap], steps
 /// [n_q, kStepCount], attn [n_q, n_head, 256]; scratch is `n_q` times the single-query size.
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
-                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
+                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream,
+                           const QsaAttnGate& gate = QsaAttnGate{});
 
 }  // namespace strata::kernels

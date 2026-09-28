@@ -491,10 +491,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // KV streaming: the n selections' blocks resident (device-side, inside the graph)
                 qsa_kv_resolve(st, *g_, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, n, cap_, cs);
                 const QsaAttnPools pools = qsa_attn_pools(st);
+                QsaAttnGate gate;   // O6c: the gate folded into the merge (opt-in, not with Q4_0's rotation)
+                if (qsa_decode_attn_gate_fold() && !st.kv_q4) {
+                    gate.kind = native_qsa_enabled() ? kQsaGateNativeF32 : kQsaGateF64;
+                    gate.q_full = qfull_ + tb * NH * 2 * HD;
+                    gate.out = attn32_ + tb * NH * HD;
+                }
                 qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_,
-                                      s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
+                                      s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs,
+                                      gate);
                 if (st.kv_q4) fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t) n * NH, cs);   // back: H^-1 = H
-                for (int t = tb; t < te; ++t) {
+                for (int t = tb; t < te && gate.kind == kQsaGateNone; ++t) {
                     if (native_qsa_enabled())
                         native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD,
                                               (int) NH, (int) HD, cs);

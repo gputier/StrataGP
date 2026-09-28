@@ -356,17 +356,10 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_pf_kernel(const float* __r
     for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
 }
 
-__global__ void __launch_bounds__(HD) attn_merge_kernel(const float* __restrict__ part_acc,
-                                                        const float* __restrict__ part_m,
-                                                        const float* __restrict__ part_l, int n_chunks,
-                                                        float* __restrict__ attn, long long scratch_stride = 0) {
-    part_acc += (size_t) blockIdx.y * (size_t) scratch_stride;
-    part_m += (size_t) blockIdx.y * (size_t) scratch_stride;
-    part_l += (size_t) blockIdx.y * (size_t) scratch_stride;
-    attn += (size_t) blockIdx.y * (size_t) gridDim.x * HD;
-    const int h = blockIdx.x;                 // global query head
+// Query head h, dimension d: the chunks combined with the usual log-sum-exp rescale.
+__device__ __forceinline__ float merge_one(const float* __restrict__ part_acc, const float* __restrict__ part_m,
+                                           const float* __restrict__ part_l, int n_chunks, int h, int d) {
     const int kvh = h / G, hl = h % G;
-    const int d = threadIdx.x;
     float M = -FLT_MAX;
     for (int c = 0; c < n_chunks; ++c) M = fmaxf(M, part_m[(kvh * n_chunks + c) * G + hl]);
     float L = 0.0f, acc = 0.0f;
@@ -378,7 +371,67 @@ __global__ void __launch_bounds__(HD) attn_merge_kernel(const float* __restrict_
         L = fmaf(part_l[slot * G + hl], w, L);
         acc = fmaf(part_acc[((size_t) slot * G + hl) * HD + d], w, acc);
     }
-    attn[(size_t) h * HD + d] = L > 0.0f ? acc / L : 0.0f;
+    return L > 0.0f ? acc / L : 0.0f;
+}
+
+__global__ void __launch_bounds__(HD) attn_merge_kernel(const float* __restrict__ part_acc,
+                                                        const float* __restrict__ part_m,
+                                                        const float* __restrict__ part_l, int n_chunks,
+                                                        float* __restrict__ attn, long long scratch_stride = 0) {
+    part_acc += (size_t) blockIdx.y * (size_t) scratch_stride;
+    part_m += (size_t) blockIdx.y * (size_t) scratch_stride;
+    part_l += (size_t) blockIdx.y * (size_t) scratch_stride;
+    attn += (size_t) blockIdx.y * (size_t) gridDim.x * HD;
+    const int h = blockIdx.x;                 // global query head
+    const int d = threadIdx.x;
+    attn[(size_t) h * HD + d] = merge_one(part_acc, part_m, part_l, n_chunks, h, d);
+}
+
+// ---- O6c: the output gate folded into the merge (opt-in, STRATA_QSA_MERGE_GATE=1): one launch less per QSA layer.
+//
+// The gate is the layer's own formula on the same float the merge would have stored, so the gated output is the one
+// the separate gate kernel writes - IF the formula compiles to the same instructions.  kQsaGateF64 is
+// `qsa_gate_apply_f32_kernel`'s source in a TU built with the same flags (neither is fast-math).  kQsaGateNativeF32
+// is `native_qsa_gate_apply`, whose TU IS fast-math: its `1 / (1 + expf(-x))` is written out as the PTX that TU
+// emits for it (mul by -log2(e), ex2.approx, add, rcp.approx, mul, all .ftz), with explicit `.rn` so that nothing
+// is fused.  `qsa_decode_attn_parity` compares both with the separate kernels, bitwise.
+__device__ __forceinline__ float gate_f64(float a, float raw) {
+    const double g = (double) raw;
+    const double sig = 1.0 / (1.0 + exp(-g));
+    return (float) ((double) a * sig);
+}
+__device__ __forceinline__ float gate_native_f32(float a, float raw) {
+    float out;
+    asm("{\n\t.reg .f32 t0, t1, t2, t3;\n\t"
+        "mul.rn.ftz.f32 t0, %1, 0fBFB8AA3B;\n\t"
+        "ex2.approx.ftz.f32 t1, t0;\n\t"
+        "add.rn.ftz.f32 t2, t1, 0f3F800000;\n\t"
+        "rcp.approx.ftz.f32 t3, t2;\n\t"
+        "mul.rn.ftz.f32 %0, %2, t3;\n\t}"
+        : "=f"(out)
+        : "f"(raw), "f"(a));
+    return out;
+}
+
+template <int GATE>
+__global__ void __launch_bounds__(HD) attn_merge_gate_kernel(const float* __restrict__ part_acc,
+                                                             const float* __restrict__ part_m,
+                                                             const float* __restrict__ part_l, int n_chunks,
+                                                             float* __restrict__ attn, long long scratch_stride,
+                                                             const float* __restrict__ q_full,
+                                                             float* __restrict__ gated) {
+    part_acc += (size_t) blockIdx.y * (size_t) scratch_stride;
+    part_m += (size_t) blockIdx.y * (size_t) scratch_stride;
+    part_l += (size_t) blockIdx.y * (size_t) scratch_stride;
+    attn += (size_t) blockIdx.y * (size_t) gridDim.x * HD;
+    gated += (size_t) blockIdx.y * (size_t) gridDim.x * HD;
+    q_full += (size_t) blockIdx.y * (size_t) gridDim.x * 2 * HD;
+    const int h = blockIdx.x;                 // global query head
+    const int d = threadIdx.x;
+    const float a = merge_one(part_acc, part_m, part_l, n_chunks, h, d);
+    attn[(size_t) h * HD + d] = a;            // still written: a reader of the ungated output sees the same thing
+    const float raw = q_full[(size_t) h * 2 * HD + HD + d];   // the gate: the SECOND half of the head's block
+    gated[(size_t) h * HD + d] = GATE == kQsaGateF64 ? gate_f64(a, raw) : gate_native_f32(a, raw);
 }
 
 }  // namespace
@@ -406,7 +459,7 @@ bool prefetch_aligned(const QsaAttnPools& p, int kv_mode) {
 
 // Both entry points: `n_q` queries (the single-query form is n_q = 1, whose offsets are all zero).
 void launch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
-            const QsaShapes& s, float* scratch, float* attn, int64_t n_q, cudaStream_t st) {
+            const QsaShapes& s, float* scratch, float* attn, int64_t n_q, cudaStream_t st, const QsaAttnGate& gate) {
     const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr ? 1 : 0);
     int variant = qsa_decode_attn_variant();
     if (variant != kQsaAttnOld && !prefetch_aligned(pools, kv_mode)) variant = kQsaAttnOld;
@@ -435,11 +488,31 @@ void launch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const
         else attn_chunk_pf_kernel<0, 32><<<grid, THREADS, 0, st>>>(STRATA_QSA_CHUNK_ARGS);
     }
 #undef STRATA_QSA_CHUNK_ARGS
-    attn_merge_kernel<<<dim3((unsigned) s.n_head, (unsigned) n_q), HD, 0, st>>>(part_acc, part_m, part_l, n_chunks,
-                                                                                  attn, stride);
+    const dim3 mgrid((unsigned) s.n_head, (unsigned) n_q);
+    if (gate.kind == kQsaGateF64)
+        attn_merge_gate_kernel<kQsaGateF64><<<mgrid, HD, 0, st>>>(part_acc, part_m, part_l, n_chunks, attn, stride,
+                                                                  gate.q_full, gate.out);
+    else if (gate.kind == kQsaGateNativeF32)
+        attn_merge_gate_kernel<kQsaGateNativeF32><<<mgrid, HD, 0, st>>>(part_acc, part_m, part_l, n_chunks, attn,
+                                                                        stride, gate.q_full, gate.out);
+    else
+        attn_merge_kernel<<<mgrid, HD, 0, st>>>(part_acc, part_m, part_l, n_chunks, attn, stride);
+}
+
+void check_gate(const QsaAttnGate& gate, const char* who) {
+    if (gate.kind == kQsaGateNone) return;
+    if ((gate.kind != kQsaGateF64 && gate.kind != kQsaGateNativeF32) || gate.q_full == nullptr || gate.out == nullptr) {
+        std::fprintf(stderr, "%s: a folded gate needs its kind, q_full and out\n", who);
+        std::exit(1);
+    }
 }
 
 }  // namespace
+
+bool qsa_decode_attn_gate_fold() {
+    static const bool on = env_on("STRATA_QSA_MERGE_GATE");
+    return on;
+}
 
 int qsa_decode_attn_variant() {
     int v = g_variant.load(std::memory_order_relaxed);
@@ -461,14 +534,16 @@ void qsa_decode_attn_set_variant(int variant) {
 }
 
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
-                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
+                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream,
+                           const QsaAttnGate& gate) {
     if (n_q <= 0) return;
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps ||
         !pools.page_table || n_q > 65535) {
         std::fprintf(stderr, "qsa_decode_attn_batch: unsupported geometry or missing buffers\n");
         std::exit(1);
     }
-    launch(q, pools, ids, steps, cap, s, scratch, attn, n_q, (cudaStream_t) stream);
+    check_gate(gate, "qsa_decode_attn_batch");
+    launch(q, pools, ids, steps, cap, s, scratch, attn, n_q, (cudaStream_t) stream, gate);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa_decode_attn_batch: %s\n", cudaGetErrorString(e));
@@ -483,7 +558,8 @@ uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s) {
 }
 
 void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* step,
-                          int64_t cap, const QsaShapes& s, float* scratch, float* attn, void* stream) {
+                          int64_t cap, const QsaShapes& s, float* scratch, float* attn, void* stream,
+                          const QsaAttnGate& gate) {
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !step ||
         !pools.page_table) {
         std::fprintf(stderr, "qsa_decode_attn: unsupported geometry or missing buffers\n");
@@ -494,7 +570,8 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
         std::fprintf(stderr, "qsa_decode_attn: incomplete KV pools\n");
         std::exit(1);
     }
-    launch(q, pools, ids, step, cap, s, scratch, attn, 1, (cudaStream_t) stream);
+    check_gate(gate, "qsa_decode_attn");
+    launch(q, pools, ids, step, cap, s, scratch, attn, 1, (cudaStream_t) stream, gate);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa_decode_attn: %s\n", cudaGetErrorString(e));
