@@ -17,8 +17,10 @@
 //      row ranges and the per-expert parts), for every batch size up to the largest.
 //
 //   pool_test --synthetic      the same checks on random expert blobs (no pack needed; a ctest)
-//   pool_test --bench [layers] run_split per token, flat vs per-expert cut (and, on Linux, with transparent huge
-//                              pages), from an arena of `layers` x 10 random experts (default 64: 885 MB)
+//   pool_test --bench [layers] [--workers N]
+//                              run_split per token: flat vs per-expert cut, with software prefetch and, on Linux,
+//                              with transparent huge pages; an arena of `layers` x 10 random experts (default 64:
+//                              885 MB); N pool workers besides the host (default: the engine's, cores - 1)
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 
@@ -91,11 +93,11 @@ void unmap_arena(uint8_t* p, size_t bytes) {
 }
 
 // #27: run_split for one token (48 layers of n experts drawn at random from an arena of `layers` x 10, as the
-// router does), flat cut against the per-expert parts, interleaved and best of 15 so a contended machine shows up
-// as noise and not as a difference.  Each timed token takes the NEXT experts of the arena, so no arm finds the
-// previous one's experts in the L3.  On Linux the flat cut is timed again on a second arena with transparent huge
-// pages (#28).
-int bench_split(int layers) {
+// router does), flat cut against the per-expert parts, interleaved and best of `reps` so a contended machine shows
+// up as noise and not as a difference.  Each timed token takes the NEXT experts of the arena, so no arm finds the
+// previous one's experts in the L3.  The flat cut is timed again with the kernels' software prefetch (#29) and, on
+// Linux, on a second arena with transparent huge pages (#28).
+int bench_split(int layers, int reps, int workers) {
     std::mt19937 rng(27);
     const int K = 10;
     const size_t bytes = (size_t) layers * K * cpu::BLOB;
@@ -129,34 +131,42 @@ int bench_split(int layers) {
             jobs[a][(size_t) e].out = out.data() + (size_t) (e % K) * cpu::H;
         }
     }
-    cpu::ExpertPool pool;
+    cpu::ExpertPool pool(workers);
     std::printf("run_split bench: 48 layers per token from an arena of %d x %d experts (%.0f MB), %d workers + host, "
-                "best of 15 tokens\n", layers, K, (double) bytes / 1e6, pool.workers());
-    const int total = layers * K, narms = 1 + arenas;
+                "best of %d tokens; gain against the first arm\n", layers, K, (double) bytes / 1e6, pool.workers(), reps);
+    // the arms: the cut (#27), the arena's pages (#28), the kernels' software prefetch (#29, scales / codes bytes)
+    struct Arm { const char* name; bool flat; int arena, pf_sc, pf_co; };
+    const Arm all[] = {{"per-expert parts", false, 0, 0, 0},
+                       {"flat", true, 0, 0, 0},
+                       {"flat + prefetch", true, 0, 2048, 1024},
+                       {"flat + THP", true, 1, 0, 0},
+                       {"flat + THP + prefetch", true, 1, 2048, 1024}};
+    std::vector<Arm> arms;
+    for (const Arm& a : all)
+        if (a.arena < arenas) arms.push_back(a);
+    const int total = layers * K, narms = (int) arms.size();
     int cursor[2] = {0, 0};
-    for (int n : {K, 7, 4, 2}) {
-        const int reps = 15;
-        double best[3] = {1e30, 1e30, 1e30};
+    for (int n : {K, 7, 4}) {
+        std::vector<double> best((size_t) narms, 1e30);
         for (int r = 0; r < reps; ++r)
             for (int k = 0; k < narms; ++k) {
-                const int arm = (r + k) % narms, a = arm == 2 ? 1 : 0;
-                pool.set_flat_split(arm >= 1);
+                const int i = (r + k) % narms, a = arms[(size_t) i].arena;
+                pool.set_flat_split(arms[(size_t) i].flat);
+                cpu::expert_set_prefetch(arms[(size_t) i].pf_sc, arms[(size_t) i].pf_co);
                 const double t0 = now_ms();
                 for (int l = 0; l < 48; ++l) {
                     if (cursor[a] + n > total) cursor[a] = 0;
                     pool.run_split(jobs[a].data() + cursor[a], n);
                     cursor[a] += n;
                 }
-                best[arm] = std::fmin(best[arm], now_ms() - t0);
+                best[(size_t) i] = std::fmin(best[(size_t) i], now_ms() - t0);
             }
         const double gb = 48.0 * n * cpu::BLOB / 1e9;
-        std::printf("  %2d experts per layer: per-expert parts %7.2f ms (%5.1f GB/s), flat %7.2f ms (%5.1f GB/s) %+.1f%%",
-                    n, best[0], gb / (best[0] * 1e-3), best[1], gb / (best[1] * 1e-3), 100.0 * (best[0] / best[1] - 1.0));
-        if (arenas == 2)
-            std::printf(", flat + THP %7.2f ms (%5.1f GB/s) %+.1f%%", best[2], gb / (best[2] * 1e-3),
-                        100.0 * (best[1] / best[2] - 1.0));
-        std::printf("\n");
+        for (int i = 0; i < narms; ++i)
+            std::printf("  %2d experts per layer  %-24s %7.2f ms  %5.1f GB/s  %+6.1f%%\n", n, arms[(size_t) i].name,
+                        best[(size_t) i], gb / (best[(size_t) i] * 1e-3), 100.0 * (best[0] / best[(size_t) i] - 1.0));
     }
+    cpu::expert_set_prefetch(0, 0);
     for (int a = 0; a < arenas; ++a) unmap_arena(arena[a], bytes);
     return 0;
 }
@@ -165,7 +175,7 @@ int bench_split(int layers) {
 
 int main(int argc, char** argv) {
     bool selftest = false, synthetic = false, bench = false;
-    int bench_layers = 64;
+    int bench_layers = 64, bench_workers = 0;
     const char* path = "pack/full/experts.bin";
     long long layer = 0;
     for (int i = 1; i < argc; ++i) {
@@ -176,10 +186,12 @@ int main(int argc, char** argv) {
             bench = true;
             if (i + 1 < argc && argv[i + 1][0] != '-') bench_layers = std::atoi(argv[++i]);
         }
+        else if (a == "--workers" && i + 1 < argc) bench_workers = std::atoi(argv[++i]);
         else if (a == "--file" && i + 1 < argc) path = argv[++i];
         else if (a == "--layer" && i + 1 < argc) layer = std::atoll(argv[++i]);
         else {
-            std::fprintf(stderr, "usage: pool_test [--selftest] [--synthetic] [--bench [layers]] [--file P] [--layer N]\n");
+            std::fprintf(stderr, "usage: pool_test [--selftest] [--synthetic] [--bench [layers] [--workers N]] [--file P] "
+                                 "[--layer N]\n");
             return 2;
         }
     }
@@ -192,7 +204,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    if (bench) return bench_split(bench_layers > 0 ? bench_layers : 64);
+    if (bench) return bench_split(bench_layers > 0 ? bench_layers : 64, 15, bench_workers);
 
     int bad = 0;
 

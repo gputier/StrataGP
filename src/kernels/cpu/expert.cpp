@@ -23,6 +23,35 @@ namespace {
 
 std::atomic<bool> oracle_q8_0{false};
 
+// O8c (#29).  (a) Software prefetch of the scale stream, this many bytes ahead of the row being computed (0 = off,
+// STRATA_CPU_PREFETCH=<bytes>); and of the code stream (STRATA_CPU_PREFETCH_CODES=<bytes>).  Neither changes a bit.
+// (b) The down rows' Q2_0 offset removed in integer (STRATA_CPU_INT_CORR=1): changes the last bits, so opt-in.
+int env_int(const char* name, int dflt) {
+    const char* e = std::getenv(name);
+    return e != nullptr && e[0] != 0 ? std::atoi(e) : dflt;
+}
+std::atomic<int> pf_scales{env_int("STRATA_CPU_PREFETCH", 0)};
+std::atomic<int> pf_codes{env_int("STRATA_CPU_PREFETCH_CODES", 0)};
+std::atomic<bool> int_corr{env_int("STRATA_CPU_INT_CORR", 0) == 1};
+
+// `n` bytes starting `dist` bytes past `p`, one prefetch per 64: over consecutive rows the prefetched addresses then
+// never step by more than a line, so every line of the stream is requested once it is `dist` bytes ahead.
+inline void prefetch_ahead(const uint8_t* p, int n, int dist) {
+    for (int o = 0; o < n; o += 64) _mm_prefetch((const char*) (p + dist + o), _MM_HINT_T0);
+}
+// The two streams of a gate/up row pair (r) and of a down row (r), when a distance is set.
+struct Prefetch {
+    int sc = pf_scales.load(std::memory_order_relaxed), co = pf_codes.load(std::memory_order_relaxed);
+    inline void gu(const uint8_t* blob, int r) const {
+        if (sc > 0) prefetch_ahead(blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2, 2 * SC_GU * 2, sc);
+        if (co > 0) prefetch_ahead(blob + O_GU_CODES + (size_t) (2 * r) * ROW_GU, 2 * ROW_GU, co);
+    }
+    inline void down(const uint8_t* blob, int r) const {
+        if (sc > 0) prefetch_ahead(blob + O_D_SCALES + (size_t) r * SC_D * 2, SC_D * 2, sc);
+        if (co > 0) prefetch_ahead(blob + O_D_CODES + (size_t) r * ROW_D, ROW_D, co);
+    }
+};
+
 /// fp16 -> fp32, written out rather than using `_cvtsh_ss`, because the F16C intrinsic's behaviour on
 /// subnormals is the one place the two can differ and the scales in this artifact are small.
 inline float h2f(const uint8_t* p) {
@@ -191,6 +220,55 @@ inline float row_dot_z(const uint8_t* codes, const uint8_t* scales, const ActQ& 
     return _mm512_reduce_add_ps(acc) - _mm512_reduce_add_ps(corr);
 }
 
+// O8c (b) (#29), opt-in: `row_dot_z` with the Q2_0 offset removed in INTEGER.  vpdpbusd starts from `a.seed[b]`,
+// -sum(xhat) of the block's two chunks in lanes 0 and 8, so each chunk's lanes add up to sum((c - 1) * xhat) exactly
+// and the float correction - its accumulator, one FMA per eight blocks and a second full reduction - is gone.  A
+// down row has only 10 blocks, so that was ~a third of its work.  Rounds differently from `row_dot_z`.
+inline float row_dot_z_ic(const uint8_t* codes, const uint8_t* scales, const ActQ& a, int nblocks) {
+    __m512 acc = _mm512_setzero_ps();
+    const __m512i base = _mm512_setr_epi32(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1);
+    for (int b0 = 0; b0 < nblocks; b0 += 8) {
+        const int nb = nblocks - b0 < 8 ? nblocks - b0 : 8;
+        __m512 p, dd;
+        scales8(scales, a, b0, nb, p, dd);
+        for (int i = 0; i < nb; ++i) {
+            const int b = b0 + i;
+            const __m512i dot = _mm512_dpbusd_epi32(_mm512_load_si512((const void*) a.seed[b]), unpack64_q2_0(codes + b * 16),
+                                                    _mm512_load_si512((const void*) (a.q + b * QK)));
+            const __m512 sv = _mm512_permutexvar_ps(_mm512_add_epi32(base, _mm512_set1_epi32(2 * i)), p);
+            acc = _mm512_fmadd_ps(sv, _mm512_cvtepi32_ps(dot), acc);
+        }
+    }
+    return _mm512_reduce_add_ps(acc);
+}
+
+template<int NT>
+inline void row_dot_multi_z_ic(const uint8_t* codes, const uint8_t* scales, const ActQ* const* a, int nblocks,
+                               float* res) {
+    __m512 acc[NT];
+    for (int t = 0; t < NT; ++t) acc[t] = _mm512_setzero_ps();
+    const __m512i base = _mm512_setr_epi32(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1);
+    for (int b0 = 0; b0 < nblocks; b0 += 8) {
+        const int nb = nblocks - b0 < 8 ? nblocks - b0 : 8;
+        __m512 p[NT];
+        for (int t = 0; t < NT; ++t) {
+            __m512 dd;
+            scales8(scales, *a[t], b0, nb, p[t], dd);
+        }
+        for (int i = 0; i < nb; ++i) {
+            const int b = b0 + i;
+            const __m512i w = unpack64_q2_0(codes + b * 16);
+            const __m512i idx = _mm512_add_epi32(base, _mm512_set1_epi32(2 * i));
+            for (int t = 0; t < NT; ++t) {
+                const __m512i dot = _mm512_dpbusd_epi32(_mm512_load_si512((const void*) a[t]->seed[b]), w,
+                                                        _mm512_load_si512((const void*) (a[t]->q + b * QK)));
+                acc[t] = _mm512_fmadd_ps(_mm512_permutexvar_ps(idx, p[t]), _mm512_cvtepi32_ps(dot), acc[t]);
+            }
+        }
+    }
+    for (int t = 0; t < NT; ++t) res[t] = _mm512_reduce_add_ps(acc[t]);
+}
+
 template<int NT>
 inline void row_dot_multi_z(const uint8_t* codes, const uint8_t* scales, const ActQ* const* a, int nblocks,
                             float* res) {
@@ -272,6 +350,14 @@ inline float row_dot_oracle(const uint8_t* codes, const uint8_t* scales, const A
     return result;
 }
 
+/// A DOWN row (`SC_D` blocks, against the intermediate's activation): `row_dot`, or with `ic` (STRATA_CPU_INT_CORR)
+/// the integer-correction form.  Every down row of every path goes through here, so the single-token and the
+/// multi-token kernels still agree bitwise with each other in either mode.
+inline float row_dot_down(const uint8_t* codes, const uint8_t* scales, const ActQ& a, bool ic) {
+    if (ic && kZmm) return row_dot_z_ic(codes, scales, a, SC_D);
+    return row_dot(codes, scales, a, SC_D);
+}
+
 /// `row_dot` for NT activations at once: the codes of each block are unpacked once, and each token's
 /// accumulator sees exactly the operations `row_dot` would apply to it, in the same order.
 template<int NT>
@@ -300,9 +386,18 @@ inline void row_dot_multi(const uint8_t* codes, const uint8_t* scales, const Act
 }
 
 template<int NT>
+inline void row_dot_multi_down(const uint8_t* codes, const uint8_t* scales, const ActQ* const* a, float* res, bool ic) {
+    if (ic && kZmm) { row_dot_multi_z_ic<NT>(codes, scales, a, SC_D, res); return; }
+    row_dot_multi<NT>(codes, scales, a, SC_D, res);
+}
+
+template<int NT>
 void expert_multi(const uint8_t* blob, const ActQ* const* a1, float* const* out, ExpertScratchMulti& ws) {
     float g[NT], u[NT];
+    const Prefetch pf;
+    const bool ic = int_corr.load(std::memory_order_relaxed);
     for (int r = 0; r < FF; ++r) {
+        pf.gu(blob, r);
         row_dot_multi<NT>(blob + O_GU_CODES + (size_t) (2 * r) * ROW_GU,
                           blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2, a1, SC_GU, g);
         row_dot_multi<NT>(blob + O_GU_CODES + (size_t) (2 * r + 1) * ROW_GU,
@@ -316,8 +411,9 @@ void expert_multi(const uint8_t* blob, const ActQ* const* a1, float* const* out,
     }
     float o[NT];
     for (int r = 0; r < H; ++r) {
-        row_dot_multi<NT>(blob + O_D_CODES + (size_t) r * ROW_D, blob + O_D_SCALES + (size_t) r * SC_D * 2, a2,
-                          SC_D, o);
+        pf.down(blob, r);
+        row_dot_multi_down<NT>(blob + O_D_CODES + (size_t) r * ROW_D, blob + O_D_SCALES + (size_t) r * SC_D * 2, a2,
+                               o, ic);
         for (int t = 0; t < NT; ++t) out[t][r] = o[t];
     }
 }
@@ -416,6 +512,13 @@ void act_quant_q8_1(const float* x, int n, ActQ& a) {
             a.sum[k] = sum;
             a.hx[k] = s * (float) sum;
         }
+        if (int_corr.load(std::memory_order_relaxed)) {
+            // O8c (b): the seeds of the integer correction, -sum of chunk 2b in lane 0 and of chunk 2b+1 in lane 8
+            for (int b = 0; 2 * b + 1 < a.nchunks && b < SC_D; ++b)
+                _mm512_store_si512((void*) a.seed[b],
+                                   _mm512_mask_set1_epi32(_mm512_maskz_set1_epi32((__mmask16) 0x0001, -a.sum[2 * b]),
+                                                          (__mmask16) 0x0100, -a.sum[2 * b + 1]));
+        }
         return;
     }
     for (int k = 0; k < a.nchunks; ++k) {
@@ -454,6 +557,14 @@ void expert_set_oracle_q8_0(bool enabled) {
     oracle_q8_0.store(enabled, std::memory_order_relaxed);
 }
 
+void expert_set_prefetch(int scales_bytes, int codes_bytes) {
+    pf_scales.store(scales_bytes, std::memory_order_relaxed);
+    pf_codes.store(codes_bytes, std::memory_order_relaxed);
+}
+
+void expert_set_int_corr(bool enabled) { int_corr.store(enabled, std::memory_order_relaxed); }
+bool expert_int_corr_enabled() { return int_corr.load(std::memory_order_relaxed); }
+
 void s2_expert_vnni(const uint8_t* blob, const float* x, float* out, ExpertScratch& ws) {
     act_quant_q8_1(x, H, ws.a1);
     s2_expert_vnni_q(blob, ws.a1, out, ws);
@@ -464,7 +575,9 @@ void s2_expert_vnni_q(const uint8_t* blob, const ActQ& a1, float* out, ExpertScr
         expert_oracle_q8_0(blob, a1, out, ws);
         return;
     }
+    const Prefetch pf;
     for (int r = 0; r < FF; ++r) {
+        pf.gu(blob, r);
         const float g = row_dot(blob + O_GU_CODES + (size_t) (2 * r) * ROW_GU,
                                 blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2, a1, SC_GU);
         const float u = row_dot(blob + O_GU_CODES + (size_t) (2 * r + 1) * ROW_GU,
@@ -474,15 +587,19 @@ void s2_expert_vnni_q(const uint8_t* blob, const ActQ& a1, float* out, ExpertScr
         ws.ff[r] = (g / (1.f + std::exp(-g))) * u;
     }
     act_quant_q8_1(ws.ff, FF, ws.a2);
-    for (int r = 0; r < H; ++r)
-        out[r] = row_dot(blob + O_D_CODES + (size_t) r * ROW_D,
-                         blob + O_D_SCALES + (size_t) r * SC_D * 2, ws.a2, SC_D);
+    const bool ic = int_corr.load(std::memory_order_relaxed);
+    for (int r = 0; r < H; ++r) {
+        pf.down(blob, r);
+        out[r] = row_dot_down(blob + O_D_CODES + (size_t) r * ROW_D, blob + O_D_SCALES + (size_t) r * SC_D * 2, ws.a2, ic);
+    }
 }
 
 bool expert_oracle_q8_0_enabled() { return oracle_q8_0.load(std::memory_order_relaxed); }
 
 void s2_expert_gu_rows(const uint8_t* blob, const ActQ& a1, float* ff, int r0, int r1) {
+    const Prefetch pf;
     for (int r = r0; r < r1; ++r) {
+        pf.gu(blob, r);
         const float g = row_dot(blob + O_GU_CODES + (size_t) (2 * r) * ROW_GU,
                                 blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2, a1, SC_GU);
         const float u = row_dot(blob + O_GU_CODES + (size_t) (2 * r + 1) * ROW_GU,
@@ -492,15 +609,21 @@ void s2_expert_gu_rows(const uint8_t* blob, const ActQ& a1, float* ff, int r0, i
 }
 
 void s2_expert_down_rows(const uint8_t* blob, const ActQ& a2, float* out, int r0, int r1) {
-    for (int r = r0; r < r1; ++r)
-        out[r] = row_dot(blob + O_D_CODES + (size_t) r * ROW_D, blob + O_D_SCALES + (size_t) r * SC_D * 2, a2, SC_D);
+    const Prefetch pf;
+    const bool ic = int_corr.load(std::memory_order_relaxed);
+    for (int r = r0; r < r1; ++r) {
+        pf.down(blob, r);
+        out[r] = row_dot_down(blob + O_D_CODES + (size_t) r * ROW_D, blob + O_D_SCALES + (size_t) r * SC_D * 2, a2, ic);
+    }
 }
 
 namespace {
 template<int NT>
 void gu_rows_multi(const uint8_t* blob, const ActQ* const* a1, float* const* ff, int r0, int r1) {
     float g[NT], u[NT];
+    const Prefetch pf;
     for (int r = r0; r < r1; ++r) {
+        pf.gu(blob, r);
         row_dot_multi<NT>(blob + O_GU_CODES + (size_t) (2 * r) * ROW_GU,
                           blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2, a1, SC_GU, g);
         row_dot_multi<NT>(blob + O_GU_CODES + (size_t) (2 * r + 1) * ROW_GU,
@@ -511,9 +634,12 @@ void gu_rows_multi(const uint8_t* blob, const ActQ* const* a1, float* const* ff,
 template<int NT>
 void down_rows_multi(const uint8_t* blob, const ActQ* const* a2, float* const* out, int r0, int r1) {
     float o[NT];
+    const Prefetch pf;
+    const bool ic = int_corr.load(std::memory_order_relaxed);
     for (int r = r0; r < r1; ++r) {
-        row_dot_multi<NT>(blob + O_D_CODES + (size_t) r * ROW_D, blob + O_D_SCALES + (size_t) r * SC_D * 2, a2,
-                          SC_D, o);
+        pf.down(blob, r);
+        row_dot_multi_down<NT>(blob + O_D_CODES + (size_t) r * ROW_D, blob + O_D_SCALES + (size_t) r * SC_D * 2, a2,
+                               o, ic);
         for (int t = 0; t < NT; ++t) out[t][r] = o[t];
     }
 }
@@ -553,7 +679,8 @@ void s2_expert_down_rows_multi(const uint8_t* blob, const ActQ* const* a2, int n
 // 64 weights, interleaved), which ggml-cpu computes with a scalar loop on x86.  This is `row_dot_multi_z` with
 // the block stride of the GGUF layout: the same unpack, the same VNNI dot, the same correction.
 namespace {
-template<int NT>
+// IC (O8c (b), opt-in): the integer correction of `row_dot_z_ic`, for rows of at most SC_D blocks (the down rows).
+template<int NT, bool IC>
 inline void q2g_row_multi(const uint8_t* row, const ActQ* const* a, int nblocks, float* res) {
     __m512 acc[NT], corr[NT];
     for (int t = 0; t < NT; ++t) { acc[t] = _mm512_setzero_ps(); corr[t] = _mm512_setzero_ps(); }
@@ -569,26 +696,34 @@ inline void q2g_row_multi(const uint8_t* row, const ActQ* const* a, int nblocks,
         __m512 p[NT];
         for (int t = 0; t < NT; ++t) {
             p[t] = _mm512_mul_ps(dd, _mm512_maskz_loadu_ps(m16, a[t]->scale + 2 * b0));
-            corr[t] = _mm512_fmadd_ps(dd, _mm512_maskz_loadu_ps(m16, a[t]->hx + 2 * b0), corr[t]);
+            if (!IC) corr[t] = _mm512_fmadd_ps(dd, _mm512_maskz_loadu_ps(m16, a[t]->hx + 2 * b0), corr[t]);
         }
         for (int i = 0; i < nb; ++i) {
             const int b = b0 + i;
             const __m512i w = unpack64_q2_0(row + (size_t) b * 18 + 2);
             const __m512i idx = _mm512_add_epi32(base, _mm512_set1_epi32(2 * i));
             for (int t = 0; t < NT; ++t) {
-                const __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w,
-                                                        _mm512_load_si512((const void*) (a[t]->q + b * QK)));
+                const __m512i seed = IC ? _mm512_load_si512((const void*) a[t]->seed[b]) : _mm512_setzero_si512();
+                const __m512i dot = _mm512_dpbusd_epi32(seed, w, _mm512_load_si512((const void*) (a[t]->q + b * QK)));
                 acc[t] = _mm512_fmadd_ps(_mm512_permutexvar_ps(idx, p[t]), _mm512_cvtepi32_ps(dot), acc[t]);
             }
         }
     }
-    for (int t = 0; t < NT; ++t) res[t] = _mm512_reduce_add_ps(acc[t]) - _mm512_reduce_add_ps(corr[t]);
+    for (int t = 0; t < NT; ++t)
+        res[t] = IC ? _mm512_reduce_add_ps(acc[t]) : _mm512_reduce_add_ps(acc[t]) - _mm512_reduce_add_ps(corr[t]);
 }
 template<int NT>
 void q2g_rows(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, float* const* out, int r0, int r1) {
     float res[NT];
+    if (nblocks <= SC_D && int_corr.load(std::memory_order_relaxed)) {
+        for (int r = r0; r < r1; ++r) {
+            q2g_row_multi<NT, true>(w + (size_t) r * row_bytes, a, nblocks, res);
+            for (int t = 0; t < NT; ++t) out[t][r] = res[t];
+        }
+        return;
+    }
     for (int r = r0; r < r1; ++r) {
-        q2g_row_multi<NT>(w + (size_t) r * row_bytes, a, nblocks, res);
+        q2g_row_multi<NT, false>(w + (size_t) r * row_bytes, a, nblocks, res);
         for (int t = 0; t < NT; ++t) out[t][r] = res[t];
     }
 }

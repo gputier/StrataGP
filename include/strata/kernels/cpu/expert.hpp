@@ -67,6 +67,9 @@ struct ActQ {
     int32_t sum[MAXC];
     float hx[MAXC];
     int nchunks;
+    /// O8c (b) (#29), written only with `expert_set_int_corr(true)`: for the first SC_D blocks (a down row's), the
+    /// vpdpbusd seed of block b - `-sum[2b]` in lane 0, `-sum[2b+1]` in lane 8, zero elsewhere.
+    alignas(64) int32_t seed[SC_D][16];
 };
 
 /// Per-worker scratch.  Owned by the caller and passed in, so the token path performs NO allocations
@@ -103,6 +106,18 @@ void cpu_require_expert_support();
 /// GPU expert-cache parity is not established for this mode; the driver must
 /// reject combining it with that cache. No allocation occurs in either mode.
 void expert_set_oracle_q8_0(bool enabled);
+
+/// O8c (a) (#29): software prefetch in the AVX-512 expert kernels, `scales_bytes` ahead in the scale stream and
+/// `codes_bytes` ahead in the code stream (0 = off; STRATA_CPU_PREFETCH / STRATA_CPU_PREFETCH_CODES at startup).
+/// Changes no result.  Set it while no expert runs.
+void expert_set_prefetch(int scales_bytes, int codes_bytes);
+/// O8c (b) (#29), opt-in (STRATA_CPU_INT_CORR=1 at startup): the down rows of the 512-bit kernels remove the Q2_0
+/// code offset in integer (vpdpbusd seeded with -sum) instead of with a float correction.  The single-token and
+/// multi-token kernels still agree bitwise with each other; both differ from the default in the last bits, and the
+/// GPU's `--expert-cache-cpu-order` kernel reproduces neither (it follows the 256-bit kernel).  Set it before any
+/// activation is quantized and do not change it during a request: the seeds are written by `act_quant_q8_1`.
+void expert_set_int_corr(bool enabled);
+bool expert_int_corr_enabled();
 
 /// `x` -> `a` in the configured contract. The function name is historical;
 /// `n` must be a multiple of QKA and at most H. No allocation occurs.
