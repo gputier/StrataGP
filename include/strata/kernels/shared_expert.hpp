@@ -24,6 +24,8 @@ namespace strata::kernels {
 /// Configure before session capture; captured graphs retain their selected kernels.
 /// In this mode shared_expert requires its optional unrounded x_f32 input.
 void shared_expert_set_native_bf16(bool enabled);
+/// What `shared_expert_set_native_bf16` selected.  With it on, `shared_expert` never reads `x_bf16`.
+bool shared_expert_native_bf16();
 
 /// Optional native GGUF projections. Each supported type with nonnull data
 /// replaces only that canonical projection; absent or unsupported entries fall
@@ -76,6 +78,24 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
                          int64_t n_ff, void* stream);
 
+/// Where the shared output's scalar gate stands after `shared_expert_multi_batched`.
+enum class SharedGate : int {
+    Applied = 0,   ///< `out` is final (gated), as `shared_expert_multi` leaves it
+    Value = 1,     ///< `out` is ungated and g[t] is the gate: the BF16 gate's double sigmoid, already a float
+    Logit = 2,     ///< `out` is ungated and g[t] is the native gate's dot; the gate is its FP32 sigmoid
+};
+
+/// #19: `shared_expert_multi` with its per-token launches batched - token for token BITWISE the same:
+///   * the SwiGLU and the Q8_1 quantization of its result are one kernel (`native_swiglu_quantize_q8_1`);
+///   * the scalar gate is one launch for all the tokens (a multi-column MMVF, or one BF16 block per token);
+///   * the sigmoid and the scale are one launch, or none with `defer_gate`: `out` is then left ungated and the
+///     combination applies g (`moe_combine_window` / `native_moe_combine_window`, gate mode = the return value).
+/// `gate` keeps the gate projection (the old kernel overwrote it with the SwiGLU) and, when the native gate
+/// defers, `g` keeps the dot; both are scratch.  `x_bf16` is only read when the native BF16 gate is off.
+SharedGate shared_expert_multi_batched(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
+                                       const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out,
+                                       int64_t n_embd, int64_t n_ff, void* stream, bool defer_gate);
+
 /// The MoE block's final combination, `ref/moe.py::moe` L156:
 ///
 ///     y = sum over the k routed experts of  w[k] * parts[k]  +  shared
@@ -97,5 +117,14 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
 /// it, because the sum has to happen once over all k and not once per worker.
 void moe_combine(const float* parts, const float* weights, const float* shared, float* y, int64_t n_embd,
                  int64_t k, void* stream);
+
+/// #44 (E1) and #19: `moe_combine` for n_tok tokens in ONE launch, each routed row read where it was left - see
+/// `native_moe_combine_window` for the row rule (CPU rows from the mapped `y_miss`, the rows listed in
+/// hit_dst[0 .. *hit_count) from `hit_out`) and the gate modes.  Token for token BITWISE copy_from_mapped +
+/// moe_hit_add + moe_combine (after the shared expert's own gate for modes Value/Logit), given the pool's zero
+/// rows for the GPU's experts.  k 1..16, n_tok * k <= 128, n_embd a multiple of 4, rows 16-byte aligned.
+void moe_combine_window(const float* y_miss, const float* hit_out, const int32_t* hit_dst, const int32_t* hit_count,
+                        const float* weights, const float* shared, const float* shared_gate, SharedGate gate_mode,
+                        float* y, int64_t n_embd, int64_t k, int n_tok, void* stream);
 
 }  // namespace strata::kernels

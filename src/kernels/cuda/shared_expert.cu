@@ -106,8 +106,9 @@ __device__ __forceinline__ double warp_sum_d(double v) {
     return __shfl_sync(0xFFFFFFFFu, v, 0);
 }
 
-__global__ void scalar_gate_kernel(const uint16_t* __restrict__ x_bf16, const uint16_t* __restrict__ w_bf16,
-                                   float* __restrict__ out, int n_embd) {
+// One token's gate by one block; `scalar_gate_kernel` runs it once, `scalar_gate_rows_kernel` once per block.
+__device__ __forceinline__ void scalar_gate_row(const uint16_t* __restrict__ x_bf16, const uint16_t* __restrict__ w_bf16,
+                                                float* __restrict__ out, int n_embd) {
     __shared__ double scratch[8];   // 8 warps: the launch is <<<1, 256>>>
     double acc = 0.0;
     for (int i = threadIdx.x; i < n_embd; i += blockDim.x)
@@ -123,6 +124,17 @@ __global__ void scalar_gate_kernel(const uint16_t* __restrict__ x_bf16, const ui
         acc = warp_sum_d(acc);
         if (threadIdx.x == 0) out[0] = (float) (1.0 / (1.0 + exp(-acc)));
     }
+}
+
+__global__ void scalar_gate_kernel(const uint16_t* __restrict__ x_bf16, const uint16_t* __restrict__ w_bf16,
+                                   float* __restrict__ out, int n_embd) {
+    scalar_gate_row(x_bf16, w_bf16, out, n_embd);
+}
+
+// #19: the verify window's per-token gate launches as one, a block per token (blocks share nothing).
+__global__ void scalar_gate_rows_kernel(const uint16_t* __restrict__ x_bf16, const uint16_t* __restrict__ w_bf16,
+                                        float* __restrict__ out, int n_embd) {
+    scalar_gate_row(x_bf16 + (size_t) blockIdx.x * n_embd, w_bf16, out + blockIdx.x, n_embd);
 }
 
 __global__ void scale_kernel(float* __restrict__ out, const float* __restrict__ g, int n) {
@@ -155,11 +167,89 @@ __global__ void moe_combine_kernel(const float* __restrict__ parts, const float*
 
 void shared_expert_set_native_bf16(bool enabled) { native_bf16 = enabled; }
 
+bool shared_expert_native_bf16() { return native_bf16; }
+
 namespace {
 __global__ void scale_rows_kernel(float* __restrict__ out, const float* __restrict__ g, int n) {
     const int t = blockIdx.y;
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[(size_t) t * n + i] *= g[t];
+}
+
+// #19: `native_scalar_sigmoid_kernel` per token and then `scale_rows_kernel`, as one launch.  Every thread
+// evaluates the sigmoid's own expression on the dot (this file, these flags: the same float) instead of one
+// thread writing it back first.  `dot` is left as the dot.
+__global__ void sigmoid_scale_rows_kernel(float* __restrict__ out, const float* __restrict__ dot, int n) {
+    const int t = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float g = __fdividef(1.0f, 1.0f + __expf(-dot[t]));
+    out[(size_t) t * n + i] *= g;
+}
+
+// #44 (E1) and #19: `moe_combine_kernel`'s window form, each routed row read where it was left (see
+// native_moe_combine_window, which this mirrors for the double-accumulating combination).  This file is built
+// without --use_fast_math, like the kernels it replaces, so the explicit single-rounding intrinsics below are
+// their instructions: `+0 + hit` (moe_hit_add), `out * g` (the scale), the FMAs in expert order, the shared add.
+constexpr int kWindowMaxK = 16;
+constexpr int kWindowMaxRows = 128;
+constexpr int kWindowThreads = 128;
+
+template <int GATE>
+__launch_bounds__(kWindowThreads)
+__global__ void moe_combine_window_kernel(const float* y_miss, const float* __restrict__ hit_out,
+                                          const int32_t* __restrict__ hit_dst, const int32_t* __restrict__ hit_count,
+                                          const float* __restrict__ weights, const float* __restrict__ shared,
+                                          const float* __restrict__ gate, float* __restrict__ y, int n4, int k) {
+    __shared__ unsigned char s_gpu[kWindowMaxRows];
+    const int t = blockIdx.y, rows = (int) gridDim.y * k;
+    for (int i = threadIdx.x; i < rows; i += blockDim.x) s_gpu[i] = 0;
+    __syncthreads();
+    if (hit_count != nullptr) {
+        const int count = min(*hit_count, rows);
+        for (int h = threadIdx.x; h < count; h += blockDim.x) {
+            const int row = hit_dst[h];
+            if (row >= 0 && row < rows) s_gpu[row] = 1;
+        }
+    }
+    __syncthreads();
+    const int c = (int) blockIdx.x * kWindowThreads + (int) threadIdx.x;
+    if (c >= n4) return;
+    float4 p[kWindowMaxK];
+#pragma unroll
+    for (int e = 0; e < kWindowMaxK; ++e) {
+        if (e < k) {
+            const int row = t * k + e;
+            const size_t at = (size_t) row * (size_t) n4 + (size_t) c;
+            if (s_gpu[row]) {
+                const float4 h = reinterpret_cast<const float4*>(hit_out)[at];
+                p[e] = make_float4(__fadd_rn(0.0f, h.x), __fadd_rn(0.0f, h.y), __fadd_rn(0.0f, h.z),
+                                   __fadd_rn(0.0f, h.w));
+            } else {
+                p[e] = __ldcv(reinterpret_cast<const float4*>(y_miss) + at);
+            }
+        }
+    }
+    float4 sh = reinterpret_cast<const float4*>(shared)[(size_t) t * (size_t) n4 + (size_t) c];
+    if constexpr (GATE != 0) {
+        const float g = GATE == 2 ? __fdividef(1.0f, 1.0f + __expf(-gate[t])) : gate[t];
+        sh = make_float4(__fmul_rn(sh.x, g), __fmul_rn(sh.y, g), __fmul_rn(sh.z, g), __fmul_rn(sh.w, g));
+    }
+    const float* w = weights + (size_t) t * (size_t) k;
+    double a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+#pragma unroll
+    for (int e = 0; e < kWindowMaxK; ++e) {
+        if (e < k) {
+            const double we = (double) w[e];
+            a0 = __fma_rn(we, (double) p[e].x, a0);
+            a1 = __fma_rn(we, (double) p[e].y, a1);
+            a2 = __fma_rn(we, (double) p[e].z, a2);
+            a3 = __fma_rn(we, (double) p[e].w, a3);
+        }
+    }
+    reinterpret_cast<float4*>(y)[(size_t) t * (size_t) n4 + (size_t) c] =
+        make_float4(__double2float_rn(__dadd_rn(a0, (double) sh.x)), __double2float_rn(__dadd_rn(a1, (double) sh.y)),
+                    __double2float_rn(__dadd_rn(a2, (double) sh.z)), __double2float_rn(__dadd_rn(a3, (double) sh.w)));
 }
 }  // namespace
 
@@ -188,6 +278,62 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
         out, g, (int) n_embd);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) throw std::runtime_error(std::string("shared_expert_multi: ") + cudaGetErrorString(e));
+}
+
+SharedGate shared_expert_multi_batched(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
+                                       const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out,
+                                       int64_t n_embd, int64_t n_ff, void* stream, bool defer_gate) {
+    if (n_tok < 1 || n_tok > 8 || !nw.q8_1 || !nw.gate_data || !nw.up_data || !nw.down_data || !stream ||
+        (!native_bf16 && !x_bf16))
+        throw std::invalid_argument("shared_expert_multi_batched: needs 1..8 tokens, native weights, scratch, a stream "
+                                    "and, for the BF16 gate, the rounded input");
+    cudaStream_t cs = (cudaStream_t) stream;
+    native_quantize_q8_1(x, nw.q8_1, (int) n_embd, n_tok, stream);
+    native_mmvq(nw.gate_type, nw.gate_data, nw.q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream);
+    native_mmvq(nw.up_type, nw.up_data, nw.q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);
+    native_swiglu_quantize_q8_1(gate, up, nw.q8_1, (int) n_ff, n_tok, stream);   // `gate` keeps the projection
+    native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
+    // the scalar gate for all the tokens in one launch: g[t] is the dot (native) or already the sigmoid (BF16)
+    if (native_bf16) bf16_gemv_fp32_mmvf_multi(x, n_embd, gate_inp_bf16, g, 1, n_embd, 1, n_tok, stream);
+    else scalar_gate_rows_kernel<<<(unsigned) n_tok, 256, 0, cs>>>(x_bf16, gate_inp_bf16, g, (int) n_embd);
+    SharedGate mode = native_bf16 ? SharedGate::Logit : SharedGate::Value;
+    if (!defer_gate) {
+        const dim3 grid((unsigned) ((n_embd + THREADS - 1) / THREADS), (unsigned) n_tok);
+        if (native_bf16) sigmoid_scale_rows_kernel<<<grid, THREADS, 0, cs>>>(out, g, (int) n_embd);
+        else scale_rows_kernel<<<grid, THREADS, 0, cs>>>(out, g, (int) n_embd);
+        mode = SharedGate::Applied;
+    }
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) throw std::runtime_error(std::string("shared_expert_multi_batched: ") + cudaGetErrorString(e));
+    return mode;
+}
+
+void moe_combine_window(const float* y_miss, const float* hit_out, const int32_t* hit_dst, const int32_t* hit_count,
+                        const float* weights, const float* shared, const float* shared_gate, SharedGate gate_mode,
+                        float* y, int64_t n_embd, int64_t k, int n_tok, void* stream) {
+    const int mode = (int) gate_mode;
+    if (!stream || !y_miss || !weights || !shared || !y || n_embd <= 0 || n_embd % 4 != 0 || n_embd > INT_MAX ||
+        k < 1 || k > kWindowMaxK || n_tok < 1 || (int64_t) n_tok * k > kWindowMaxRows || mode < 0 || mode > 2 ||
+        (mode != 0 && !shared_gate) || (hit_count != nullptr) != (hit_dst != nullptr) || (hit_count && !hit_out))
+        throw std::invalid_argument("moe_combine_window: needs a stream, a width that is a multiple of 4, 1..16 "
+                                    "experts, at most 128 rows, the shared output and its gate");
+    auto misaligned = [](const void* p) { return p != nullptr && ((uintptr_t) p & 15u) != 0; };
+    if (misaligned(y_miss) || misaligned(hit_out) || misaligned(shared) || misaligned(y))
+        throw std::invalid_argument("moe_combine_window: rows must be 16-byte aligned");
+    const int n4 = (int) (n_embd / 4);
+    const dim3 grid((unsigned) ((n4 + kWindowThreads - 1) / kWindowThreads), (unsigned) n_tok);
+    const cudaStream_t cs = (cudaStream_t) stream;
+    if (mode == 0)
+        moe_combine_window_kernel<0><<<grid, kWindowThreads, 0, cs>>>(y_miss, hit_out, hit_dst, hit_count, weights,
+                                                                     shared, shared_gate, y, n4, (int) k);
+    else if (mode == 1)
+        moe_combine_window_kernel<1><<<grid, kWindowThreads, 0, cs>>>(y_miss, hit_out, hit_dst, hit_count, weights,
+                                                                     shared, shared_gate, y, n4, (int) k);
+    else
+        moe_combine_window_kernel<2><<<grid, kWindowThreads, 0, cs>>>(y_miss, hit_out, hit_dst, hit_count, weights,
+                                                                     shared, shared_gate, y, n4, (int) k);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) throw std::runtime_error(std::string("moe_combine_window: ") + cudaGetErrorString(e));
 }
 
 uint64_t shared_expert_scratch_bytes(int64_t n_ff) {

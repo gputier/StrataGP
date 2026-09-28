@@ -395,7 +395,8 @@ if (w_ginp->kind != WeightKind::Bf16InF32) {        err = v.name("ffn_gate_inp_s
 // the rest, `ffn_up_shexp` Q2_0 on 13, and `ffn_down_shexp` is LEGACY in every layer (IQ4_NL/Q4_0/Q5_0/
 // Q8_0/Q2_0, `n_in` 640 so Q8_K is impossible).  So BOTH quantized images of the activation are produced
 // and each projection takes the one its own form asks for.
-f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
+// #19: the BF16 image only feeds the BF16 scalar gate; with the native gate on nothing reads it.
+if (!shared_expert_native_bf16()) f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
     if (!w_sgate->native_data || !w_sup->native_data) {
         quantize_q8_K(x, b.x_q8k, g.n_embd, stream);
         quantize_q8_0(x, b.x_q8_0, g.n_embd, stream);
@@ -435,6 +436,52 @@ try {
     return false;
 }
 return true;}
+bool moe_route_multi(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,
+                     const float* x, int n_tok, void* stream, std::string& err) {
+    using namespace strata::kernels;
+    if (!native_bf16_projections || n_tok > kMmvfMaxCols) {   // the BF16-activation router: the loop itself
+        for (int t = 0; t < n_tok; ++t) {
+            MoEBuffers bt = b;
+            bt.logits = b.logits + (size_t) t * g.n_expert; bt.ids = b.ids + (size_t) t * k; bt.weights = b.weights + (size_t) t * k;
+            if (!moe_route(tables, g, layer, k, bt, x + (size_t) t * g.n_embd, stream, err, nullptr)) return false;
+        }
+        return true;
+    }
+    const LayerView v(tables, layer);
+    const WeightRef* w_router = v.get("ffn_gate_inp.weight");
+    if (w_router == nullptr) { err = v.name("ffn_gate_inp.weight") + " is missing"; return false; }
+    if (k < 1 || k > 64) { err = "moe_route: k must be 1..64"; return false; }
+    try {
+        // `moe_route`'s GEMV (project_bf16 -> bf16_gemv_fp32_mmvf) and top-k, each once for the n_tok columns
+        bf16_gemv_fp32_mmvf_multi(x, g.n_embd, (const uint16_t*) w_router->data, b.logits, g.n_expert, g.n_embd,
+                                  g.n_expert, n_tok, stream);
+        if (native_router_enabled() && g.n_expert == 512 && k == 10)
+            native_router_top10_multi(b.logits, b.ids, b.weights, n_tok, stream);
+        else
+            router_top10(b.logits, n_tok, (int) g.n_expert, (int) k, b.ids, b.weights, stream);
+    } catch (const std::exception& error) {
+        err = v.name("router") + ": " + error.what();
+        return false;
+    }
+    return true;
+}
+bool moe_combine_rows(const ModelGeometry& g, int64_t layer, int64_t k, int n_tok, const float* weights,
+                      const float* shared, const float* shared_gate, int gate_mode, const MoeRows& rows, float* out,
+                      void* stream, std::string& err) {
+    using namespace strata::kernels;
+    try {
+        if (native_moe_combine_enabled())
+            native_moe_combine_window(rows.y_miss, rows.hit_out, rows.hit_dst, rows.hit_count, weights, shared,
+                                      shared_gate, gate_mode, out, g.n_embd, k, n_tok, stream);
+        else
+            moe_combine_window(rows.y_miss, rows.hit_out, rows.hit_dst, rows.hit_count, weights, shared, shared_gate,
+                               (SharedGate) gate_mode, out, g.n_embd, k, n_tok, stream);
+    } catch (const std::exception& error) {
+        err = "blk." + std::to_string(layer) + ".moe_combine_rows: " + error.what();
+        return false;
+    }
+    return true;
+}
 bool moe_finish(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,
                 const float* x, const float* parts, float* out, void* stream, std::string& err) {
     if (k < 1 || k > 64) { err = "moe_finish: k must be 1..64"; return false; }
@@ -1237,11 +1284,15 @@ uint64_t ple_run_scratch_bytes() {
     return strata::kernels::ple_block_scratch_bytes() + strata::kernels::NG_HC_DIM * sizeof(float);
 }
 
-bool block_layer_post(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k,                      const MoEBuffers& mb, const BlockBuffers& bb, const float* parts, void* stream,                      std::string& err) {    const strata::kernels::GrShapes gs{g.n_embd, g.hc, g.hc_lr};
+bool block_layer_post(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k,                      const MoEBuffers& mb, const BlockBuffers& bb, const float* parts, void* stream,                      std::string& err, const MoeRows* rows) {    const strata::kernels::GrShapes gs{g.n_embd, g.hc, g.hc_lr};
 // `bb.mixed` and `bb.inject` are what `block_layer_pre` left, and NOTHING between the two calls may touch
 // them - that is what makes `post[l]` safe to launch after the host has run the pool.
 st_begin(layer, 5, stream);
-    if (g_shared_early ? !moe_combine_parts(g, layer, k, mb, parts, bb.block_out, stream, err)
+    if (rows != nullptr) {   // #44: `moe_finish` with the routed rows read in place (moe_finish = shared + combine)
+        if (!g_shared_early && !moe_shared(tables, g, layer, mb, bb.mixed, stream, err)) return false;
+        if (!moe_combine_rows(g, layer, k, 1, mb.weights, mb.shared, nullptr, 0, *rows, bb.block_out, stream, err))
+            return false;
+    } else if (g_shared_early ? !moe_combine_parts(g, layer, k, mb, parts, bb.block_out, stream, err)
                        : !moe_finish(tables, g, layer, k, mb, bb.mixed, parts, bb.block_out, stream, err)) return false;
     st_end(layer, 5, stream);    dump_half(bb, g, layer, bb.block_out, (uint64_t) g.n_embd, g.n_embd, stream);    dump_half(bb, g, layer, bb.inject, (uint64_t) 2 * g.n_embd + g.hc, g.hc, stream);    st_begin(layer, 6, stream);
     const bool steer = strata::kernels::cvec().covers(layer);   // --control-vector-scaled: after this write

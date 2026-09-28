@@ -38,6 +38,12 @@ bool native_mmvq_multi_exact();
 void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols,
                           void* stream);
 
+// #19: the shared expert's native SwiGLU, silu(gate) * up, quantized to Q8_1 in the same pass - bitwise
+// shared_expert.cu's FP32 SwiGLU kernel followed by native_quantize_q8_1 on its output, without the
+// intermediate store.  gate/up are ncols contiguous columns of n_in floats; neither is written.
+void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_1, int n_in, int ncols,
+                                 void* stream);
+
 void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream);
 

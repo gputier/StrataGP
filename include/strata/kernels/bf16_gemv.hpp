@@ -45,4 +45,13 @@ void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_i
 void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,
                          int64_t n_in, int64_t n_out, void* stream);
 
+/// The verify window's per-token `bf16_gemv_fp32_mmvf` loop as ONE launch (#19): column j reads
+/// `x + j * x_stride` and writes `y + j * y_stride`, for n_tok = 1..kMmvfMaxCols columns.  Every column is
+/// BITWISE `bf16_gemv_fp32_mmvf` on that column alone (same block size, same pair order per thread, same
+/// reductions, one accumulator per column); the weight row is read once for all of them.  With n_tok > 1,
+/// x_stride must be even and >= n_in and y_stride >= n_out.  Same pointer rules and throws as above.
+constexpr int kMmvfMaxCols = 8;
+void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t x_stride, const uint16_t* w, float* y, int64_t y_stride,
+                               int64_t n_in, int64_t n_out, int n_tok, void* stream);
+
 }  // namespace strata::kernels

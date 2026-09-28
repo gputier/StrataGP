@@ -136,12 +136,9 @@ __device__ __forceinline__ float warp_max(float x) {
     return x;
 }
 
-__launch_bounds__(QUANT_THREADS, 1)
-__global__ void native_quantize_q8_1_kernel(const float* __restrict__ x,
-                                           Q81Block* __restrict__ y, int n_in) {
-    const int i = int(blockIdx.x) * QUANT_THREADS + int(threadIdx.x);
-    if (i >= n_in) return; // n_in is a multiple of 32: only whole warps return.
-    const float xi = x[i];
+// One element of the Q8_1 quantization; its warp holds the whole 32-element block.  Shared by the plain
+// kernel and the fused SwiGLU one below, so both quantize the same float the same way.
+__device__ __forceinline__ void quantize_q8_1_element(const float xi, const int i, Q81Block* __restrict__ y) {
     const float amax = warp_max(fabsf(xi));
     const float sum = warp_sum(xi);
     // B5 (#4): the division spelled as the --use_fast_math flag makes it (div.approx.ftz, the same PTX), so the
@@ -150,6 +147,42 @@ __global__ void native_quantize_q8_1_kernel(const float* __restrict__ x,
     const int8_t q = amax == 0.0f ? 0 : roundf(__fdividef(xi, d));
     y[i / Q8K].qs[i % Q8K] = q;
     if (i % Q8K == 0) y[i / Q8K].ds = make_half2(d, sum);
+}
+
+__launch_bounds__(QUANT_THREADS, 1)
+__global__ void native_quantize_q8_1_kernel(const float* __restrict__ x,
+                                           Q81Block* __restrict__ y, int n_in) {
+    const int i = int(blockIdx.x) * QUANT_THREADS + int(threadIdx.x);
+    if (i >= n_in) return; // n_in is a multiple of 32: only whole warps return.
+    quantize_q8_1_element(x[i], i, y);
+}
+
+// The shared expert's SwiGLU exactly as `native_swiglu_kernel` (shared_expert.cu) computes it.  That file is
+// NOT built with --use_fast_math, so its __expf/__fdividef lower to the non-flushing instructions below, while
+// the same intrinsics here would flush denormals; the PTX is therefore spelled out.  Explicit .rn on the mul
+// and add only forbids contraction (the separate kernel stores the product, so nothing was fused there either).
+__device__ __forceinline__ float shared_swiglu_exact(const float gate, const float up) {
+    float h;
+    asm("{\n\t"
+        ".reg .f32 e, s, q;\n\t"
+        "mul.rn.f32 e, %1, 0fBFB8AA3B;\n\t"   // -log2(e) * gate, as __expf(-gate) scales it
+        "ex2.approx.f32 e, e;\n\t"
+        "add.rn.f32 s, e, 0f3F800000;\n\t"
+        "div.approx.f32 q, %1, s;\n\t"
+        "mul.rn.f32 %0, q, %2;\n\t"
+        "}"
+        : "=f"(h) : "f"(gate), "f"(up));
+    return h;
+}
+
+// #19: the shared expert's SwiGLU and the Q8_1 quantization of its result in one pass - the separate SwiGLU
+// kernel wrote this float to memory and the quantizer read it back, here it stays in a register.
+__launch_bounds__(QUANT_THREADS, 1)
+__global__ void native_swiglu_quantize_q8_1_kernel(const float* __restrict__ gate, const float* __restrict__ up,
+                                                  Q81Block* __restrict__ y, int n_in) {
+    const int i = int(blockIdx.x) * QUANT_THREADS + int(threadIdx.x);
+    if (i >= n_in) return; // n_in is a multiple of 32: only whole warps return.
+    quantize_q8_1_element(shared_swiglu_exact(gate[i], up[i]), i, y);
 }
 
 // Exact pinned vec_dot_q5_K_q8_1_impl_vmmq expression and integer dot order.
@@ -1161,6 +1194,20 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, voi
     const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
     native_quantize_q8_1_kernel<<<blocks, QUANT_THREADS, 0,
                                  static_cast<cudaStream_t>(stream)>>>(x, static_cast<Q81Block*>(x_q8_1), n_total);
+    launch_check();
+}
+
+void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_1, int n_in, int ncols,
+                                 void* stream) {
+    validate_shape(n_in, ncols);
+    validate_pointer(gate);
+    validate_pointer(up);
+    validate_pointer(x_q8_1);
+    validate_stream(stream);
+    const int n_total = n_in * ncols;
+    const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
+    native_swiglu_quantize_q8_1_kernel<<<blocks, QUANT_THREADS, 0, static_cast<cudaStream_t>(stream)>>>(
+        gate, up, static_cast<Q81Block*>(x_q8_1), n_total);
     launch_check();
 }
 
