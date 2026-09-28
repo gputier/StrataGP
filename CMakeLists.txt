@@ -398,6 +398,13 @@ if(STRATA_ENABLE_CUDA)
   target_link_libraries(mtp_chain_parity PRIVATE strata_kernels CUDA::cudart)
   add_test(NAME mtp_chain_parity COMMAND mtp_chain_parity)
 
+  # O3 (#17): the rewritten per-hit and grouped expert kernels vs the previous ones, bitwise (GPU, synthetic, no
+  # model).  `--bench` adds previous/new timings on engine-like shapes.
+  add_executable(s2_expert_grouped_parity src/kernels/s2_expert_grouped_parity.cpp)
+  target_include_directories(s2_expert_grouped_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(s2_expert_grouped_parity PRIVATE strata_kernels CUDA::cudart)
+  add_test(NAME s2_expert_grouped_parity COMMAND s2_expert_grouped_parity --selftest)
+
   # Plan v0.3 P3: native MMVQ for 1..8 tokens (bitwise selftest + --bench timing); synthetic data, no model.
   if(STRATA_BUILD_TESTS AND STRATA_HAVE_MICRO)
   add_executable(native_mmvq_multi bench/micro/native_mmvq_multi.cpp)
