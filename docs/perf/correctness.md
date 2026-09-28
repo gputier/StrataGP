@@ -86,6 +86,11 @@ de l'appel en place (x == out, comme tous les appelants).
   ~0,01 rad à 128K), alors que le décodage `--native` utilise l'angle fast-math. Les K du prompt et les Q du décodage
   ne sont donc pas tournés avec la même arithmétique ; l'écart croît avec la position. `STRATA_ROPE_F64` ne touche
   que le décodage. Piste : aligner les deux chemins (même instanciation) après mesure.
+- **Intégration (`perf/all`, avec `qsa-small`)** : la préparation QSA fusionnée de `qsa-small` (`qsa_q_prep`,
+  `kv_append*_prep_step`, active par défaut) refait l'angle f32 fast-math de `native_rope_apply` dans ses propres
+  kernels. Avec `STRATA_ROPE_F64=1`, `qsa_prep_supported` répond donc non et la couche QSA du décodage token par
+  token garde les lancements séparés, qui passent par `native_rope_apply` : l'option atteint bien toutes les rotations
+  du décodage (fenêtres de vérification comprises, qui appellent `native_rope_apply` directement).
 
 ### #5 (B6) : softplus (`src/kernels/cuda/native_gdn_preprocess.cu`, commentaire seulement)
 

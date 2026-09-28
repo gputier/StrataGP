@@ -116,6 +116,9 @@ bool qsa_prep_supported(const QsaShapes& s, const QsaNormRope& nr) {
         if (s.n_rot != 64 || (s.idx_dim != 128 && s.idx_dim != 256) || !std::isfinite(nr.freq_base) ||
             nr.freq_base <= 1.0f)
             return false;
+        // issue #3's float64 angle (STRATA_ROPE_F64=1) lives in native_rope_apply only: the fused rows repeat the
+        // f32 fast-math angle, so with it on the layer keeps the separate launches and the opt-in reaches them
+        if (native_rope_f64_angle()) return false;
     } else if (nr.cos_tab == nullptr || nr.sin_tab == nullptr) {
         return false;
     }
