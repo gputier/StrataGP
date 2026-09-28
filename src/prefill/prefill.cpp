@@ -33,6 +33,8 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <set>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -674,14 +676,15 @@ bool native_proj(Gemm& gm, const core::WeightRef* w, const float* X32, const uin
                  const std::string& name, std::string& err, int64_t ldy = 0) {
     if (!w->native_data) { err = "prefill: " + name + " has no native GGUF blocks (run with --native)"; return false; }
     // --prefill-dense-mmq: through MMQ when it covers the weight's type, else (and by default) the FP16 GEMM
-    if (gm.native_mmq(X32, X, w->native_type, w->native_data, Y, T, w->ne1, w->ne0, ldy)) return true;
-    if (dense_mmq_on()) {   // once per type: what stays on the FP16 GEMM (IQ1_M, or a build without MMQ)
-        static bool told[64] = {};
-        const int t = w->native_type;
-        if (t >= 0 && t < 64 && !told[t])
-            std::fprintf(stderr, "strata prefill: --prefill-dense-mmq: %s (GGML type %d) stays on the FP16 GEMM\n",
-                         name.c_str(), t);
-        if (t >= 0 && t < 64) told[t] = true;
+    const char* why = "";
+    if (gm.native_mmq(X32, X, w->native_type, w->native_data, Y, T, w->ne1, w->ne0, ldy, 0.0f, &why)) return true;
+    if (dense_mmq_on()) {   // once per (type, reason): what stays on the FP16 GEMM, and why
+        static std::mutex mu;
+        static std::set<std::pair<int, std::string>> told;
+        std::lock_guard<std::mutex> lk(mu);
+        if (told.emplace(w->native_type, why).second)
+            std::fprintf(stderr, "strata prefill: --prefill-dense-mmq: %s (GGML type %d) stays on the FP16 GEMM: %s\n",
+                         name.c_str(), w->native_type, why);
     }
     gm.native(X, w->native_type, w->native_data, Y, T, w->ne1, w->ne0, ldy);
     return true;

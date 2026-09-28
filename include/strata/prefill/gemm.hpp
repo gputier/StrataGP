@@ -44,9 +44,10 @@ public:
     /// q8_1 - from `X32` (FP32, K floats per row) when the caller has it, else from the FP16 `X` widened.  The
     /// scratch holds the quantized rows (in token slices when a chunk's do not fit) and, when MMQ's K tiles would
     /// read past the weight's end, a copy of it with a zeroed tail.  False, with nothing launched, when MMQ does not
-    /// cover the call (no context, the weight type, beta != 0, a scratch too small): the caller runs `native`.
+    /// cover the call (no context, the weight type, beta != 0, K % 4 != 0, a scratch too small): the caller runs
+    /// `native`.  `why`, when given, receives a static string naming the reason of a decline.
     bool native_mmq(const float* X32, const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T,
-                    int64_t N, int64_t K, int64_t ldy = 0, float beta = 0.0f);
+                    int64_t N, int64_t K, int64_t ldy = 0, float beta = 0.0f, const char** why = nullptr);
     /// The MMQ launch context of `native_mmq` (not owned; null, the default: `native_mmq` declines every call).
     void set_mmq(mmq::Context* ctx) { mmq_ = ctx; }
 

@@ -137,8 +137,12 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
 }
 
 bool Gemm::native_mmq(const float* X32, const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T,
-                      int64_t N, int64_t K, int64_t ldy, float beta) {
-    if (mmq_ == nullptr || beta != 0.0f || K % 4 != 0 || !mmq::dense_supported(ggml_type)) return false;
+                      int64_t N, int64_t K, int64_t ldy, float beta, const char** why) {
+    const auto decline = [why](const char* r) { if (why) *why = r; return false; };
+    if (mmq_ == nullptr) return decline("no MMQ context (a build without MMQ)");
+    if (beta != 0.0f) return decline("beta != 0");
+    if (K % 4 != 0) return decline("K % 4 != 0");
+    if (!mmq::dense_supported(ggml_type)) return decline("MMQ does not cover the type");
     if (T <= 0 || N <= 0) return true;
     if (ldy <= 0) ldy = N;
     const cudaStream_t s = (cudaStream_t) stream_;
@@ -152,9 +156,9 @@ bool Gemm::native_mmq(const float* X32, const uint16_t* X, int ggml_type, const 
     const size_t q8_row = mmq::q8_bytes(1, K) - mmq::q8_bytes(0, K), q8_tail = mmq::q8_bytes(0, K);
     const size_t x_row = X32 != nullptr ? 0 : (size_t) K * 4;
     const size_t fixed = w_region + q8_tail + 2 * 256;
-    if (base == nullptr || cap <= fixed) return false;
+    if (base == nullptr || cap <= fixed) return decline("the scratch is too small");
     int64_t rows = (int64_t) ((cap - fixed) / (q8_row + x_row));
-    if (rows <= 0) return false;
+    if (rows <= 0) return decline("the scratch is too small");
     if (rows < T && rows >= 128) rows -= rows % 128;   // whole column tiles in every slice but the last
     rows = std::min(rows, T);
     const void* w = W_blocks;
