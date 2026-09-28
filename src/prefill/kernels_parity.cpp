@@ -60,9 +60,7 @@ template <typename T> void same(const char* what, long long case_id, const std::
         if (std::memcmp(&a[i], &b[i], sizeof(T)) != 0 && bad++ == 0) first = i;
     if (bad == 0) return;
     ++g_fail;
-    double x = 0, y = 0;
-    if constexpr (sizeof(T) == 4) { float f; std::memcpy(&f, &a[first], 4); x = f; std::memcpy(&f, &b[first], 4); y = f; }
-    else { x = (double) a[first]; y = (double) b[first]; }
+    const double x = (double) a[first], y = (double) b[first];   // FP16/BF16 images: their bits
     std::fprintf(stderr, "FAIL %s (case %lld): %zu of %zu differ, first at %zu: old %.9g new %.9g\n", what, case_id, bad,
                  a.size(), first, x, y);
 }
