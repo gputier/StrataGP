@@ -89,7 +89,9 @@ struct TicketState {
 // THREADING. With `io_thread` (the default) one worker thread owns every DirectFile call: it submits queued jobs
 // and reaps completions, so `issue` on the caller's thread only builds jobs and wakes it (~11 us per ReadFile
 // no longer lands on the host loop). `mu` guards everything below except `file`, which only the worker touches
-// (plus `wake`, which is thread-safe). Without `io_thread` the caller does all of it, as before.
+// (plus `wake`, which is thread-safe), and the `inflight` jobs, which only the worker touches while the reader is
+// open. Issue #15: the worker makes its submit calls WITHOUT `mu` (`pump_worker`), so a submit that blocks (the
+// `sync` backend's pread) never holds up `issue` or `collect`. Without `io_thread` the caller does all of it.
 struct PleReader::Impl {
     DirectFile file;
     uint64_t table_offset = 0;
@@ -100,6 +102,7 @@ struct PleReader::Impl {
     std::vector<Job> inflight;            // indexed by slot
     std::vector<Completion> delayed;      // completed but held back by fault injection
     std::deque<Job> queue;                // not yet submitted
+    std::vector<uint32_t> batch;          // pump_worker: the slots taken in one pass
     std::unordered_map<uint32_t, TicketState> tickets;
     uint32_t next_ticket = 1;
     RowCache cache;
@@ -139,6 +142,40 @@ struct PleReader::Impl {
         return true;
     }
 
+    /// The worker's pump: slots are taken under `mu` (held by `lk` on entry and on return), the submit calls run
+    /// without it. A job that could not be submitted gives its slot back; its ticket then fails through `error`.
+    bool pump_worker(std::unique_lock<std::mutex>& lk) {
+        batch.clear();
+        while (!queue.empty() && !free_slots.empty()) {
+            const uint32_t s = free_slots.back();
+            free_slots.pop_back();
+            inflight[s] = std::move(queue.front());
+            queue.pop_front();
+            batch.push_back(s);
+        }
+        if (batch.empty()) return true;
+        lk.unlock();
+        std::string e;
+        size_t done = 0;
+        double sub_us = 0;
+        for (; done < batch.size(); ++done) {
+            Job& j = inflight[batch[done]];
+            j.issued_us = now_us();
+            if (!file.submit(j.offset, slot_buf(batch[done]), j.length, batch[done], e)) break;
+            sub_us += now_us() - j.issued_us;
+        }
+        lk.lock();
+        stats.submit_us += sub_us;
+        stats.reads += done;
+        if (done == batch.size()) return true;
+        for (size_t i = done; i < batch.size(); ++i) {
+            inflight[batch[i]].uses.clear();
+            free_slots.push_back(batch[i]);
+        }
+        error = e.empty() ? "PleReader: submit failed" : e;
+        return false;
+    }
+
     bool finish(const Completion& c) {
         const uint32_t s = (uint32_t) c.tag;
         Job& j = inflight[s];
@@ -161,7 +198,7 @@ struct PleReader::Impl {
         if (it != tickets.end() && it->second.pending > 0) --it->second.pending;
         j.uses.clear();
         free_slots.push_back(s);
-        return pump();
+        return threaded || pump();                 // the worker pumps at the top of its loop, without `mu`
     }
 
     /// Completions (or wake packets) just returned by `file.wait`, applying fault injection.
@@ -208,7 +245,7 @@ struct PleReader::Impl {
         for (;;) {
             cv_work.wait(lk, [&] { return stop || !queue.empty() || busy(); });
             if (stop && !busy()) break;
-            if (error.empty() && !pump() && error.empty()) error = "PleReader: submit failed";
+            if (error.empty() && !pump_worker(lk) && error.empty()) error = "PleReader: submit failed";
             if (!delayed.empty() && !release_delayed() && error.empty()) error = "PleReader: read failed";
             if (!error.empty()) {
                 cv_done.notify_all();
@@ -237,7 +274,7 @@ bool PleReader::open(const std::string& path, uint64_t table_offset, uint64_t n_
                      uint64_t cache_rows, std::string& err, bool io_thread) {
     close();
     if (max_inflight == 0 || max_inflight > 1024) { err = "PleReader: max_inflight must be 1..1024"; return false; }
-    if (!impl_->file.open(path, err)) return false;
+    if (!impl_->file.open(path, err, max_inflight)) return false;
     if (table_offset + n_rows * (uint64_t) ROW_BYTES > impl_->file.size()) {
         err = "PleReader: the table extends past the end of " + path;
         close();
@@ -343,8 +380,9 @@ PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_
     ts.pending = (uint32_t) jobs.size();
     for (Job& j : jobs) m.queue.push_back(std::move(j));
     if (m.threaded) {
+        const bool queued = ts.pending > 0;        // read under `mu`: the worker updates it once unlocked
         lk.unlock();
-        if (ts.pending > 0) {
+        if (queued) {
             m.cv_work.notify_one();
             m.file.wake();                         // in case the worker is blocked in the port
         }
@@ -390,6 +428,7 @@ void PleReader::reset_stats() {
     impl_->stats = ReaderStats{};
     impl_->ring_pos = 0;
 }
+const char* PleReader::backend() const { return impl_->file.backend(); }
 uint64_t PleReader::cache_capacity() const { return impl_->cache.sets * WAYS; }
 uint64_t PleReader::cache_size() const { return impl_->cache.used; }
 
