@@ -303,6 +303,12 @@ if(STRATA_ENABLE_CUDA)
   target_link_libraries(s2_gemv_q8_parity PRIVATE strata_kernels CUDA::cudart)
   add_test(NAME s2_gemv_q8_parity COMMAND s2_gemv_q8_parity --selftest)
 
+  # issue #52: the MTP draft layer's expert kernel with negative Q2_0 scales (tools/mtp_pack.py --q2-search)
+  add_executable(s2_grouped_parity src/kernels/s2_grouped_parity.cpp)
+  target_include_directories(s2_grouped_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(s2_grouped_parity PRIVATE strata_kernels CUDA::cudart)
+  add_test(NAME s2_grouped_parity COMMAND s2_grouped_parity --selftest)
+
   add_executable(sampler_parity src/kernels/sampler_parity.cpp)
   target_include_directories(sampler_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(sampler_parity PRIVATE strata_kernels CUDA::cudart)
