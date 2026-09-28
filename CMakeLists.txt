@@ -536,6 +536,12 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
+  if(STRATA_BUILD_TESTS)
+    # O8d (#30): the AVX-512 i-quant kernels' builds, bitwise against each other and against ggml (synthetic, CPU)
+    add_executable(iq512_test src/kernels/cpu/iq512_test.cpp)
+    target_link_libraries(iq512_test PRIVATE strata_kernels_cpu)
+    add_test(NAME iq512_test COMMAND iq512_test)
+  endif()
   if(STRATA_ENABLE_CUDA)
     # prompt-speed plan step 2b: llama.cpp's MMQ kernels (ggml-cuda, MIT) for the prompt path's experts, compiled
     # from the same checkout as ggml above - only mmq.cuh's instances for the packs' types and the quantizer, with

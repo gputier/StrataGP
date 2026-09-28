@@ -8,6 +8,11 @@
 namespace strata::kernels::cpu {
 
 bool iq512_supported(int ggml_type) noexcept;
+/// O8d (#30): which build of the kernels runs, all bitwise the same: 0 = gathered grid lookups on a 64-byte-aligned
+/// copy of the activations (the default), 1 = the gathers on the activations in place (STRATA_IQ512_NOPACK=1),
+/// 2 = the previous kernel, scalar lookups (STRATA_OLD_IQ512=1).  For tests and benchmarks; set it while no row runs.
+void iq512_set_path(int path) noexcept;
+int iq512_path() noexcept;
 /// ff[t][r] = silu(gate_r . a[t]) * (up_r . a[t]), rows [r0, r1); gate rows at blob, up rows at blob + up_off.
 void iq512_gu_rows(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
                    int nt, float* const* ff, int r0, int r1);
