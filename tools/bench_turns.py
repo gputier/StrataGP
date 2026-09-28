@@ -63,6 +63,8 @@ def main(argv=None) -> int:
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--think", default="high", choices=["none", "low", "medium", "high"])
     ap.add_argument("--send-reasoning", action="store_true", help="send past answers back with their reasoning")
+    ap.add_argument("--salt", default=None, help="a line put before the document (default: the time), so a second "
+                                                 "run is a new conversation the engine's cache knows nothing of")
     ap.add_argument("--json", help="also write the rows to this file")
     a = ap.parse_args(argv)
     base = f"http://{a.host}:{a.port}"
@@ -71,7 +73,9 @@ def main(argv=None) -> int:
         headers["Authorization"] = "Bearer " + a.api_key
     doc = (ROOT / "docs" / "AUDIT-PERF.md").read_text(encoding="utf-8")
     doc = (doc * (a.context_chars // max(1, len(doc)) + 1))[:a.context_chars]
-    messages = [{"role": "user", "content": doc + "\n\nWhat does this document recommend first, and why?"}]
+    salt = a.salt if a.salt is not None else f"run {time.time():.3f}"
+    question = "\n\nWhat does this document recommend first, and why?"
+    messages = [{"role": "user", "content": f"[{salt}]\n" + doc + question}]
     rows = []
     print(f"{'turn':>4} {'first text s':>12} {'turn s':>8} {'prompt tok':>10} {'reused':>8} {'prompt ms':>10} "
           f"{'decode tok/s':>12}")
