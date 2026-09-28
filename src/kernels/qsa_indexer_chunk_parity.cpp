@@ -7,7 +7,8 @@
 // chunk at a time; after every chunk the two copies must be BITWISE equal, every byte of every buffer - including
 // the rows neither should have touched.  Chunks of 1..7 cells and longer ones, starting at every alignment to
 // the 4-cell block, one reaching past the capacity (those cells are ignored), with and without the multimodal
-// position table, and a capacity that is not a multiple of four.
+// position table, and a capacity that is not a multiple of four.  With --idx-fp16 (O6, #21) the pooling also keeps
+// an fp16 shadow of the pooled rows and the spare; the "fp16 shadow" cases compare it too.
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/qsa.hpp"
@@ -39,17 +40,28 @@ constexpr int D = 128, R = 4;
 struct Bufs {
     float *tail = nullptr, *dead = nullptr, *pooled = nullptr;
     int32_t* block_pos = nullptr;
+    uint16_t *pooled16 = nullptr, *dead16 = nullptr;   // O6: the fp16 shadow, when the case keeps one
     int64_t rows = 0;
-    void alloc(int64_t max_cells) {
+    void alloc(int64_t max_cells, bool shadow) {
         rows = max_cells / R + 1;
         tail = dalloc<float>((size_t) (R - 1) * D);
         dead = dalloc<float>(D);
         pooled = dalloc<float>((size_t) rows * D);
         block_pos = dalloc<int32_t>(1);
+        if (shadow) {
+            pooled16 = dalloc<uint16_t>((size_t) rows * D);
+            dead16 = dalloc<uint16_t>(D);
+        }
     }
-    k::QsaIndexerBuffers view() const { return {tail, dead, pooled, block_pos}; }
+    k::QsaIndexerBuffers view() const {
+        k::QsaIndexerBuffers v{tail, dead, pooled, block_pos};
+        v.pooled16 = pooled16;
+        v.dead16 = dead16;
+        return v;
+    }
+    size_t shadow_bytes() const { return pooled16 ? (size_t) (rows * D + D) * 2 : 0; }
     std::vector<uint8_t> bytes() const {
-        std::vector<uint8_t> h((size_t) ((R - 1) * D + D + rows * D) * 4 + 4);
+        std::vector<uint8_t> h((size_t) ((R - 1) * D + D + rows * D) * 4 + 4 + shadow_bytes());
         uint8_t* p = h.data();
         ck(cudaMemcpy(p, tail, (size_t) (R - 1) * D * 4, cudaMemcpyDeviceToHost), "d2h tail");
         p += (size_t) (R - 1) * D * 4;
@@ -58,6 +70,12 @@ struct Bufs {
         ck(cudaMemcpy(p, pooled, (size_t) rows * D * 4, cudaMemcpyDeviceToHost), "d2h pooled");
         p += (size_t) rows * D * 4;
         ck(cudaMemcpy(p, block_pos, 4, cudaMemcpyDeviceToHost), "d2h block_pos");
+        if (pooled16 != nullptr) {
+            p += 4;
+            ck(cudaMemcpy(p, pooled16, (size_t) rows * D * 2, cudaMemcpyDeviceToHost), "d2h pooled16");
+            p += (size_t) rows * D * 2;
+            ck(cudaMemcpy(p, dead16, (size_t) D * 2, cudaMemcpyDeviceToHost), "d2h dead16");
+        }
         return h;
     }
     void fill(const std::vector<uint8_t>& h) {
@@ -69,12 +87,18 @@ struct Bufs {
         ck(cudaMemcpy(pooled, p, (size_t) rows * D * 4, cudaMemcpyHostToDevice), "h2d pooled");
         p += (size_t) rows * D * 4;
         ck(cudaMemcpy(block_pos, p, 4, cudaMemcpyHostToDevice), "h2d block_pos");
+        if (pooled16 != nullptr) {
+            p += 4;
+            ck(cudaMemcpy(pooled16, p, (size_t) rows * D * 2, cudaMemcpyHostToDevice), "h2d pooled16");
+            p += (size_t) rows * D * 2;
+            ck(cudaMemcpy(dead16, p, (size_t) D * 2, cudaMemcpyHostToDevice), "h2d dead16");
+        }
     }
 };
 
 // one sequence: `cells` random keys appended in the chunks `sizes` (cycled), per cell into `a`, per chunk into `b`
 void run_case(const char* name, int64_t max_cells, int64_t cells, const std::vector<int64_t>& sizes, bool mrope,
-              uint32_t seed, cudaStream_t cs) {
+              uint32_t seed, cudaStream_t cs, bool shadow = false) {
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> u(-1.0f, 1.0f);
     std::uniform_int_distribution<int> dec(-3, 2);
@@ -106,8 +130,8 @@ void run_case(const char* name, int64_t max_cells, int64_t cells, const std::vec
     }
     k::mrope_table_set(tab);
     Bufs a, b;
-    a.alloc(max_cells);
-    b.alloc(max_cells);
+    a.alloc(max_cells, shadow);
+    b.alloc(max_cells, shadow);
     std::vector<uint8_t> junk(a.bytes().size());
     for (uint8_t& x : junk) x = (uint8_t) rng();
     for (size_t i = 0; i + 4 <= junk.size(); i += 4) {   // finite floats: the kernels never read garbage rows, but
@@ -145,7 +169,10 @@ void run_case(const char* name, int64_t max_cells, int64_t cells, const std::vec
                 (long long) cells, (long long) chunks, (long long) max_cells);
     cudaFree(raw); cudaFree(gamma); cudaFree(pos);
     if (tab) cudaFree(tab);
-    for (Bufs* x : {&a, &b}) { cudaFree(x->tail); cudaFree(x->dead); cudaFree(x->pooled); cudaFree(x->block_pos); }
+    for (Bufs* x : {&a, &b}) {
+        cudaFree(x->tail); cudaFree(x->dead); cudaFree(x->pooled); cudaFree(x->block_pos);
+        if (x->pooled16) { cudaFree(x->pooled16); cudaFree(x->dead16); }
+    }
 }
 }  // namespace
 
@@ -164,6 +191,8 @@ int main(int argc, char** argv) {
     run_case("long chunks, multimodal positions", 12288, 12000, {1023, 4096, 7, 2048}, true, 4, cs);
     run_case("past the capacity (ignored cells)", 1026, 1400, {100, 333, 600, 1, 366}, false, 5, cs);
     run_case("capacity not a multiple of four", 1023, 1023, {17, 64, 3, 1000}, true, 6, cs);
+    run_case("fp16 shadow (--idx-fp16), small chunks", 4096, 700, {1, 2, 3, 5, 7, 1, 4, 6}, false, 7, cs, true);
+    run_case("fp16 shadow (--idx-fp16), prompt chunks", 20000, 12000, {3, 8192, 257, 4096}, true, 8, cs, true);
     std::printf("qsa_indexer_chunk_parity: %s\n", g_fail ? "FAILED" : "OK");
     return g_fail ? 1 : 0;
 }

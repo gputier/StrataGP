@@ -160,7 +160,8 @@ namespace {
 __global__ void append_chunk(const float* __restrict__ raw, int cell0, int b0, int spare, int spare_row,
                              int pos_base, const float* __restrict__ gamma, float epsilon,
                              const float* __restrict__ tail, float* __restrict__ dead, float* __restrict__ pooled,
-                             float theta_scale, const int32_t* __restrict__ mtab) {
+                             float theta_scale, const int32_t* __restrict__ mtab,
+                             uint16_t* __restrict__ pooled16, uint16_t* __restrict__ dead16) {
     const int d = threadIdx.x;
     const bool is_spare = spare && blockIdx.x == 0;
     const int b = is_spare ? 0 : b0 + int(blockIdx.x) - spare;
@@ -210,13 +211,24 @@ __global__ void append_chunk(const float* __restrict__ raw, int cell0, int b0, i
     } else {
         pooled[std::size_t(b) * D + d] = y;
     }
+    if (pooled16 != nullptr) {   // O6 (#21): the fp16 shadow of the rows written above, as `append` keeps it
+        const uint16_t y16 = f16_from_f32(y);
+        if (is_spare) {
+            dead16[d] = y16;
+            if (spare_row) pooled16[d] = y16;
+        } else {
+            pooled16[std::size_t(b) * D + d] = y16;
+        }
+    }
 }
 __global__ void append_chunk_tail(const float* __restrict__ raw, int cell0, int n, int last_b, int pos_base,
                                   float* __restrict__ tail, const float* __restrict__ dead,
-                                  float* __restrict__ pooled, int32_t* __restrict__ block_pos) {
+                                  float* __restrict__ pooled, int32_t* __restrict__ block_pos,
+                                  uint16_t* __restrict__ pooled16) {
     const int d = threadIdx.x;
     if (last_b >= 0) {
         pooled[std::size_t(last_b + 1) * D + d] = dead[d];
+        if (pooled16 != nullptr) pooled16[std::size_t(last_b + 1) * D + d] = f16_from_f32(dead[d]);
         if (d == 0) *block_pos = pos_base + R * last_b;
     }
     const int last = cell0 + n - 1;
@@ -244,6 +256,18 @@ void native_qsa_indexer_append_chunk(const float* raw, int64_t n, int64_t cell0,
     for (const auto& span : spans) validate(span);
     for (int i = 0; i < 6; ++i) for (int j = i + 1; j < 6; ++j)
         if (overlaps(spans[i], spans[j])) throw std::invalid_argument("native QSA indexer buffers overlap");
+    // O6 (#21, --idx-fp16): the chunk keeps the fp16 shadow as the per-cell kernel does
+    if ((b.pooled16 == nullptr) != (b.dead16 == nullptr))
+        throw std::invalid_argument("native QSA indexer: the fp16 shadow needs both pooled16 and dead16");
+    if (b.pooled16 != nullptr) {
+        const Span shadow[] = {{b.pooled16,std::size_t(max_cells/R+1)*D*2},{b.dead16,D*2}};
+        for (const auto& span : shadow) {
+            validate(span);
+            for (const auto& other : spans)
+                if (overlaps(span, other)) throw std::invalid_argument("native QSA indexer buffers overlap");
+        }
+        if (overlaps(shadow[0], shadow[1])) throw std::invalid_argument("native QSA indexer buffers overlap");
+    }
     const float theta_scale = powf(freq_base, -2.0f / ROT);
     const int64_t end = cell0 + n;
     const int spare = cell0 == 0 ? 1 : 0;
@@ -251,9 +275,10 @@ void native_qsa_indexer_append_chunk(const float* raw, int64_t n, int64_t cell0,
     const auto cs = static_cast<cudaStream_t>(stream);
     if (spare + completed > 0)
         append_chunk<<<unsigned(spare + completed),THREADS,0,cs>>>(raw,int(cell0),int(cell0/R),spare,
-            completed == 0 ? 1 : 0,pos_base,gamma,epsilon,b.tail,b.dead,b.pooled,theta_scale,mrope_table());
+            completed == 0 ? 1 : 0,pos_base,gamma,epsilon,b.tail,b.dead,b.pooled,theta_scale,mrope_table(),
+            b.pooled16,b.dead16);
     append_chunk_tail<<<1,D,0,cs>>>(raw,int(cell0),int(n),completed > 0 ? int(end/R-1) : -1,pos_base,b.tail,
-        b.dead,b.pooled,b.block_pos);
+        b.dead,b.pooled,b.block_pos,b.pooled16);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
