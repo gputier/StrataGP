@@ -79,6 +79,7 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     s.k = k;
 
     gdn_buffers_init(g, take(gdn_buffers_bytes(g)), s.gdn);
+    s.gdn_wide = s.gdn.state;       // repointed per layer from here on; its own slice stays free
     s.gdn_state = (float*) take((uint64_t) g.n_gdn_layers() * gdn_state_floats(g) * 4);
 
     // the 12 QSA states are separate allocations carved from one arena, because `QsaState` is a struct of

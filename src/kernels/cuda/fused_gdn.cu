@@ -4,6 +4,7 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 
@@ -14,7 +15,11 @@ constexpr int S = 128;          // state size (rows = cols = 128)
 constexpr int RG = 4;           // row groups
 constexpr int RPG = S / RG;     // 32 rows per thread
 
-__global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(float* __restrict__ state, const float* __restrict__ q,
+std::atomic<bool> g_state_bf16{false};
+
+// St = float (the default) or uint16_t (the BF16 state of issue #53): only the state's load and store differ.
+template <typename St>
+__global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(St* __restrict__ state, const float* __restrict__ q,
                                                                const float* __restrict__ k, const float* __restrict__ v,
                                                                const float* __restrict__ gate,
                                                                const float* __restrict__ beta,
@@ -31,10 +36,10 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(float* __restrict
     const int qh = head % h_k;
     if (tid < S) { sk[tid] = k[qh * S + tid]; sq[tid] = q[qh * S + tid]; }
     float s[RPG];
-    float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+    St* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
     const size_t row_stride = (size_t) h_v * S;
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+    for (int r = 0; r < RPG; ++r) s[r] = gdn_state_load(base + r * row_stride);
     __syncthreads();
     const float g = __expf(gate[head]);
     float kv = 0.0f;
@@ -49,7 +54,7 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(float* __restrict
     for (int r = 0; r < RPG; ++r) {
         s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
         o = fmaf(s[r], sq[rg * RPG + r], o);
-        base[r * row_stride] = s[r];
+        gdn_state_store(base + r * row_stride, s[r]);
     }
     __syncthreads();                      // every thread has read red[] for kv_col
     red[rg][col] = o;
@@ -194,7 +199,9 @@ __global__ void __launch_bounds__(AB_THREADS) gdn_ab_row_kernel(const float* __r
 constexpr int GC = 4;                             // blocks per head
 constexpr int GCW = S / GC;                       // 32 columns per block
 
-__global__ void __launch_bounds__(GCW * RG) gdn_step_norm_cluster_kernel(float* __restrict__ state,
+// St as in gdn_step_norm_kernel (#53): only the state's load and store differ.
+template <typename St>
+__global__ void __launch_bounds__(GCW * RG) gdn_step_norm_cluster_kernel(St* __restrict__ state,
                                                                          const float* __restrict__ q,
                                                                          const float* __restrict__ k,
                                                                          const float* __restrict__ v,
@@ -217,10 +224,10 @@ __global__ void __launch_bounds__(GCW * RG) gdn_step_norm_cluster_kernel(float* 
     const int qh = head % h_k;
     if (tid < S) { sk[tid] = k[qh * S + tid]; sq[tid] = q[qh * S + tid]; }
     float s[RPG];
-    float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+    St* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
     const size_t row_stride = (size_t) h_v * S;
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+    for (int r = 0; r < RPG; ++r) s[r] = gdn_state_load(base + r * row_stride);
     __syncthreads();
     const float g = __expf(gate[head]);
     float kv = 0.0f;
@@ -235,7 +242,7 @@ __global__ void __launch_bounds__(GCW * RG) gdn_step_norm_cluster_kernel(float* 
     for (int r = 0; r < RPG; ++r) {
         s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
         o = fmaf(s[r], sq[rg * RPG + r], o);
-        base[r * row_stride] = s[r];
+        gdn_state_store(base + r * row_stride, s[r]);
     }
     __syncthreads();                              // every thread has read red[] for kv_col
     red[rg][c] = o;
@@ -262,10 +269,59 @@ __global__ void __launch_bounds__(GCW * RG) gdn_step_norm_cluster_kernel(float* 
 #endif
 }
 
+template <typename St>
 bool step_cluster_ready() {
-    static const bool ready = cluster_launchable(gdn_step_norm_cluster_kernel, dim3(GCW, RG), GC);
+    static const bool ready = cluster_launchable(gdn_step_norm_cluster_kernel<St>, dim3(GCW, RG), GC);
     return ready;
 }
+__global__ void gdn_state_widen_kernel(const uint16_t* __restrict__ src, float* __restrict__ dst, int64_t n) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
+        dst[i] = gdn_state_load(src + i);
+}
+
+__global__ void gdn_state_narrow_kernel(const float* __restrict__ src, uint16_t* __restrict__ dst, int64_t n) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
+        gdn_state_store(dst + i, src[i]);
+}
+
+template <typename St>
+void launch_step_norm(St* state, const float* q, const float* k, const float* v, const float* gate, const float* beta,
+                      const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, void* stream) {
+    if (!state || !q || !k || !v || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v <= 0 || h_v % h_k) {
+        std::fprintf(stderr, "fused_gdn_step_norm: invalid arguments\n");
+        std::exit(1);
+    }
+    if (!old_gdn_step().on() && step_cluster_ready<St>()) {   // issue #26 (O7)
+        cudaLaunchAttribute at{};
+        at.id = cudaLaunchAttributeClusterDimension;
+        at.val.clusterDim.x = GC;
+        at.val.clusterDim.y = 1;
+        at.val.clusterDim.z = 1;
+        cudaLaunchConfig_t cfg{};
+        cfg.gridDim = dim3((unsigned) (h_v * GC));
+        cfg.blockDim = dim3(GCW, RG);
+        cfg.stream = (cudaStream_t) stream;
+        cfg.attrs = &at;
+        cfg.numAttrs = 1;
+        const cudaError_t le = cudaLaunchKernelEx(&cfg, gdn_step_norm_cluster_kernel<St>, state, q, k, v, gate, beta, z,
+                                                  gamma, eps, y, h_k, h_v);
+        if (le != cudaSuccess) {
+            std::fprintf(stderr, "fused_gdn_step_norm (cluster; STRATA_OLD_GDN_STEP=1 avoids it): %s\n",
+                         cudaGetErrorString(le));
+            std::exit(1);
+        }
+    } else {
+        gdn_step_norm_kernel<St><<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, q, k, v, gate, beta,
+                                                                                           z, gamma, eps, y, h_k, h_v);
+    }
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "fused_gdn_step_norm: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
+
+unsigned blocks_1d(int64_t n) { return (unsigned) ((n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096); }
 
 }  // namespace
 
@@ -299,42 +355,39 @@ void fused_gdn_ab(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
 void fused_gdn_step_norm(float* state, const float* q, const float* k, const float* v, const float* gate,
                          const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k, int h_v,
                          void* stream) {
-    if (!state || !q || !k || !v || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v <= 0 || h_v % h_k) {
-        std::fprintf(stderr, "fused_gdn_step_norm: invalid arguments\n");
-        std::exit(1);
-    }
-    if (fused_gdn_step_cluster_path()) {
-        cudaLaunchAttribute at{};
-        at.id = cudaLaunchAttributeClusterDimension;
-        at.val.clusterDim.x = GC;
-        at.val.clusterDim.y = 1;
-        at.val.clusterDim.z = 1;
-        cudaLaunchConfig_t cfg{};
-        cfg.gridDim = dim3((unsigned) (h_v * GC));
-        cfg.blockDim = dim3(GCW, RG);
-        cfg.stream = (cudaStream_t) stream;
-        cfg.attrs = &at;
-        cfg.numAttrs = 1;
-        const cudaError_t le = cudaLaunchKernelEx(&cfg, gdn_step_norm_cluster_kernel, state, q, k, v, gate, beta, z,
-                                                  gamma, eps, y, h_k, h_v);
-        if (le != cudaSuccess) {
-            std::fprintf(stderr, "fused_gdn_step_norm (cluster; STRATA_OLD_GDN_STEP=1 avoids it): %s\n",
-                         cudaGetErrorString(le));
-            std::exit(1);
-        }
-    } else {
-        gdn_step_norm_kernel<<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, q, k, v, gate, beta, z,
-                                                                                       gamma, eps, y, h_k, h_v);
-    }
+    if (gdn_state_bf16_enabled())   // #53: the slice's first half holds the BF16 state
+        launch_step_norm(reinterpret_cast<uint16_t*>(state), q, k, v, gate, beta, z, gamma, eps, y, h_k, h_v, stream);
+    else
+        launch_step_norm(state, q, k, v, gate, beta, z, gamma, eps, y, h_k, h_v, stream);
+}
+
+void gdn_state_bf16_set_enabled(bool enabled) { g_state_bf16.store(enabled, std::memory_order_relaxed); }
+bool gdn_state_bf16_enabled() { return g_state_bf16.load(std::memory_order_relaxed); }
+
+void fused_gdn_step_norm_bf16(uint16_t* state, const float* q, const float* k, const float* v, const float* gate,
+                              const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k,
+                              int h_v, void* stream) {
+    launch_step_norm(state, q, k, v, gate, beta, z, gamma, eps, y, h_k, h_v, stream);
+}
+
+void gdn_state_widen(const uint16_t* src, float* dst, int64_t n, void* stream) {
+    if (!src || !dst || n < 0) { std::fprintf(stderr, "gdn_state_widen: invalid arguments\n"); std::exit(1); }
+    if (n == 0) return;
+    gdn_state_widen_kernel<<<blocks_1d(n), 256, 0, (cudaStream_t) stream>>>(src, dst, n);
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "fused_gdn_step_norm: %s\n", cudaGetErrorString(e));
-        std::exit(1);
-    }
+    if (e != cudaSuccess) { std::fprintf(stderr, "gdn_state_widen: %s\n", cudaGetErrorString(e)); std::exit(1); }
+}
+
+void gdn_state_narrow(const float* src, uint16_t* dst, int64_t n, void* stream) {
+    if (!src || !dst || n < 0) { std::fprintf(stderr, "gdn_state_narrow: invalid arguments\n"); std::exit(1); }
+    if (n == 0) return;
+    gdn_state_narrow_kernel<<<blocks_1d(n), 256, 0, (cudaStream_t) stream>>>(src, dst, n);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { std::fprintf(stderr, "gdn_state_narrow: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }
 
 bool fused_gdn_step_cluster_path() {
-    return !old_gdn_step().on() && step_cluster_ready();
+    return !old_gdn_step().on() && step_cluster_ready<float>();
 }
 
 }  // namespace strata::kernels

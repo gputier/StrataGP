@@ -34,4 +34,46 @@ void fused_gdn_step_norm(float* state, const float* q, const float* k, const flo
                          const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k, int h_v,
                          void* stream);
 
+// ---- Issue #53 (S5), OPT-IN: the recurrent state stored as BF16 (`--gdn-state-bf16`, default off).
+//
+// The step reads and writes the whole state every token (6.3 MB per layer in FP32); in BF16 that traffic halves.
+// Only the STORAGE changes: a load widens (exact), all the arithmetic is the FP32 arithmetic above, and a store
+// rounds to nearest even.  A layer's state slice keeps its FP32 size and its layout ([row][head][col]); the BF16
+// state is the first half of the slice and the conv history stays where it was, so the session arena, the
+// checkpoints and the plan's budget do not move.  Rounding once per step is a numerical change (drift over long
+// sequences is the risk the issue names), hence opt-in; `gdn_state_bf16_parity` measures it against FP32.
+//
+// The switch is process-wide and must be set before any session or graph is captured, like
+// `native_gdn_set_enabled`: `fused_gdn_step_norm` and `gdn_step_norm_multi` then read their `float* state` as
+// the BF16 slice.  Only the fused native step and the verify/commit kernels know the BF16 form; the other token
+// steps refuse it (`layer.cpp`), and the prompt path runs its FP32 recurrence on a widened copy
+// (`gdn_state_widen` / `gdn_state_narrow`).
+void gdn_state_bf16_set_enabled(bool enabled);
+bool gdn_state_bf16_enabled();
+
+/// `fused_gdn_step_norm` on a BF16 state, whatever the switch says (the parity test runs both forms side by side).
+void fused_gdn_step_norm_bf16(uint16_t* state, const float* q, const float* k, const float* v, const float* gate,
+                              const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k,
+                              int h_v, void* stream);
+
+#if defined(__CUDACC__)
+/// Round to nearest even, as `bf16_bits.hpp` does, except that a NaN stays a NaN instead of carrying into -0.
+__device__ __forceinline__ uint16_t gdn_bf16_rne(float v) {
+    const uint32_t u = __float_as_uint(v);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t) ((u >> 16) | 0x0040u);
+    return (uint16_t) ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+/// One state element's load and store for either storage: FP32 is the plain access, so a kernel templated on it
+/// compiles to what it was before the BF16 form existed.
+__device__ __forceinline__ float gdn_state_load(const float* p) { return *p; }
+__device__ __forceinline__ float gdn_state_load(const uint16_t* p) { return __uint_as_float((uint32_t) *p << 16); }
+__device__ __forceinline__ void gdn_state_store(float* p, float v) { *p = v; }
+__device__ __forceinline__ void gdn_state_store(uint16_t* p, float v) { *p = gdn_bf16_rne(v); }
+#endif
+
+/// dst[i] = the BF16 src[i] as FP32 (exact).
+void gdn_state_widen(const uint16_t* src, float* dst, int64_t n, void* stream);
+/// dst[i] = src[i] rounded to BF16, nearest even (a NaN stays a NaN).
+void gdn_state_narrow(const float* src, uint16_t* dst, int64_t n, void* stream);
+
 }  // namespace strata::kernels

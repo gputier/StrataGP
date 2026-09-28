@@ -412,6 +412,14 @@ if(STRATA_ENABLE_CUDA)
   target_link_libraries(s_gemv_q8k_parity PRIVATE strata_kernels CUDA::cudart)
   add_test(NAME s_gemv_q8k_parity COMMAND s_gemv_q8k_parity --selftest)
 
+  # issue #53: the opt-in BF16 GDN state against FP32 (bit-exact by construction, then the drift over 4096 tokens);
+  # --cpu-drift is the same drift on a CPU emulation, which runs without a GPU
+  add_executable(gdn_state_bf16_parity src/kernels/gdn_state_bf16_parity.cpp)
+  target_include_directories(gdn_state_bf16_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(gdn_state_bf16_parity PRIVATE strata_kernels CUDA::cudart)
+  add_test(NAME gdn_state_bf16_parity COMMAND gdn_state_bf16_parity --selftest)
+  add_test(NAME gdn_state_bf16_drift_cpu COMMAND gdn_state_bf16_parity --cpu-drift)
+
   add_executable(qsa_parity src/kernels/qsa_parity.cpp)
   target_include_directories(qsa_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(qsa_parity PRIVATE strata_kernels CUDA::cudart)
@@ -743,5 +751,14 @@ if(STRATA_BUILD_TESTS)
   # tests/ holds the model-file tests; it is not part of every checkout
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     add_subdirectory(tests)
+  endif()
+  # issue #51: tools/routing_locality.py on synthetic routing traces; issue #53: tools/logits_kl.py on synthetic
+  # logits dumps (Python 3 + numpy)
+  find_program(STRATA_PYTHON3 NAMES python3 python)
+  if(STRATA_PYTHON3)
+    add_test(NAME routing_locality_test COMMAND ${STRATA_PYTHON3} -m unittest tools.test_routing_locality
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME logits_kl_test COMMAND ${STRATA_PYTHON3} -m unittest tools.test_logits_kl
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
   endif()
 endif()

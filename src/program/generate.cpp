@@ -30,6 +30,7 @@
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_gdn.hpp"
+#include "strata/kernels/fused_gdn.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
@@ -211,6 +212,7 @@ struct Options {
     bool no_fast_attn = false;         ///< plan v0.3 P3 A/B: gather + one-block-per-head QSA attention
     bool no_publish_kernel = false;    ///< plan v0.3 P3 A/B: memcpy nodes for the doorbell and QSA step
     bool no_fused_gdn = false;         ///< plan v0.3 P3 A/B: llama.cpp-layout GDN step + separate out norm
+    bool gdn_state_bf16 = false;       ///< issue #53 (S5), opt-in: the GDN recurrent state stored as BF16
     bool no_fast_select = false;       ///< plan v0.3 P7 A/B: FP64 row scores + bit-serial cell top-k
     bool idx_fp16 = false;             ///< O6 (#21): block scores from the fp16 shadow of the pooled keys (opt-in)
     /// Plan v0.3 P4: `--expert-cache auto` sizes the VRAM tier from what is free after the weights, the session
@@ -353,7 +355,8 @@ void usage() {
                  "  --dump-residual PATH write the final R (hc x n_embd, f32) for head bisection\n"
                  "  --dump-layers PATH   write R after EVERY layer, per position: the C1 bisection ladder\n"
                  "  --dump-halves PATH   write both halves' block_out and inject per layer: the half bisection\n"
-                 "  --dump-routing PATH  write the routed expert ids and weights per layer per position (P0.S8)\n"
+                 "  --dump-routing PATH  write the routed expert ids and weights per layer per position (P0.S8); a\n"
+                 "                       --spec window writes its committed tokens, weights 0 (tools/routing_locality.py)\n"
                  "  --no-capture         run the layers directly instead of replaying graphs\n"
                  "  --shared-late        A/B: shared expert after the CPU pool (default: overlapped with it)\n"
                  "  --keep-canonical     A/B: also load canonical copies of natively served tensors (more VRAM)\n"
@@ -374,6 +377,9 @@ void usage() {
                  "  --cvec-dir per-layer|single:L  each layer's own direction (default) or layer L's everywhere (project)\n"
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
+                 "  --gdn-state-bf16     opt-in (#53): keep the GDN recurrent state in BF16 (FP32 arithmetic, rounded\n"
+                 "                       at each store): half its traffic, some drift on long sequences. Needs the\n"
+                 "                       fused native GDN step (--native, not --no-fused-gdn)\n"
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
                  "                       the largest chunk up to 8192 whose buffers the expert cache can lend\n"
                  "  --prefill-dense-mmq  the prompt path's dense GGUF projections through MMQ (int8, q8_1 activations)\n"
@@ -467,7 +473,57 @@ struct Drive {
     /// needs no locking.  `d.layers` is the CURRENT layer on entry (the adapter increments it as it walks the
     /// blob), which is why the layer index comes from there rather than from a counter of our own.
     std::FILE* routing = nullptr;
+    /// Issue #51: a verify window's routing waits here until its acceptance is known, so that only the committed
+    /// tokens reach the trace, in position order - the same records the token path would have written, which
+    /// makes a --spec run (and a native pack, which decodes only in windows) traceable.  `win[(layer * MAXT + t)
+    /// * k + j]`, `win_n[layer]` tokens held.  The window publishes no weights: they are written as 0.
+    std::vector<int32_t> win;
+    std::vector<int32_t> win_n;
+    int64_t win_k = 0;
+    int64_t routing_records = 0;
 };
+
+constexpr int32_t kRoutingLayers = 48;   // the trace's layer range, as `drive_pool` checks it
+
+/// Holds one layer's ids for the tokens of one call (a whole window, or one group of a split one: a layer's
+/// groups arrive in token order).
+void routing_hold(Drive* t, const int32_t* ids, int64_t n_tok, int64_t k, int64_t layer) {
+    constexpr int MAXT = strata::kernels::kVerifyMaxT;
+    if (layer < 0 || layer >= kRoutingLayers || k < 1) return;
+    if (t->win_k != k) {
+        t->win_k = k;
+        t->win.assign((size_t) kRoutingLayers * MAXT * (size_t) k, -1);
+        t->win_n.assign(kRoutingLayers, 0);
+    }
+    for (int64_t i = 0; i < n_tok && t->win_n[(size_t) layer] < MAXT; ++i) {
+        const size_t at = ((size_t) layer * MAXT + (size_t) t->win_n[(size_t) layer]++) * (size_t) k;
+        std::memcpy(t->win.data() + at, ids + i * k, (size_t) k * sizeof(int32_t));
+    }
+}
+
+/// Writes the first `n_keep` tokens of the held window, each as its layers 0..47, then drops the window.
+void routing_commit(Drive& t, int n_keep) {
+    constexpr int MAXT = strata::kernels::kVerifyMaxT;
+    if (t.routing == nullptr || t.win_k < 1) return;
+    const std::vector<float> zeros((size_t) t.win_k, 0.0f);
+    for (int tok = 0; tok < n_keep && tok < MAXT; ++tok)
+        for (int32_t layer = 0; layer < kRoutingLayers; ++layer) {
+            if (tok >= t.win_n[(size_t) layer]) continue;
+            const int32_t rec[2] = {layer, (int32_t) t.win_k};
+            std::fwrite(rec, sizeof rec, 1, t.routing);
+            std::fwrite(t.win.data() + ((size_t) layer * MAXT + (size_t) tok) * (size_t) t.win_k, sizeof(int32_t),
+                        (size_t) t.win_k, t.routing);
+            std::fwrite(zeros.data(), sizeof(float), zeros.size(), t.routing);
+            ++t.routing_records;
+        }
+    std::fill(t.win_n.begin(), t.win_n.end(), 0);
+}
+
+/// Drops the held window unwritten: for the `ver.run` callers that never commit (serve's prompt windows and its
+/// spec loop), so their ids neither pile up nor reach the next `routing_commit` as another window's.
+void routing_drop(Drive& t) {
+    std::fill(t.win_n.begin(), t.win_n.end(), 0);
+}
 
 void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd, int64_t k,
                 float* out) {
@@ -495,6 +551,7 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
         std::fwrite(rec, sizeof rec, 1, t->routing);
         std::fwrite(ids, sizeof(int32_t), (size_t) k, t->routing);
         std::fwrite(weights, sizeof(float), (size_t) k, t->routing);
+        ++t->routing_records;
     }
 }
 
@@ -507,6 +564,7 @@ void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t 
     strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
     ++t->calls;
+    if (t->routing != nullptr) routing_hold(t, ids, n_tok, k, layer);
 }
 
 // ---- issue #31: what the watchdog prints before it stops a stalled engine
@@ -698,6 +756,8 @@ struct ConvStateSizes {
     size_t gdn = 0, ple = 0, tail = 0;
 };
 
+/// `gdn` is the DEVICE size of `gdn_state` (every layer's full FP32 slice), which is what the state hash walks; a
+/// checkpoint's GDN bytes are `gdn_runs` below, smaller with `--gdn-state-bf16`.
 ConvStateSizes conv_state_sizes(const strata::core::ModelGeometry& g) {
     ConvStateSizes z;
     z.gdn = (size_t) g.n_gdn_layers() *
@@ -708,30 +768,86 @@ ConvStateSizes conv_state_sizes(const strata::core::ModelGeometry& g) {
     return z;
 }
 
+/// Issue #53: with the BF16 state (`--gdn-state-bf16`) a GDN layer's slice is [BF16 state | unused half | conv
+/// history], and a checkpoint keeps only the two live runs, all the states then all the histories (~61 MB instead
+/// of ~118).  `run` = the state bytes kept per layer, `slice` = the layer's stride in `gdn_state`.
+struct GdnRuns {
+    size_t slice = 0, run = 0, conv = 0;
+    bool packed = false;
+    size_t bytes(const strata::core::ModelGeometry& g) const { return (size_t) g.n_gdn_layers() * (run + conv); }
+};
+
+GdnRuns gdn_runs(const strata::core::ModelGeometry& g) {
+    GdnRuns r;
+    const size_t st = (size_t) g.ssm_state_size * (size_t) g.ssm_v_heads * (size_t) g.ssm_state_size * sizeof(float);
+    r.conv = (size_t) g.ssm_conv_channels * (size_t) (g.ssm_d_conv - 1) * sizeof(float);
+    r.slice = st + r.conv;
+    r.packed = strata::kernels::gdn_state_bf16_enabled();
+    r.run = r.packed ? st / 2 : st;
+    return r;
+}
+
+/// The GDN state into a checkpoint's bytes: all of it, or the BF16 runs.  With a stream (issue #45's pool) the
+/// copies are only queued on it; without, they are synchronous.
+bool gdn_state_to_host(uint8_t* h, const float* dev, const strata::core::ModelGeometry& g, cudaStream_t stream = nullptr) {
+    const GdnRuns r = gdn_runs(g);
+    const size_t n = (size_t) g.n_gdn_layers();
+    const uint8_t* d = (const uint8_t*) dev;
+    if (stream != nullptr) {
+        if (!r.packed) return cudaMemcpyAsync(h, dev, n * r.slice, cudaMemcpyDeviceToHost, stream) == cudaSuccess;
+        return cudaMemcpy2DAsync(h, r.run, d, r.slice, r.run, n, cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
+               cudaMemcpy2DAsync(h + n * r.run, r.conv, d + (r.slice - r.conv), r.slice, r.conv, n,
+                                 cudaMemcpyDeviceToHost, stream) == cudaSuccess;
+    }
+    if (!r.packed) return cudaMemcpy(h, dev, n * r.slice, cudaMemcpyDeviceToHost) == cudaSuccess;
+    return cudaMemcpy2D(h, r.run, d, r.slice, r.run, n, cudaMemcpyDeviceToHost) == cudaSuccess &&
+           cudaMemcpy2D(h + n * r.run, r.conv, d + (r.slice - r.conv), r.slice, r.conv, n, cudaMemcpyDeviceToHost) ==
+               cudaSuccess;
+}
+
+/// And back.
+bool gdn_state_to_device(float* dev, const uint8_t* h, const strata::core::ModelGeometry& g, cudaStream_t stream = nullptr) {
+    const GdnRuns r = gdn_runs(g);
+    const size_t n = (size_t) g.n_gdn_layers();
+    uint8_t* d = (uint8_t*) dev;
+    if (stream != nullptr) {
+        if (!r.packed) return cudaMemcpyAsync(dev, h, n * r.slice, cudaMemcpyHostToDevice, stream) == cudaSuccess;
+        return cudaMemcpy2DAsync(d, r.slice, h, r.run, r.run, n, cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+               cudaMemcpy2DAsync(d + (r.slice - r.conv), r.slice, h + n * r.run, r.conv, r.conv, n,
+                                 cudaMemcpyHostToDevice, stream) == cudaSuccess;
+    }
+    if (!r.packed) return cudaMemcpy(dev, h, n * r.slice, cudaMemcpyHostToDevice) == cudaSuccess;
+    return cudaMemcpy2D(d, r.slice, h, r.run, r.run, n, cudaMemcpyHostToDevice) == cudaSuccess &&
+           cudaMemcpy2D(d + (r.slice - r.conv), r.slice, h + n * r.run, r.conv, r.conv, n, cudaMemcpyHostToDevice) ==
+               cudaSuccess;
+}
+
 /// Copies the running state out.  The caller has synchronized the device.  With a pool (issue #45): into one of its
-/// buffers, on its stream; without (STRATA_OLD_CKPT=1): into pageable vectors, synchronously.
+/// buffers, on its stream; without (STRATA_OLD_CKPT=1): into pageable vectors, synchronously.  The GDN part is
+/// `gdn_runs` either way (#53: only the live BF16 runs with --gdn-state-bf16).
 bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, const strata::core::ModelGeometry& g,
                      CkptPool* pool = nullptr) {
     const ConvStateSizes z = conv_state_sizes(g);
+    const size_t gdn = gdn_runs(g).bytes(g);
     if (pool != nullptr) {
         const size_t ple = ss.ple_hist != nullptr ? z.ple : 0, tails = z.tail * (size_t) g.n_qsa_layers();
-        pool->bytes = z.gdn + z.ple + tails;
+        pool->bytes = gdn + z.ple + tails;
         c.state = pool->take();
         c.ple_bytes = ple;
         if (c.state == nullptr) return false;
         uint8_t* p = c.state.get();
-        bool ok = cudaMemcpyAsync(p, ss.gdn_state, z.gdn, cudaMemcpyDeviceToHost, pool->stream) == cudaSuccess;
+        bool ok = gdn_state_to_host(p, ss.gdn_state, g, pool->stream);
         if (ple > 0)
-            ok = ok && cudaMemcpyAsync(p + z.gdn, ss.ple_hist, ple, cudaMemcpyDeviceToHost, pool->stream) == cudaSuccess;
+            ok = ok && cudaMemcpyAsync(p + gdn, ss.ple_hist, ple, cudaMemcpyDeviceToHost, pool->stream) == cudaSuccess;
         for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
-            ok = ok && cudaMemcpyAsync(p + z.gdn + ple + (size_t) i * z.tail, ss.qsa_states[i].idx_tail, z.tail,
+            ok = ok && cudaMemcpyAsync(p + gdn + ple + (size_t) i * z.tail, ss.qsa_states[i].idx_tail, z.tail,
                                        cudaMemcpyDeviceToHost, pool->stream) == cudaSuccess;
         return cudaStreamSynchronize(pool->stream) == cudaSuccess && ok;
     }
-    c.gdn.resize(z.gdn);
+    c.gdn.resize(gdn);
     c.ple.resize(ss.ple_hist != nullptr ? z.ple : 0);
     c.tails.resize(z.tail * (size_t) g.n_qsa_layers());
-    if (cudaMemcpy(c.gdn.data(), ss.gdn_state, z.gdn, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+    if (!gdn_state_to_host(c.gdn.data(), ss.gdn_state, g)) return false;
     if (!c.ple.empty() && cudaMemcpy(c.ple.data(), ss.ple_hist, z.ple, cudaMemcpyDeviceToHost) != cudaSuccess)
         return false;
     for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
@@ -745,15 +861,16 @@ bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, co
 bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss, const strata::core::ModelGeometry& g,
                         CkptPool* pool = nullptr) {
     const ConvStateSizes z = conv_state_sizes(g);
+    const size_t gdn = gdn_runs(g).bytes(g);
     if (c.state != nullptr) {   // saved into a pool's buffer (issue #45): back on its stream
         if (pool == nullptr || pool->stream == nullptr || (c.ple_bytes > 0 && ss.ple_hist == nullptr)) return false;
         if (cudaDeviceSynchronize() != cudaSuccess) return false;   // nothing may still be reading the state
         const uint8_t* p = c.state.get();
-        bool ok = cudaMemcpyAsync(ss.gdn_state, p, z.gdn, cudaMemcpyHostToDevice, pool->stream) == cudaSuccess;
+        bool ok = gdn_state_to_device(ss.gdn_state, p, g, pool->stream);
         if (c.ple_bytes > 0)
-            ok = ok && cudaMemcpyAsync(ss.ple_hist, p + z.gdn, c.ple_bytes, cudaMemcpyHostToDevice, pool->stream) == cudaSuccess;
+            ok = ok && cudaMemcpyAsync(ss.ple_hist, p + gdn, c.ple_bytes, cudaMemcpyHostToDevice, pool->stream) == cudaSuccess;
         for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
-            ok = ok && cudaMemcpyAsync(ss.qsa_states[i].idx_tail, p + z.gdn + c.ple_bytes + (size_t) i * z.tail, z.tail,
+            ok = ok && cudaMemcpyAsync(ss.qsa_states[i].idx_tail, p + gdn + c.ple_bytes + (size_t) i * z.tail, z.tail,
                                        cudaMemcpyHostToDevice, pool->stream) == cudaSuccess;
         if (cudaStreamSynchronize(pool->stream) != cudaSuccess || !ok) return false;
         const size_t L = c.ids.size();
@@ -761,8 +878,8 @@ bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss,
         ss.ple_prev[1] = L >= 1 ? c.ids[L - 1] : -1;
         return cudaDeviceSynchronize() == cudaSuccess;
     }
-    if (c.gdn.size() != z.gdn || c.tails.size() != z.tail * (size_t) g.n_qsa_layers()) return false;
-    if (cudaMemcpy(ss.gdn_state, c.gdn.data(), z.gdn, cudaMemcpyHostToDevice) != cudaSuccess) return false;
+    if (c.gdn.size() != gdn || c.tails.size() != z.tail * (size_t) g.n_qsa_layers()) return false;
+    if (!gdn_state_to_device(ss.gdn_state, c.gdn.data(), g)) return false;
     if (!c.ple.empty() && cudaMemcpy(ss.ple_hist, c.ple.data(), z.ple, cudaMemcpyHostToDevice) != cudaSuccess)
         return false;
     for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
@@ -1087,6 +1204,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-fast-attn") o.no_fast_attn = true;
         else if (a == "--no-publish-kernel") o.no_publish_kernel = true;
         else if (a == "--no-fused-gdn") o.no_fused_gdn = true;
+        else if (a == "--gdn-state-bf16") o.gdn_state_bf16 = true;
         else if (a == "--no-fast-select") o.no_fast_select = true;
         else {
             // An unknown flag is an ERROR and not a warning: a typo'd `--max-neww` that silently generated 16
@@ -1343,6 +1461,15 @@ int main(int argc, char** argv) {
     strata::kernels::shared_expert_set_native_bf16(o.native_bf16_extra);
     strata::kernels::native_moe_combine_set_enabled(o.native_moe_combine);
     strata::kernels::native_gdn_set_enabled(o.native_gdn);
+    // #53: the BF16 state is known to the fused native step, the verify/commit kernels and the prompt path only
+    if (o.gdn_state_bf16 && (!o.native_gdn || o.no_fused_gdn)) {
+        std::fprintf(stderr, "strata generate: --gdn-state-bf16 needs the fused native GDN step (--native or "
+                             "--native-gdn, without --no-fused-gdn)\n");
+        return 2;
+    }
+    strata::kernels::gdn_state_bf16_set_enabled(o.gdn_state_bf16);
+    if (o.gdn_state_bf16)
+        std::fprintf(stderr, "strata generate: GDN state in BF16 (opt-in, #53): FP32 arithmetic, rounded at each store\n");
     strata::kernels::native_router_set_enabled(o.native_router);
     strata::kernels::native_qsa_set_enabled(o.native_qsa);
     strata::kernels::native_qsa_indexer_set_enabled(o.native_qsa_indexer);
@@ -3168,6 +3295,7 @@ int main(int argc, char** argv) {
                     drive.d.experts = 0;
                     drive.d.failed = false;
                     apply_pending(false);   // lent slots refilled asynchronously (issue #42) as they land
+                    routing_drop(drive);
                     if (!ver.run(T, win.data(), q, &drive_pool_multi, &drive, outw.data(), e) || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
@@ -3390,6 +3518,7 @@ int main(int argc, char** argv) {
                                cudaMemcpyHostToDevice);
                 }
                 tr("window", p, T);
+                routing_drop(drive);
                 if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
@@ -4108,6 +4237,7 @@ int main(int argc, char** argv) {
             drive.d.experts = 0;
             drive.d.failed = false;
             apply_pending(false);
+            routing_drop(drive);   // nothing held but this window's ids reaches the commit below
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
@@ -4120,6 +4250,7 @@ int main(int argc, char** argv) {
             }
             int a = 0;
             while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+            routing_commit(drive, a + 1);   // #51: the committed tokens' routing, if --dump-routing
             if (first_window) {
                 first_window = false;
                 ttft_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
@@ -4239,7 +4370,7 @@ int main(int argc, char** argv) {
         std::fclose(routing);
         drive.routing = nullptr;
         std::printf("%-24s %s (%lld records of layer, k, ids, weights)\n", "routing dumped",
-                    o.dump_routing.c_str(), (long long) drive.calls);
+                    o.dump_routing.c_str(), (long long) drive.routing_records);
     }
     if (o.stage_timing) strata::core::stage_timing_report(g.n_layers);
 

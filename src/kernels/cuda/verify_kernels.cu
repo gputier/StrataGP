@@ -5,6 +5,8 @@
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/launch_grid.hpp"
 
+#include "strata/kernels/fused_gdn.hpp"
+
 #include <cuda_runtime.h>
 
 #include <cstdio>
@@ -193,7 +195,9 @@ __global__ void __launch_bounds__(ABM_THREADS) gdn_ab_multi_row_kernel(const flo
     if (two) ab_multi_out(acc1, is_beta, r, t1, h_v, dt, ssm_a, gate, beta);
 }
 
-__global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __restrict__ state,
+// St = float, or uint16_t for the BF16 state of issue #53 (fused_gdn.hpp): only the state's load and store differ.
+template <typename St>
+__global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(St* __restrict__ state,
                                                                      const float* __restrict__ hbuf, int C,
                                                                      const float* __restrict__ gate,
                                                                      const float* __restrict__ beta,
@@ -213,10 +217,10 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
     const int value_dim = S * h_v;
     const int n = n_keep ? *n_keep : T;
     float s[RPG];
-    float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+    St* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
     const size_t row_stride = (size_t) h_v * S;
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+    for (int r = 0; r < RPG; ++r) s[r] = gdn_state_load(base + r * row_stride);
     for (int t = 0; t < n; ++t) {
         const float* ht = hbuf + (size_t) t * C;
         __syncthreads();                // the previous token is done with sk/sq/red/wsum
@@ -257,7 +261,7 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
     }
     if (n_keep != nullptr && n > 0) {
 #pragma unroll
-        for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
+        for (int r = 0; r < RPG; ++r) gdn_state_store(base + r * row_stride, s[r]);
     }
 }
 
@@ -274,7 +278,9 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
 constexpr int GC = 4;                             // blocks per head
 constexpr int GCW = S / GC;                       // 32 columns per block
 
-__global__ void __launch_bounds__(GCW * RG) gdn_step_norm_multi_cluster_kernel(float* __restrict__ state,
+// St as in the kernel above (#53): only the state's load and store differ.
+template <typename St>
+__global__ void __launch_bounds__(GCW * RG) gdn_step_norm_multi_cluster_kernel(St* __restrict__ state,
                                                                                const float* __restrict__ hbuf, int C,
                                                                                const float* __restrict__ gate,
                                                                                const float* __restrict__ beta,
@@ -304,10 +310,10 @@ __global__ void __launch_bounds__(GCW * RG) gdn_step_norm_multi_cluster_kernel(f
     // kernel above would run it (reading past hbuf): stop here rather than silently run fewer tokens than it.
     if (n > kVerifyMaxT) __trap();
     float s[RPG];
-    float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+    St* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
     const size_t row_stride = (size_t) h_v * S;
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+    for (int r = 0; r < RPG; ++r) s[r] = gdn_state_load(base + r * row_stride);
     __cluster_barrier_wait();                     // every block of the cluster is running: DSMEM is live
     for (int t = 0; t < n; ++t) {
         const float* ht = hbuf + (size_t) t * C;
@@ -358,13 +364,14 @@ __global__ void __launch_bounds__(GCW * RG) gdn_step_norm_multi_cluster_kernel(f
     }
     if (n_keep != nullptr && n > 0) {
 #pragma unroll
-        for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
+        for (int r = 0; r < RPG; ++r) gdn_state_store(base + r * row_stride, s[r]);
     }
 #endif
 }
 
+template <typename St>
 bool multi_cluster_ready() {
-    static const bool ready = cluster_launchable(gdn_step_norm_multi_cluster_kernel, dim3(GCW, RG), GC);
+    static const bool ready = cluster_launchable(gdn_step_norm_multi_cluster_kernel<St>, dim3(GCW, RG), GC);
     return ready;
 }
 
@@ -604,15 +611,17 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
     check("gdn_ab_multi");
 }
 
-void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
-                         const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
-                         const int32_t* n_keep, void* stream, int t_out_begin) {
+namespace {
+template <typename St>
+void launch_step_norm_multi(St* state, const float* h, int conv_channels, const float* gate, const float* beta,
+                            const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
+                            const int32_t* n_keep, void* stream, int t_out_begin) {
     if (!state || !h || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v % h_k || n_tok < 1 ||
         n_tok > kVerifyMaxT) {
         std::fprintf(stderr, "gdn_step_norm_multi: invalid arguments\n");
         std::exit(1);
     }
-    if (gdn_step_norm_multi_cluster_path()) {
+    if (!old_gdn_step().on() && multi_cluster_ready<St>()) {
         cudaLaunchAttribute at{};
         at.id = cudaLaunchAttributeClusterDimension;
         at.val.clusterDim.x = GC;
@@ -624,7 +633,7 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         cfg.stream = (cudaStream_t) stream;
         cfg.attrs = &at;
         cfg.numAttrs = 1;
-        const cudaError_t e = cudaLaunchKernelEx(&cfg, gdn_step_norm_multi_cluster_kernel, state, h, conv_channels, gate,
+        const cudaError_t e = cudaLaunchKernelEx(&cfg, gdn_step_norm_multi_cluster_kernel<St>, state, h, conv_channels, gate,
                                                  beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin);
         if (e != cudaSuccess) {
             std::fprintf(stderr, "gdn_step_norm_multi (cluster; STRATA_OLD_GDN_STEP=1 avoids it): %s\n",
@@ -632,14 +641,33 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
             std::exit(1);
         }
     } else {
-        gdn_step_norm_multi_kernel<<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(
+        gdn_step_norm_multi_kernel<St><<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(
             state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin);
     }
     check("gdn_step_norm_multi");
 }
+}  // namespace
+
+void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
+                         const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
+                         const int32_t* n_keep, void* stream, int t_out_begin) {
+    if (gdn_state_bf16_enabled())   // #53: the slice's first half holds the BF16 state
+        launch_step_norm_multi(reinterpret_cast<uint16_t*>(state), h, conv_channels, gate, beta, z, gamma, eps, y, h_k,
+                               h_v, n_tok, n_keep, stream, t_out_begin);
+    else
+        launch_step_norm_multi(state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, stream,
+                               t_out_begin);
+}
+
+void gdn_step_norm_multi_bf16(uint16_t* state, const float* h, int conv_channels, const float* gate, const float* beta,
+                              const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
+                              const int32_t* n_keep, void* stream, int t_out_begin) {
+    launch_step_norm_multi(state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, stream,
+                           t_out_begin);
+}
 
 bool gdn_step_norm_multi_cluster_path() {
-    return !old_gdn_step().on() && multi_cluster_ready();
+    return !old_gdn_step().on() && multi_cluster_ready<float>();
 }
 
 namespace {
