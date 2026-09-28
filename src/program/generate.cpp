@@ -755,6 +755,19 @@ bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss,
     return cudaDeviceSynchronize() == cudaSuccess;
 }
 
+// Issue #42: STRATA_ASYNC_REFILL=1 - the expert-cache slots lent to the prompt path are refilled on the refill stream
+// and re-admitted like the adaptive tier's swaps (`pending`, checked before every window) once their copies have
+// landed, instead of one blocking copy per slot before the first window (~180 ms serving, more from the command
+// line).  Opt-in: until the copies land those experts are computed on the CPU, which rounds differently, and when
+// they land depends on timing.
+bool async_refill_on() {
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_ASYNC_REFILL");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return v;
+}
+
 // --control-vector-scaled: llama.cpp's `common_control_vector_load` (every file's `direction.<l>` times its scale,
 // summed; layer 0 has none) and `llama_adapter_cvec::apply` with the projection-mode patch (project: the unit
 // direction and its norm as the scale), into the tables `cvec_upload` takes.  `summary` is what INFO reports.
@@ -2650,6 +2663,7 @@ int main(int argc, char** argv) {
         std::vector<std::pair<int32_t, int32_t>> pending;
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
+        const bool async_refill = async_refill_on();   // issue #42: the lent slots come back through `pending` too
         auto apply_pending = [&](bool wait) {
             if (pending.empty()) return;
             if (wait) cudaEventSynchronize(adapt_ev);
@@ -3107,6 +3121,7 @@ int main(int argc, char** argv) {
                     drive.d.layers = 0;
                     drive.d.experts = 0;
                     drive.d.failed = false;
+                    apply_pending(false);   // lent slots refilled asynchronously (issue #42) as they land
                     if (!ver.run(T, win.data(), q, &drive_pool_multi, &drive, outw.data(), e) || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
@@ -3128,6 +3143,21 @@ int main(int argc, char** argv) {
             auto refill = [&](std::string& e) -> bool {
                 if (lent_now.empty()) return true;
                 tr("refill start", (long long) lent_now.size());
+                if (async_refill) {
+                    // issue #42: queued on the refill stream and re-admitted through `pending` once they have landed
+                    // (apply_pending, before every window); the CPU computes these experts until then
+                    for (const auto& [i, slot] : lent_now) {
+                        const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
+                        if (b == nullptr || !xcache.fill_slot(slot, b, adapt_stream, e,
+                                (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert)))
+                            return false;
+                        pending.emplace_back(i, slot);
+                    }
+                    cudaEventRecord(adapt_ev, adapt_stream);
+                    lent_now.clear();
+                    lent_chunk = 0;
+                    return true;
+                }
                 for (const auto& [i, slot] : lent_now) {
                     const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
                     if (b == nullptr || !xcache.fill_slot_blocking(slot, b, e,
@@ -3149,6 +3179,7 @@ int main(int argc, char** argv) {
                     if (want <= lent_chunk) return true;
                     if (!refill(e)) return false;
                 }
+                apply_pending(true);   // an asynchronous refill of these slots (issue #42) lands before they are lent
                 const int32_t first = std::max<int32_t>(lend_first, (int32_t) (xcache.slots() - lend_slots(want)));
                 if (want != sp.chunk() || first != lend_first_now) {
                     if (!sp.relayout(want, xcache.device_slot(first), lend_bytes(first), e)) return false;
@@ -3558,8 +3589,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
-        // refill the lent slots from the arena and give them back to the decode tier
-        if (!lent.empty()) {
+        // refill the lent slots from the arena and give them back to the decode tier (issue #42: with
+        // STRATA_ASYNC_REFILL=1 and a native pack, `lent` is left to the speculative loop, which queues the copies and
+        // re-admits the slots as they land)
+        if (!lent.empty() && !(async_refill_on() && native_pack && o.max_new > 0)) {
             const Clock::time_point tr = Clock::now();
             for (const auto& [i, slot] : lent) {
                 const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
@@ -3573,6 +3606,7 @@ int main(int argc, char** argv) {
             cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
             std::fprintf(stderr, "strata generate: %zu lent slots refilled in %.1f ms\n", lent.size(),
                          std::chrono::duration<double, std::milli>(Clock::now() - tr).count());
+            lent.clear();
         }
         prefill_batched_ms = std::chrono::duration<double, std::milli>(Clock::now() - tp0).count();
         prefill_ms += prefill_batched_ms;
@@ -3875,6 +3909,25 @@ int main(int argc, char** argv) {
             if (d_res != nullptr)
                 cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
         };
+        if (!lent.empty()) {   // issue #42 (STRATA_ASYNC_REFILL=1): the prompt path's slots, re-admitted as they land
+            if (adapt_stream == nullptr && cudaStreamCreateWithFlags(&adapt_stream, cudaStreamNonBlocking) != cudaSuccess) {
+                std::fprintf(stderr, "strata generate: cannot create the refill stream\n");
+                return 1;
+            }
+            for (const auto& [i, slot] : lent) {
+                const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
+                if (b == nullptr || !xcache.fill_slot(slot, b, adapt_stream, err,
+                        (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert))) {
+                    std::fprintf(stderr, "strata generate: refilling a lent slot failed: %s\n", err.c_str());
+                    return 1;
+                }
+                pending.emplace_back(i, slot);
+            }
+            cudaEventRecord(adapt_ev, adapt_stream);
+            std::fprintf(stderr, "strata generate: %zu lent slots refilled asynchronously (the CPU computes them until "
+                                 "they land)\n", lent.size());
+            lent.clear();
+        }
         // Plan v0.3 P6: the VRAM tier follows the conversation.  Candidates are missing experts routed at least
         // twice (decayed); each is paired with its layer's least-routed resident expert and swapped when it was
         // routed clearly more often.  Copies run between rounds, when the GPU is idle.
