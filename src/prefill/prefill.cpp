@@ -755,6 +755,16 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
     PfTimer pt;
     const cudaStream_t cs = (cudaStream_t) m.cs;
+    // every return waits for both streams, the early ones too (a STOP between chunks, an error): the last copies
+    // of experts the routing did not pick may still be landing in the borrowed slots, and the caller refills them
+    // on streams that are not ordered after the non-blocking copy stream
+    struct StreamsDrained {
+        Impl& m;
+        ~StreamsDrained() {
+            cudaStreamSynchronize(m.cs);
+            cudaStreamSynchronize(m.copy);
+        }
+    } streams_drained{m};
     // the MMQ row table lives in the borrowed cache slots, which the refill after a prompt overwrites with experts:
     // write it again for every prompt (a layout is reused as long as the chunk and the slots are the same)
     if (m.ids_identity != nullptr) mmq::iota(m.ids_identity, m.T * K, m.cs);
@@ -948,9 +958,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy);
                     m.stager->issued_one(en.job, m.copy);
                 }
-                cudaEventRecord(m.copied[sl], m.copy);
+                // on the run's last slot: the first one is given back (and filled again) as soon as the batch
+                // holding the run's first entry is released, while a later batch may still wait on the run; the
+                // last slot is not reused before the batch holding the run's last entry is released
+                cudaEventRecord(m.copied[sl + r - 1], m.copy);
                 for (size_t i = 0; i < r; ++i) {
-                    cp_ev[k + i] = (int32_t) sl;
+                    cp_ev[k + i] = (int32_t) (sl + r - 1);
                     m.stage_live[sl + i] = true;
                 }
                 stats_.ms_experts_host += ms_since(th);
