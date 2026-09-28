@@ -110,6 +110,12 @@ void moe_hit_select_multi(const int32_t* ids, const int32_t* res_row, int n, int
 void moe_hit_grouped_s2_multi(const uint8_t* blob_base, const int32_t* slot_index, const int32_t* dst_index,
                               const int32_t* d_count, int64_t cap, int64_t blob_bytes, const uint8_t* x_q8_0,
                               const float* x_scales, int k_per_token, void* scratch, float* out, void* stream);
+/// O3 (#17): the per-hit kernels (`moe_hit_grouped_s2`, `_dev`, `_multi`) and the grouped ones (`moe_grouped_s2`)
+/// were rewritten with bitwise-identical outputs: conflict-free staged activations, `hx` once per chunk, wide loads,
+/// two rows per warp.  The previous kernels stay for A/B: `STRATA_OLD_GROUPED=1` in the environment selects them,
+/// and so does `moe_grouped_select_old(1)`; `0` forces the new ones, `-1` returns to the environment.  Read at each
+/// launch, so a captured graph keeps the kernels it was captured with.
+void moe_grouped_select_old(int old);
 void moe_hit_grouped_s2_cpu_order(const uint8_t* blob_base, const int32_t* slot_index,
                                  const int32_t* dst_index, int64_t n_hits, int64_t blob_bytes,
                                  const uint8_t* x_q8_0, void* scratch, float* out, void* stream,
