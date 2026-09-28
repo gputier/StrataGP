@@ -14,7 +14,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import CTX_SLACK, ByteTokenizer, EngineDied, MockEngine, Service, StrataEngine, serve  # noqa: E402
+from serve.server import (CTX_SLACK, ByteTokenizer, Detokenizer, EngineDied, MockEngine, Service,  # noqa: E402
+                          StrataEngine, serve)
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 4096
@@ -524,6 +525,124 @@ class WebApp(unittest.TestCase):
             self.assertEqual(self.get("/")[0], 200)                  # the page itself asks for the key
         finally:
             self.svc.api_key = ""
+
+
+def old_deltas(tok, ids):
+    d = Detokenizer(tok)
+    d.fast = False
+    return [d.push(t) for t in ids]
+
+
+def new_deltas(tok, ids):
+    d = Detokenizer(tok)
+    assert d.fast
+    return [d.push(t) for t in ids]
+
+
+class StreamingDetokenizer(unittest.TestCase):
+    """Issue #31: the incremental UTF-8 decoder gives the old re-decode's deltas, one for one."""
+
+    def random_ids(self, rnd, n):
+        out = []
+        chars = "aé你\U0001f600 \n"
+        while len(out) < n:
+            r = rnd.random()
+            if r < 0.5:
+                out += list(rnd.choice(chars).encode())          # whole or (cut below) split characters
+            elif r < 0.7:
+                out.append(rnd.randrange(0x80, 0x100))            # stray continuation / lead / invalid bytes
+            elif r < 0.75:
+                out += list("�".encode())                     # a real U+FFFD in the text
+            elif r < 0.8:
+                out.append(256 + rnd.randrange(len(ByteTokenizer.SPECIALS)))
+            else:
+                out += list(rnd.choice(chars).encode())[:rnd.randint(1, 3)]   # a character cut short
+        return out[:n]
+
+    def test_same_deltas_as_the_re_decode(self):
+        import random
+        tok, rnd = ByteTokenizer(), random.Random(1)
+        for i in range(400):
+            ids = self.random_ids(rnd, rnd.randint(0, 60))
+            with self.subTest(i=i):
+                self.assertEqual(new_deltas(tok, ids), old_deltas(tok, ids))
+
+    def test_real_vocabulary(self):
+        sys.path.insert(0, str(ROOT / "tools"))
+        from test_strata_tokenizer import load_tokenizer
+        tk = load_tokenizer()
+        if tk is None:
+            self.skipTest("no tokenizer (set STRATA_TOKENIZER or STRATA_GGUF_PY)")
+        import random
+        rnd = random.Random(2)
+        text = "Café 你好世界 \U0001f600\U0001f680 é مرحبا def f(x):\n\treturn x\n"
+        ids = tk.encode(text * 20)
+        self.assertEqual("".join(new_deltas(tk, ids)), text * 20)
+        self.assertEqual(new_deltas(tk, ids), old_deltas(tk, ids))
+        for i in range(50):                              # any ids, byte tokens included
+            ids = [rnd.randrange(len(tk.tokens) - 400) for _ in range(rnd.randint(1, 40))]
+            ids += [rnd.randrange(0x80 - 0x21, 256) for _ in range(rnd.randint(0, 6))]
+            rnd.shuffle(ids)
+            with self.subTest(i=i):
+                self.assertEqual(new_deltas(tk, ids), old_deltas(tk, ids))
+
+    def test_old_path_on_request(self):
+        os.environ["STRATA_OLD_DETOK"] = "1"
+        try:
+            self.assertFalse(Detokenizer(ByteTokenizer()).fast)
+        finally:
+            del os.environ["STRATA_OLD_DETOK"]
+
+
+class IncrementalPrompts(unittest.TestCase):
+    """Issue #32 over HTTP: every turn's prompt ids are those of a full encode, and a turn reuses the previous one's."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.engine = RecordingPrompt(tok, "Thinking.\n</think>\n\nThe answer.", max_context=CTX)
+        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    post = ClientShapes.post
+
+    def test_turns(self):
+        self.assertIsNotNone(self.svc.prompts)
+        msgs = [{"role": "system", "content": "Be brief."}]
+        for turn in range(6):
+            msgs.append({"role": "user", "content": f"question {turn} <|im_end|> é你 " * (turn + 1)})
+            status, b = self.post("/v1/chat/completions", {"model": "m", "max_tokens": 64, "messages": msgs})
+            self.assertEqual(status, 200, b)
+            prompt = self.svc.template.render(msgs)
+            self.assertEqual(self.engine.last_ids, self.svc.tok.encode(prompt, parse_special=True))
+            if turn:
+                self.assertGreater(self.svc.prompts.last_reused, len(prompt) // 3)
+            msgs.append({"role": "assistant", "content": b["choices"][0]["message"]["content"]})
+
+    def test_check_mode_and_old_path(self):
+        import contextlib
+        import io
+        os.environ["STRATA_CHECK_PROMPT_IDS"] = "1"
+        try:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                ids = self.svc.encode_prompt("<|im_start|>user\nhi<|im_end|>\n")
+            self.assertEqual(ids, self.svc.tok.encode("<|im_start|>user\nhi<|im_end|>\n", parse_special=True))
+            self.assertNotIn("DIFFER", out.getvalue())
+        finally:
+            del os.environ["STRATA_CHECK_PROMPT_IDS"]
+        os.environ["STRATA_OLD_PROMPT_ENCODE"] = "1"
+        try:
+            svc = Service(self.engine, self.svc.tok, self.svc.template)
+            self.assertIsNone(svc.prompts)
+        finally:
+            del os.environ["STRATA_OLD_PROMPT_ENCODE"]
 
 
 if __name__ == "__main__":

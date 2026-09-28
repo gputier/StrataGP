@@ -21,6 +21,7 @@ talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes ev
 from __future__ import annotations
 
 import argparse
+import codecs
 import collections
 import base64
 import hashlib
@@ -473,19 +474,28 @@ def child_env(cfg: dict) -> dict:
 class ByteTokenizer:
     """Tiny stand-in tokenizer for tests without the pack: one id per UTF-8 byte, specials as ids >= 256."""
     SPECIALS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
+    max_special_len = max(len(s) for s in SPECIALS)
 
     def encode(self, text, parse_special=False):
-        out, i = [], 0
+        return self.encode_marked(text, parse_special)[0]
+
+    def encode_marked(self, text, parse_special=False):
+        """encode() and its resume points (after each special), as strata_tokenizer's for PromptEncoder."""
+        out, marks, i = [], [], 0
         while i < len(text):
             for k, s in enumerate(self.SPECIALS):
                 if parse_special and text.startswith(s, i):
                     out.append(256 + k)
                     i += len(s)
+                    marks.append((i, len(out)))
                     break
             else:
                 out.extend(text[i].encode("utf-8"))
                 i += 1
-        return out
+        return out, marks
+
+    def token_bytes(self, t):
+        return self.SPECIALS[t - 256].encode() if t >= 256 else bytes([t])
 
     def decode(self, ids, errors="replace"):
         raw = bytearray()
@@ -496,13 +506,29 @@ class ByteTokenizer:
 
 # ------------------------------------------------------------------------------------------------ core
 class Detokenizer:
-    """Incremental decode: re-decode the generated ids and emit only the new, complete suffix (a multi-byte
-    character split across tokens is held until complete)."""
+    """Incremental decode: emit only the new, complete text of each token (a multi-byte character split across
+    tokens is held until complete).
+
+    Issue #31: it used to re-decode EVERY id of the answer per token - 0.7 ms per token at 4K, 2.2 ms at 16K, ~17 s
+    of CPU over a 16K answer on a core the expert pool also uses.  Now each token's bytes go through an
+    incremental UTF-8 decoder, so a token costs its own length.  The text is the same, delta for delta: the old
+    rule held the output while the decoded answer ended in U+FFFD - an incomplete character, which the full
+    decode shows as one U+FFFD and the incremental decoder keeps as buffered bytes, or a real U+FFFD - and so
+    does this one.  STRATA_OLD_DETOK=1 (or a tokenizer without `token_bytes`) keeps the re-decode."""
 
     def __init__(self, tok):
         self.tok, self.ids, self.sent = tok, [], 0
+        self.fast = hasattr(tok, "token_bytes") and not os.environ.get("STRATA_OLD_DETOK")
+        self.utf8 = codecs.getincrementaldecoder("utf-8")("replace")
+        self.held = ""                                  # decoded, not sent yet (it ends in U+FFFD)
 
     def push(self, t: int) -> str:
+        if self.fast:
+            self.held += self.utf8.decode(self.tok.token_bytes(t))
+            if self.utf8.getstate()[0] or self.held.endswith("�"):
+                return ""
+            delta, self.held = self.held, ""
+            return delta
         self.ids.append(t)
         text = self.tok.decode(self.ids)
         if text.endswith("�"):
@@ -532,6 +558,16 @@ class Service:
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+        # Issue #32: a prompt re-encodes only what follows the last special token it shares with a recent prompt
+        # (tools/strata_tokenizer.py PromptEncoder; the same ids by construction).  STRATA_OLD_PROMPT_ENCODE=1:
+        # the whole prompt every request, as before.  STRATA_CHECK_PROMPT_IDS=1: both, compared, on every request.
+        self.prompts = None
+        if hasattr(tokenizer, "encode_marked") and not os.environ.get("STRATA_OLD_PROMPT_ENCODE"):
+            try:
+                from strata_tokenizer import PromptEncoder
+                self.prompts = PromptEncoder(tokenizer)
+            except ImportError:                          # no `regex` module: the byte tokenizer's tests
+                pass
 
     def set_shared(self, defaults) -> dict:
         """The Chat settings every client gets for what it leaves out; {} / None = clients use their own again."""
@@ -613,11 +649,24 @@ class Service:
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
 
+    def encode_prompt(self, prompt: str) -> list[int]:
+        if self.prompts is None:
+            return self.tok.encode(prompt, parse_special=True)
+        ids = self.prompts.encode(prompt)
+        if os.environ.get("STRATA_CHECK_PROMPT_IDS"):
+            full = self.tok.encode(prompt, parse_special=True)
+            if full != ids:
+                at = next((i for i, (a, b) in enumerate(zip(full, ids)) if a != b), min(len(full), len(ids)))
+                print(f"[strata] PROMPT IDS DIFFER from a full encode at id {at} ({len(ids)} vs {len(full)}): using "
+                      "the full encode - please report it with STRATA_DEBUG=1's output", flush=True)
+                return full
+        return ids
+
     def prepare(self, messages, tools, kwargs, max_new=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context."""
         prompt = self.template.render(messages, tools=tools, **kwargs)
-        ids = self.tok.encode(prompt, parse_special=True)
+        ids = self.encode_prompt(prompt)
         self.embeddings.path = None
         images = images_of(messages)
         if images:
