@@ -90,8 +90,10 @@ struct TicketState {
 // and reaps completions, so `issue` on the caller's thread only builds jobs and wakes it (~11 us per ReadFile
 // no longer lands on the host loop). `mu` guards everything below except `file`, which only the worker touches
 // (plus `wake`, which is thread-safe), and the `inflight` jobs, which only the worker touches while the reader is
-// open. Issue #15: the worker makes its submit calls WITHOUT `mu` (`pump_worker`), so a submit that blocks (the
-// `sync` backend's pread) never holds up `issue` or `collect`. Without `io_thread` the caller does all of it.
+// open. Issue #15: the worker makes its submit calls WITHOUT `mu` (`pump_worker`), so a submit never holds up
+// `issue` or `collect`. The `sync` backend keeps the previous locked pump (`pump_locked`: pread under `mu`, and
+// `finish` refills the freed slot at once), so it stays a faithful A/B arm. Without `io_thread` the caller does all
+// of it.
 struct PleReader::Impl {
     DirectFile file;
     uint64_t table_offset = 0;
@@ -112,6 +114,7 @@ struct PleReader::Impl {
     std::string error;
 
     bool threaded = false;
+    bool pump_locked = false;             // the worker submits under `mu` (the `sync` backend, as before issue #15)
     bool stop = false;
     std::mutex mu;
     std::condition_variable cv_work;      // worker: there is something to submit
@@ -135,7 +138,11 @@ struct PleReader::Impl {
             queue.pop_front();
             Job& j = inflight[s];
             j.issued_us = now_us();
-            if (!file.submit(j.offset, slot_buf(s), j.length, s, error)) return false;
+            if (!file.submit(j.offset, slot_buf(s), j.length, s, error)) {
+                j.uses.clear();                    // not queued: no completion will free the slot
+                free_slots.push_back(s);
+                return false;
+            }
             stats.submit_us += now_us() - j.issued_us;
             ++stats.reads;
         }
@@ -176,33 +183,47 @@ struct PleReader::Impl {
         return false;
     }
 
+    /// One completed read. After an error (this read's or an earlier one) nothing is copied - every `collect`
+    /// fails from then on, and a failed ticket's destination may already be gone - but the slot is still given
+    /// back, so the reader drains and `close` returns.
     bool finish(const Completion& c) {
         const uint32_t s = (uint32_t) c.tag;
         Job& j = inflight[s];
-        if (!c.ok) {
+        bool ok = error.empty();
+        if (ok && !c.ok) {
             error = "PleReader: a table read failed";
-            return false;
+            ok = false;
         }
-        record_latency(now_us() - j.issued_us);
-        stats.bytes += c.bytes;
-        const uint8_t* buf = slot_buf(s);
-        for (const Use& u : j.uses) {
-            if (u.in_page + ROW_BYTES > c.bytes) {
-                error = "PleReader: short read inside the table";
-                return false;
+        if (ok) {
+            record_latency(now_us() - j.issued_us);
+            stats.bytes += c.bytes;
+            const uint8_t* buf = slot_buf(s);
+            for (const Use& u : j.uses) {
+                if (u.in_page + ROW_BYTES > c.bytes) {
+                    error = "PleReader: short read inside the table";
+                    ok = false;
+                    break;
+                }
+                std::memcpy(u.dst, buf + u.in_page, ROW_BYTES);
+                cache.insert(u.row, buf + u.in_page);
             }
-            std::memcpy(u.dst, buf + u.in_page, ROW_BYTES);
-            cache.insert(u.row, buf + u.in_page);
+        }
+        if (!ok) {
+            j.uses.clear();
+            free_slots.push_back(s);
+            return false;
         }
         auto it = tickets.find(j.ticket);
         if (it != tickets.end() && it->second.pending > 0) --it->second.pending;
         j.uses.clear();
         free_slots.push_back(s);
-        return threaded || pump();                 // the worker pumps at the top of its loop, without `mu`
+        return (threaded && !pump_locked) || pump();   // else the worker pumps at the top of its loop, without `mu`
     }
 
     /// Completions (or wake packets) just returned by `file.wait`, applying fault injection.
+    /// Every completion is finished even after one fails, so no slot is lost.
     bool process(const Completion* got, int n) {
+        bool ok = true;
         for (int i = 0; i < n; ++i) {
             if (got[i].tag == DirectFile::WAKE_TAG) continue;
             if (delay_us > 0 && now_us() - inflight[(uint32_t) got[i].tag].issued_us < delay_us) {
@@ -210,23 +231,24 @@ struct PleReader::Impl {
                 ++stats.late_injected;
                 continue;
             }
-            if (!finish(got[i])) return false;
+            if (!finish(got[i])) ok = false;
         }
-        return true;
+        return ok;
     }
 
     bool release_delayed() {
         const double now = now_us();
+        bool ok = true;
         for (size_t i = 0; i < delayed.size();) {
             if (now - inflight[(uint32_t) delayed[i].tag].issued_us >= delay_us) {
                 const Completion c = delayed[i];
                 delayed.erase(delayed.begin() + (ptrdiff_t) i);
-                if (!finish(c)) return false;
+                if (!finish(c)) ok = false;
             } else {
                 ++i;
             }
         }
-        return true;
+        return ok;
     }
 
     /// Caller-thread mode: process whatever has completed; blocks up to `timeout_ms` for the first completion.
@@ -245,8 +267,11 @@ struct PleReader::Impl {
         for (;;) {
             cv_work.wait(lk, [&] { return stop || !queue.empty() || busy(); });
             if (stop && !busy()) break;
-            if (error.empty() && !pump_worker(lk) && error.empty()) error = "PleReader: submit failed";
+            // Held completions first, so the pump right after refills the slots they free (with `pump_worker`,
+            // `finish` does not pump: a freed slot would otherwise wait for the next completion).
             if (!delayed.empty() && !release_delayed() && error.empty()) error = "PleReader: read failed";
+            if (error.empty() && !(pump_locked ? pump() : pump_worker(lk)) && error.empty())
+                error = "PleReader: submit failed";
             if (!error.empty()) {
                 cv_done.notify_all();
                 if (!busy()) { cv_work.wait(lk, [&] { return stop; }); break; }
@@ -293,6 +318,7 @@ bool PleReader::open(const std::string& path, uint64_t table_offset, uint64_t n_
     reset_stats();
     impl_->stop = false;
     impl_->threaded = io_thread;
+    impl_->pump_locked = io_thread && std::strcmp(impl_->file.backend(), "sync") == 0;
     if (io_thread) impl_->worker = std::thread([this] { impl_->worker_loop(); });
     return true;
 }
@@ -330,6 +356,7 @@ void PleReader::close() {
     m.free_slots.clear();
     m.cache.init(0);
     m.threaded = false;
+    m.pump_locked = false;
     m.stop = false;
 }
 
