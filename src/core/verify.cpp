@@ -190,8 +190,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
     // Issue #15: the window's graph waits for the PLE rows just before layer 1 instead of copying them at its head,
     // so the host reads them from the SSD while the GPU computes the embedding and layer 0. Same bytes, same
-    // kernels, same order of arithmetic; STRATA_OLD_PLE_STAGING=1 restores the read-before-launch path (A/B).
-    ple_late_ = std::getenv("STRATA_OLD_PLE_STAGING") == nullptr;
+    // kernels, same order of arithmetic; STRATA_OLD_PLE_STAGING=1 restores the read-before-launch path (A/B). Unset,
+    // empty or "0" keeps the new path.
+    {
+        const char* old = std::getenv("STRATA_OLD_PLE_STAGING");
+        ple_late_ = old == nullptr || old[0] == '\0' || std::strcmp(old, "0") == 0;
+    }
     // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
     {
         const int64_t cap = (int64_t) (T * K);
