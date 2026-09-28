@@ -15,9 +15,12 @@ emoji (4-byte), combining marks, whitespace runs, and C0 control bytes.
 """
 from __future__ import annotations
 
+import bisect
+import functools
 import json
 import pathlib
 import sys
+import threading
 
 import regex
 
@@ -62,6 +65,12 @@ QWEN35_PATTERN = (
     r"|\s+(?!\S)"
     r"|\s+"
 )
+
+# Pre-tokenizer pieces repeat - words, indentation runs, punctuation - and BPE is quadratic in a piece's length, so
+# the ids of a piece are cached (issue #32).  Pieces longer than PIECE_CACHE_LEN (a run of 5,000 spaces, a base64
+# blob) are rare and would each take a large entry: they are merged every time.
+PIECE_CACHE_SIZE = 1 << 17
+PIECE_CACHE_LEN = 64
 
 
 class Tokenizer:
@@ -110,6 +119,10 @@ class Tokenizer:
         # token containing regex metacharacters (several do: `<|`, `[`, `(`) is matched literally.
         self._always_re = self._alt(always)
         self._special_re = self._alt(list(self.special_tokens))
+        # How far a special-token match can look ahead of where it starts (PromptEncoder's margin).
+        self.max_special_len = max((len(t) for t in self.special_tokens), default=1)
+        self._piece_ids = functools.lru_cache(maxsize=PIECE_CACHE_SIZE)(self._piece_ids_uncached)
+        self._bytes: dict[int, bytes] = {}
 
     @staticmethod
     def _alt(literals: list[str]):
@@ -155,23 +168,32 @@ class Tokenizer:
             parts[best:best + 2] = [parts[best] + parts[best + 1]]
         return parts
 
+    def _piece_ids_uncached(self, piece: str) -> tuple[int, ...]:
+        """One pre-tokenizer piece -> its ids (a tuple: the cached value is shared, so it must not be mutable)."""
+        mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
+        out = []
+        for tok in self._bpe(mapped):
+            i = self.ids.get(tok)
+            if i is None:
+                raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
+            out.append(i)
+        return tuple(out)
+
     def _encode_plain(self, text: str) -> list[int]:
         out: list[int] = []
         for piece in self._re.findall(text):
-            mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
-            for tok in self._bpe(mapped):
-                i = self.ids.get(tok)
-                if i is None:
-                    raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
-                out.append(i)
+            out.extend(self._piece_ids(piece) if len(piece) <= PIECE_CACHE_LEN else self._piece_ids_uncached(piece))
         return out
 
-    def _encode_matching(self, text: str, pat) -> list[int]:
+    def _encode_matching(self, text: str, pat, marks: list | None = None) -> list[int]:
         """Encode `text`, emitting any literal `pat` matches as single tokens and BPE-ing the rest.
 
         The split happens on the RAW text, before the byte mapping, because a special token's string is a
         literal to match rather than bytes to decompose.  Everything between the matches is tokenized
         normally - which is why a near-miss like `<|im_star` still costs ordinary tokens.
+
+        `marks`, when given, receives (end of the match in `text`, ids so far) for every match: the points where
+        the encoding of a longer text with the same beginning can resume (PromptEncoder).
         """
         if pat is None:
             return self._encode_plain(text)
@@ -182,6 +204,8 @@ class Tokenizer:
                 out.extend(self._encode_plain(text[pos:m.start()]))
             out.append(self.special_tokens[m.group(0)])
             pos = m.end()
+            if marks is not None:
+                marks.append((pos, len(out)))
         if pos < len(text):
             out.extend(self._encode_plain(text[pos:]))
         return out
@@ -194,6 +218,26 @@ class Tokenizer:
         """
         return self._encode_matching(text, self._special_re if parse_special else self._always_re)
 
+    def encode_marked(self, text: str, parse_special: bool = False) -> tuple[list[int], list[tuple[int, int]]]:
+        """encode() and its resume points: (end offset in `text`, ids so far) after every special-token match."""
+        marks: list[tuple[int, int]] = []
+        return self._encode_matching(text, self._special_re if parse_special else self._always_re, marks), marks
+
+    def token_bytes(self, i: int) -> bytes:
+        """The raw bytes of token `i`, as decode() joins them (cached): the streaming detokenizer's unit."""
+        b = self._bytes.get(i)
+        if b is None:
+            if i < 0 or i >= len(self.tokens):
+                raise IndexError("token id %d is outside the vocabulary (%d)" % (i, len(self.tokens)))
+            raw = bytearray()
+            for ch in self.tokens[i]:
+                v = UNICODE_TO_BYTE.get(ch)
+                if v is None:
+                    raise KeyError("token %d contains a character outside the byte alphabet: %r" % (i, ch))
+                raw.append(v)
+            b = self._bytes[i] = bytes(raw)
+        return b
+
     def decode(self, ids: list[int], errors: str = "replace") -> str:
         raw = bytearray()
         for i in ids:
@@ -205,6 +249,81 @@ class Tokenizer:
                     raise KeyError("token %d contains a character outside the byte alphabet: %r" % (i, ch))
                 raw.append(b)
         return raw.decode("utf-8", errors=errors)
+
+
+# ------------------------------------------------------------------ incremental prompts
+def common_prefix_len(a: str, b: str) -> int:
+    """Length of the longest common prefix, by slices (C speed) rather than a loop over characters."""
+    n = min(len(a), len(b))
+    lo, step = 0, 4096
+    while lo < n:                                       # whole chunks first, doubling
+        hi = min(n, lo + step)
+        if a[lo:hi] != b[lo:hi]:
+            break
+        lo, step = hi, min(step * 2, 1 << 20)
+    else:
+        return n
+    while hi - lo > 1:                                  # the first difference is in [lo, hi): bisect it
+        mid = (lo + hi) // 2
+        if a[lo:mid] == b[lo:mid]:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+class PromptEncoder:
+    """`tok.encode(text, parse_special=True)` for chat prompts, reusing the ids of an earlier prompt (issue #32).
+
+    A chat client sends the whole conversation every turn, and the rendered prompt of turn n+1 starts with most of
+    turn n's.  Re-running BPE over all of it cost 1-2 s before the first token at 100K tokens, even when the engine
+    reused 99 % of the prefix.  So the ids up to a SPECIAL-TOKEN BOUNDARY both prompts share are taken as they
+    were, and only the rest is encoded.
+
+    WHY THAT IS EXACT.  Encoding splits the text at special-token matches and BPE-encodes each stretch between two
+    matches on its own (`_encode_matching`): nothing crosses a match.  Whether a match starts at position q depends
+    only on text[q : q + max_special_len].  So if the two texts agree up to L, every decision the scan makes at a
+    position before c = the end of some match, with c + max_special_len - 1 <= L, is the same for both - the same
+    matches, the same stretches, the same ids up to c - and from c the scan starts afresh, exactly as it does on
+    text[c:].  Hence encode(new) == ids_old[:ids at c] + encode(new[c:]).  The margin matters only for a
+    vocabulary where a literal overlaps another's end; it costs re-encoding one short stretch.
+
+    A few recent prompts are kept (one per conversation: the one a prompt extends is replaced by it), so a second
+    client does not evict the first.  `STRATA_CHECK_PROMPT_IDS=1` (server) also encodes every prompt in full and
+    compares.  The tokenizer needs `encode_marked` and `max_special_len`.
+    """
+
+    def __init__(self, tok, keep: int = 4):
+        self.tok, self.keep = tok, keep
+        self.entries: list[tuple[str, list[int], list[int], list[int]]] = []   # (text, ids, mark ends, mark counts)
+        self.lock = threading.Lock()
+        self.last_reused = 0                            # characters taken from an earlier prompt (for tests and logs)
+
+    def encode(self, text: str) -> list[int]:
+        with self.lock:
+            entries = list(self.entries)
+        margin = max(0, int(self.tok.max_special_len) - 1)
+        src, cut_k = None, -1
+        for e in entries:
+            limit = common_prefix_len(e[0], text) - margin
+            k = bisect.bisect_right(e[2], limit) - 1       # the last boundary c with c <= limit
+            if k >= 0 and (src is None or e[2][k] > src[2][cut_k]):
+                src, cut_k = e, k
+        if src is None:
+            ids, marks = self.tok.encode_marked(text, parse_special=True)
+            ends, counts = [m[0] for m in marks], [m[1] for m in marks]
+            self.last_reused = 0
+        else:
+            c, n = src[2][cut_k], src[3][cut_k]
+            tail, marks = self.tok.encode_marked(text[c:], parse_special=True)
+            ids = src[1][:n] + tail
+            ends = src[2][:cut_k + 1] + [c + m[0] for m in marks]
+            counts = src[3][:cut_k + 1] + [n + m[1] for m in marks]
+            self.last_reused = c
+        with self.lock:
+            self.entries = [e for e in self.entries if e is not src][-(self.keep - 1):] if self.keep > 1 else []
+            self.entries.append((text, ids, ends, counts))
+        return list(ids)
 
 
 # ------------------------------------------------------------------ the pack's tokenizer/ directory

@@ -21,6 +21,7 @@ talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes ev
 from __future__ import annotations
 
 import argparse
+import codecs
 import collections
 import base64
 import hashlib
@@ -427,8 +428,16 @@ class Vision:
 
     def encode(self, source: str) -> tuple[Path, int]:
         """-> (embeddings file, number of image tokens)."""
-        data = self.normalize(self.load(source))
-        key = hashlib.sha256(data).hexdigest()[:32]
+        raw = self.load(source)
+        # Issue #35: the cache key is the hash of the bytes AS SENT, so an image already encoded (every turn it stays
+        # in the conversation) is found before Pillow decodes and re-encodes a WebP or TIFF to PNG again.  The same
+        # bytes always normalize to the same PNG, so the embeddings are the ones the normalized image would give.
+        key = hashlib.sha256(raw).hexdigest()[:32]
+        with self.lock:
+            if key in self.cache:
+                self.cache[key] = self.cache.pop(key)                  # most recently used last
+                return self.cache[key]
+        data = self.normalize(raw)
         with self.lock:
             if key in self.cache:
                 return self.cache[key]
@@ -442,7 +451,7 @@ class Vision:
                 raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
                                                                      "the vision encoder stopped"))
             self.cache[key] = (out, int(line.split()[1]))
-            if len(self.cache) > 64:                                   # oldest first
+            if len(self.cache) > 64:                                   # least recently used first
                 old = next(iter(self.cache))
                 self.cache.pop(old)[0].unlink(missing_ok=True)
             return self.cache[key]
@@ -473,19 +482,28 @@ def child_env(cfg: dict) -> dict:
 class ByteTokenizer:
     """Tiny stand-in tokenizer for tests without the pack: one id per UTF-8 byte, specials as ids >= 256."""
     SPECIALS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
+    max_special_len = max(len(s) for s in SPECIALS)
 
     def encode(self, text, parse_special=False):
-        out, i = [], 0
+        return self.encode_marked(text, parse_special)[0]
+
+    def encode_marked(self, text, parse_special=False):
+        """encode() and its resume points (after each special), as strata_tokenizer's for PromptEncoder."""
+        out, marks, i = [], [], 0
         while i < len(text):
             for k, s in enumerate(self.SPECIALS):
                 if parse_special and text.startswith(s, i):
                     out.append(256 + k)
                     i += len(s)
+                    marks.append((i, len(out)))
                     break
             else:
                 out.extend(text[i].encode("utf-8"))
                 i += 1
-        return out
+        return out, marks
+
+    def token_bytes(self, t):
+        return self.SPECIALS[t - 256].encode() if t >= 256 else bytes([t])
 
     def decode(self, ids, errors="replace"):
         raw = bytearray()
@@ -496,19 +514,105 @@ class ByteTokenizer:
 
 # ------------------------------------------------------------------------------------------------ core
 class Detokenizer:
-    """Incremental decode: re-decode the generated ids and emit only the new, complete suffix (a multi-byte
-    character split across tokens is held until complete)."""
+    """Incremental decode: emit only the new, complete text of each token (a multi-byte character split across
+    tokens is held until complete).
+
+    Issue #31: it used to re-decode EVERY id of the answer per token - 0.7 ms per token at 4K, 2.2 ms at 16K, ~17 s
+    of CPU over a 16K answer on a core the expert pool also uses.  Now each token's bytes go through an
+    incremental UTF-8 decoder, so a token costs its own length.  The text is the same, delta for delta: the old
+    rule held the output while the decoded answer ended in U+FFFD - an incomplete character, which the full
+    decode shows as one U+FFFD and the incremental decoder keeps as buffered bytes, or a real U+FFFD - and so
+    does this one.  STRATA_OLD_DETOK=1 (or a tokenizer without `token_bytes`) keeps the re-decode."""
 
     def __init__(self, tok):
         self.tok, self.ids, self.sent = tok, [], 0
+        self.fast = hasattr(tok, "token_bytes") and not os.environ.get("STRATA_OLD_DETOK")
+        self.utf8 = codecs.getincrementaldecoder("utf-8")("replace")
+        self.held = ""                                  # decoded, not sent yet (it ends in U+FFFD)
 
     def push(self, t: int) -> str:
+        if self.fast:
+            self.held += self.utf8.decode(self.tok.token_bytes(t))
+            if self.utf8.getstate()[0] or self.held.endswith("�"):
+                return ""
+            delta, self.held = self.held, ""
+            return delta
         self.ids.append(t)
         text = self.tok.decode(self.ids)
         if text.endswith("�"):
             return ""
         delta, self.sent = text[self.sent:], len(text)
         return delta
+
+
+class ReasoningRecall:
+    """Issue #34, OPT-IN (--recall-reasoning, "recall_reasoning": true in the config, STRATA_RECALL_REASONING=1): the
+    reasoning of recent answers, given back to clients that send an answer back without it.
+
+    The template renders every past answer as `<think>\\nREASONING\\n</think>\\n\\nANSWER`.  Most clients
+    (chat.py before, the web app, OpenAI SDK clients) return only the answer, so the turn is rendered with an empty
+    `<think>` block: the prompt stops matching what the engine wrote about 70 characters into the answer, the
+    engine falls back to the checkpoint before the answer's header, and every turn reads the previous answer again.
+    With this on, an answer sent back without reasoning gets the reasoning this server wrote for it, and the
+    prompt continues the engine's live sequence.  It changes the prompt such clients produce (their past turns now
+    carry their reasoning, as the template intends; the context fills faster), hence opt-in.
+
+    An answer is found by a hash of the conversation up to and including it (roles, trimmed contents, tool calls -
+    never the reasoning itself), so the same short answer in another conversation is not given this one's
+    reasoning, and an edited earlier turn simply finds nothing.  Bounded to `max_entries` answers and `max_chars`
+    characters of reasoning, least recently used first out."""
+
+    def __init__(self, max_entries: int = 1024, max_chars: int = 16_000_000):
+        self.max_entries, self.max_chars = max_entries, max_chars
+        self.table: collections.OrderedDict[bytes, str] = collections.OrderedDict()
+        self.chars = 0
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def _feed(h, m: dict):
+        calls = []
+        for c in m.get("tool_calls") or []:
+            fn = c.get("function", c) if isinstance(c, dict) else {}
+            calls.append([fn.get("name"), fn.get("arguments")])
+        content = m.get("content")
+        b = json.dumps([m.get("role"), content.strip() if isinstance(content, str) else content, calls],
+                       sort_keys=True, ensure_ascii=False, default=str).encode()
+        h.update(len(b).to_bytes(8, "little"))
+        h.update(b)
+
+    def fill(self, messages: list[dict]) -> tuple[list[dict], object]:
+        """-> (messages with the reasoning restored where it is known, the conversation's hash state)."""
+        h, out = hashlib.sha256(), []
+        for m in messages:
+            if m.get("role") == "assistant" and not (m.get("reasoning_content") or "").strip():
+                k = h.copy()
+                self._feed(k, m)
+                key = k.digest()
+                with self.lock:
+                    r = self.table.get(key)
+                    if r is not None:
+                        self.table.move_to_end(key)
+                if r:
+                    m = dict(m, reasoning_content=r)
+            self._feed(h, m)
+            out.append(m)
+        return out, h
+
+    def remember(self, state, content: str, calls: list, reasoning: str):
+        """The answer written after the conversation `state` (fill's hash): its reasoning, for the next turn."""
+        if state is None or not reasoning.strip():
+            return
+        k = state.copy()
+        self._feed(k, {"role": "assistant", "content": content,
+                       "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
+        key = k.digest()
+        with self.lock:
+            old = self.table.pop(key, None)
+            self.chars -= len(old) if old else 0
+            self.table[key] = reasoning
+            self.chars += len(reasoning)
+            while self.table and (len(self.table) > self.max_entries or self.chars > self.max_chars):
+                self.chars -= len(self.table.popitem(last=False)[1])
 
 
 class Service:
@@ -532,6 +636,19 @@ class Service:
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+        # Issue #32: a prompt re-encodes only what follows the last special token it shares with a recent prompt
+        # (tools/strata_tokenizer.py PromptEncoder; the same ids by construction).  STRATA_OLD_PROMPT_ENCODE=1:
+        # the whole prompt every request, as before.  STRATA_CHECK_PROMPT_IDS=1: both, compared, on every request.
+        self.prompts = None
+        if hasattr(tokenizer, "encode_marked") and not os.environ.get("STRATA_OLD_PROMPT_ENCODE"):
+            try:
+                from strata_tokenizer import PromptEncoder
+                self.prompts = PromptEncoder(tokenizer)
+            except ImportError:                          # no `regex` module: the byte tokenizer's tests
+                pass
+        self.recall = None                               # ReasoningRecall (issue #34, --recall-reasoning)
+        self.recall_ctx = threading.local()              # the current request's conversation hash, for recall
+        self.last_level = None                           # (thinking level, messages) of the last prompt (issue #33)
 
     def set_shared(self, defaults) -> dict:
         """The Chat settings every client gets for what it leaves out; {} / None = clients use their own again."""
@@ -613,11 +730,41 @@ class Service:
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
 
+    def encode_prompt(self, prompt: str) -> list[int]:
+        if self.prompts is None:
+            return self.tok.encode(prompt, parse_special=True)
+        ids = self.prompts.encode(prompt)
+        if os.environ.get("STRATA_CHECK_PROMPT_IDS"):
+            full = self.tok.encode(prompt, parse_special=True)
+            if full != ids:
+                at = next((i for i, (a, b) in enumerate(zip(full, ids)) if a != b), min(len(full), len(ids)))
+                print(f"[strata] PROMPT IDS DIFFER from a full encode at id {at} ({len(ids)} vs {len(full)}): using "
+                      "the full encode - please report it with STRATA_DEBUG=1's output", flush=True)
+                return full
+        return ids
+
+    def _level_note(self, messages, kwargs):
+        """Issue #33: the thinking level is written into the system block at the very start of the prompt, so changing
+        it in the middle of a conversation (chat.py's /think, the web app's setting, a client alternating levels)
+        makes the engine read the whole conversation again.  Said in the server window when it happens."""
+        level = "none" if kwargs.get("enable_thinking") is False else str(kwargs.get("reasoning_effort") or "xhigh")
+        last, self.last_level = self.last_level, (level, messages)
+        if last is None or last[0] == level or len(last[1]) < 2 or len(messages) <= len(last[1]):
+            return
+        if all(a.get("role") == b.get("role") and a.get("content") == b.get("content")
+               for a, b in zip(messages, last[1])):
+            print(f"[strata] the thinking level changed ({last[0]} -> {level}) in the middle of a conversation: it is "
+                  "written at the start of the prompt, so the whole conversation is read again this time", flush=True)
+
     def prepare(self, messages, tools, kwargs, max_new=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context."""
+        self.recall_ctx.state = None
+        if self.recall is not None:
+            messages, self.recall_ctx.state = self.recall.fill(messages)
+        self._level_note(messages, kwargs)
         prompt = self.template.render(messages, tools=tools, **kwargs)
-        ids = self.tok.encode(prompt, parse_special=True)
+        ids = self.encode_prompt(prompt)
         self.embeddings.path = None
         images = images_of(messages)
         if images:
@@ -629,8 +776,22 @@ class Service:
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
+            combined = self.vision.dir / f"req-{uuid.uuid4().hex[:12]}.sve"
             with self.fifo:
                 encoded = [self.vision.encode(src) for src in images]
+                # the request's embeddings file, while no other encode can evict the cached files it is made of;
+                # one image (issue #35): a hard link to its cached file instead of a copy of its ~10 MB
+                linked = False
+                if len(encoded) == 1:
+                    try:
+                        os.link(encoded[0][0], combined)
+                        linked = True
+                    except OSError:                     # a file system without hard links: copy
+                        pass
+                if not linked:
+                    with open(combined, "wb") as f:
+                        for path, _ in encoded:
+                            f.write(path.read_bytes())
             out, k = [], 0
             for t in ids:                               # one <|image_pad|> per image -> one per image token
                 if t == pad and k < len(encoded):
@@ -639,12 +800,9 @@ class Service:
                 else:
                     out.append(t)
             if k != len(encoded):
+                combined.unlink(missing_ok=True)
                 raise ValueError("the prompt and its images do not match")
             ids = out
-            combined = self.vision.dir / f"req-{uuid.uuid4().hex[:12]}.sve"
-            with open(combined, "wb") as f:
-                for path, _ in encoded:
-                    f.write(path.read_bytes())
             self.embeddings.path = combined
         room = self.engine.max_context - CTX_SLACK - len(ids)
         if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
@@ -704,6 +862,8 @@ class Service:
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb = getattr(self.embeddings, "path", None)
+        recall = getattr(self.recall_ctx, "state", None) if self.recall is not None else None
+        said = ([], [], [])                             # content, reasoning, tool calls: what the recall keeps
         with self.status_lock:
             self.status["queued"] += 1
         try:
@@ -736,6 +896,8 @@ class Service:
                             break
                         raw_ids.append(t)
                         evs = parser.feed(detok.push(t))
+                        if recall is not None:
+                            self._said(said, evs)
                         self._note(n, evs)
                         last_print = self._progress(last_print)
                         for ev in evs:
@@ -795,9 +957,23 @@ class Service:
                     if os.environ.get("STRATA_DEBUG") and raw_ids:
                         print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
                 self.status["busy"] = False
-        for ev in parser.finish():
+        tail = parser.finish()
+        if recall is not None:
+            self._said(said, tail)
+            self.recall.remember(recall, "".join(said[0]), said[2], "".join(said[1]))
+        for ev in tail:
             yield "event", ev
         yield "done", {"finish": finish, "completion_tokens": n}
+
+    @staticmethod
+    def _said(said, evs):
+        for ev in evs:
+            if ev.kind == "content":
+                said[0].append(ev.text)
+            elif ev.kind == "reasoning":
+                said[1].append(ev.text)
+            elif ev.kind == "tool_call":
+                said[2].append(ev.call)
 
 
 def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
@@ -1475,6 +1651,10 @@ def main() -> int:
     ap.add_argument("--mcp-config", help="a JSON file with MCP servers in Claude Desktop's format ({\"mcpServers\": "
                                          "{...}}); the web app's chat can use their tools (also \"mcp_servers\" in "
                                          "the config)")
+    ap.add_argument("--recall-reasoning", action="store_true",
+                    help="give past answers back their reasoning when a client omits it, so the engine continues its "
+                         "live sequence instead of reading the last answer again (changes those clients' prompts; also "
+                         "\"recall_reasoning\": true in the config or STRATA_RECALL_REASONING=1)")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
     if a.gpu is not None:
@@ -1528,6 +1708,9 @@ def main() -> int:
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     svc.api_key = a.api_key or cfg.get("api_key", "")
     svc.gpu_index = cfg.get("gpu") or 0                 # the Monitor reads the card the engine runs on (issue #51)
+    if a.recall_reasoning or cfg.get("recall_reasoning") is True or os.environ.get("STRATA_RECALL_REASONING") == "1":
+        svc.recall = ReasoningRecall()                  # issue #34
+        print("[strata] past answers get their reasoning back when a client omits it (recall_reasoning)", flush=True)
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
         try:

@@ -14,7 +14,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import CTX_SLACK, ByteTokenizer, EngineDied, MockEngine, Service, StrataEngine, serve  # noqa: E402
+from serve.server import (CTX_SLACK, ByteTokenizer, Detokenizer, EngineDied, MockEngine, Service,  # noqa: E402
+                          StrataEngine, serve)
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 4096
@@ -524,6 +525,332 @@ class WebApp(unittest.TestCase):
             self.assertEqual(self.get("/")[0], 200)                  # the page itself asks for the key
         finally:
             self.svc.api_key = ""
+
+
+def old_deltas(tok, ids):
+    d = Detokenizer(tok)
+    d.fast = False
+    return [d.push(t) for t in ids]
+
+
+def new_deltas(tok, ids):
+    d = Detokenizer(tok)
+    assert d.fast
+    return [d.push(t) for t in ids]
+
+
+class StreamingDetokenizer(unittest.TestCase):
+    """Issue #31: the incremental UTF-8 decoder gives the old re-decode's deltas, one for one."""
+
+    def random_ids(self, rnd, n):
+        out = []
+        chars = "aé你\U0001f600 \n"
+        while len(out) < n:
+            r = rnd.random()
+            if r < 0.5:
+                out += list(rnd.choice(chars).encode())          # whole or (cut below) split characters
+            elif r < 0.7:
+                out.append(rnd.randrange(0x80, 0x100))            # stray continuation / lead / invalid bytes
+            elif r < 0.75:
+                out += list("�".encode())                     # a real U+FFFD in the text
+            elif r < 0.8:
+                out.append(256 + rnd.randrange(len(ByteTokenizer.SPECIALS)))
+            else:
+                out += list(rnd.choice(chars).encode())[:rnd.randint(1, 3)]   # a character cut short
+        return out[:n]
+
+    def test_same_deltas_as_the_re_decode(self):
+        import random
+        tok, rnd = ByteTokenizer(), random.Random(1)
+        for i in range(400):
+            ids = self.random_ids(rnd, rnd.randint(0, 60))
+            with self.subTest(i=i):
+                self.assertEqual(new_deltas(tok, ids), old_deltas(tok, ids))
+
+    def test_real_vocabulary(self):
+        sys.path.insert(0, str(ROOT / "tools"))
+        from test_strata_tokenizer import load_tokenizer
+        tk = load_tokenizer()
+        if tk is None:
+            self.skipTest("no tokenizer (set STRATA_TOKENIZER or STRATA_GGUF_PY)")
+        import random
+        rnd = random.Random(2)
+        text = "Café 你好世界 \U0001f600\U0001f680 é مرحبا def f(x):\n\treturn x\n"
+        ids = tk.encode(text * 20)
+        self.assertEqual("".join(new_deltas(tk, ids)), text * 20)
+        self.assertEqual(new_deltas(tk, ids), old_deltas(tk, ids))
+        for i in range(50):                              # any ids, byte tokens included
+            ids = [rnd.randrange(len(tk.tokens) - 400) for _ in range(rnd.randint(1, 40))]
+            ids += [rnd.randrange(0x80 - 0x21, 256) for _ in range(rnd.randint(0, 6))]
+            rnd.shuffle(ids)
+            with self.subTest(i=i):
+                self.assertEqual(new_deltas(tk, ids), old_deltas(tk, ids))
+
+    def test_old_path_on_request(self):
+        os.environ["STRATA_OLD_DETOK"] = "1"
+        try:
+            self.assertFalse(Detokenizer(ByteTokenizer()).fast)
+        finally:
+            del os.environ["STRATA_OLD_DETOK"]
+
+
+class IncrementalPrompts(unittest.TestCase):
+    """Issue #32 over HTTP: every turn's prompt ids are those of a full encode, and a turn reuses the previous one's."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.engine = RecordingPrompt(tok, "Thinking.\n</think>\n\nThe answer.", max_context=CTX)
+        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    post = ClientShapes.post
+
+    def test_turns(self):
+        self.assertIsNotNone(self.svc.prompts)
+        msgs = [{"role": "system", "content": "Be brief."}]
+        for turn in range(6):
+            msgs.append({"role": "user", "content": f"question {turn} <|im_end|> é你 " * (turn + 1)})
+            status, b = self.post("/v1/chat/completions", {"model": "m", "max_tokens": 64, "messages": msgs})
+            self.assertEqual(status, 200, b)
+            prompt = self.svc.template.render(msgs)
+            self.assertEqual(self.engine.last_ids, self.svc.tok.encode(prompt, parse_special=True))
+            if turn:
+                self.assertGreater(self.svc.prompts.last_reused, len(prompt) // 3)
+            msgs.append({"role": "assistant", "content": b["choices"][0]["message"]["content"]})
+
+    def test_check_mode_and_old_path(self):
+        import contextlib
+        import io
+        os.environ["STRATA_CHECK_PROMPT_IDS"] = "1"
+        try:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                ids = self.svc.encode_prompt("<|im_start|>user\nhi<|im_end|>\n")
+            self.assertEqual(ids, self.svc.tok.encode("<|im_start|>user\nhi<|im_end|>\n", parse_special=True))
+            self.assertNotIn("DIFFER", out.getvalue())
+        finally:
+            del os.environ["STRATA_CHECK_PROMPT_IDS"]
+        os.environ["STRATA_OLD_PROMPT_ENCODE"] = "1"
+        try:
+            svc = Service(self.engine, self.svc.tok, self.svc.template)
+            self.assertIsNone(svc.prompts)
+        finally:
+            del os.environ["STRATA_OLD_PROMPT_ENCODE"]
+
+
+class ThinkingLevelNote(unittest.TestCase):
+    """Issue #33: a thinking level changed in the middle of a conversation is said in the server window."""
+
+    def test_note(self):
+        import contextlib
+        import io
+        tok = ByteTokenizer()
+        svc = Service(RecordingPrompt(tok, "</think>\n\nok", max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        conv = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            svc.prepare(conv[:1], None, {"reasoning_effort": "medium"})
+            svc.prepare(conv + [{"role": "user", "content": "more"}], None, {"reasoning_effort": "medium"})
+            self.assertNotIn("thinking level changed", out.getvalue())
+            svc.prepare(conv + [{"role": "user", "content": "more"}, {"role": "assistant", "content": "ok"},
+                                {"role": "user", "content": "again"}], None, {"reasoning_effort": "low"})
+            self.assertIn("thinking level changed (medium -> low)", out.getvalue())
+            out.truncate(0)
+            svc.prepare([{"role": "user", "content": "another conversation"}], None, {"enable_thinking": False})
+            self.assertNotIn("thinking level changed", out.getvalue())
+
+
+class RecallReasoning(unittest.TestCase):
+    """Issue #34: with --recall-reasoning a client that returns only the answer still continues the engine's live
+    sequence; without it, the prompt diverges right after <think> (the old behaviour, unchanged by default)."""
+
+    SCRIPT = "Let me think.\nStill thinking.\n</think>\n\nThe answer is 4."
+
+    def make(self, recall, script=None):
+        from serve.server import ReasoningRecall
+        tok = ByteTokenizer()
+        engine = RecordingPrompt(tok, script or self.SCRIPT, max_context=CTX)
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        if recall:
+            svc.recall = ReasoningRecall()
+        httpd = serve(svc, port=0)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        return svc, engine, f"http://127.0.0.1:{httpd.server_address[1]}"
+
+    def chat(self, base, body):
+        req = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+
+    def two_turns(self, recall):
+        svc, engine, base = self.make(recall)
+        msgs = [{"role": "user", "content": "2+2?"}]
+        b = self.chat(base, {"model": "m", "max_tokens": 200, "messages": msgs})
+        live = engine.last_ids + list(engine.script)       # what the engine holds after turn 1
+        msg = b["choices"][0]["message"]
+        self.assertEqual(msg["content"], "The answer is 4.")
+        msgs += [{"role": "assistant", "content": msg["content"]}, {"role": "user", "content": "and 3+3?"}]
+        self.chat(base, {"model": "m", "max_tokens": 200, "messages": msgs})
+        return svc, engine, live
+
+    def test_live_prefix_with_recall(self):
+        _, engine, live = self.two_turns(True)
+        self.assertEqual(engine.last_ids[:len(live)], live)
+
+    def test_default_is_unchanged(self):
+        svc, engine, live = self.two_turns(False)
+        self.assertIsNone(svc.recall)
+        self.assertNotEqual(engine.last_ids[:len(live)], live)
+        text = bytes(t for t in engine.last_ids if t < 256).decode()
+        self.assertIn("<think>\n\n</think>\n\nThe answer is 4.", text)
+
+    def test_other_conversation_gets_nothing(self):
+        svc, engine, base = self.make(True)
+        self.chat(base, {"model": "m", "max_tokens": 200, "messages": [{"role": "user", "content": "2+2?"}]})
+        self.chat(base, {"model": "m", "max_tokens": 200, "messages": [
+            {"role": "user", "content": "something else"}, {"role": "assistant", "content": "The answer is 4."},
+            {"role": "user", "content": "ok"}]})
+        text = bytes(t for t in engine.last_ids if t < 256).decode()
+        self.assertNotIn("Still thinking", text)
+
+    def test_client_reasoning_wins_and_tool_calls(self):
+        script = ("Need the tool.\n</think>\n\n<tool_call>\n<function=add>\n<parameter=a>\n2\n</parameter>\n"
+                  "</function>\n</tool_call>")
+        svc, engine, base = self.make(True, script)
+        tools = [{"type": "function", "function": {"name": "add", "parameters": {
+            "type": "object", "properties": {"a": {"type": "integer"}}}}}]
+        msgs = [{"role": "user", "content": "add"}]
+        b = self.chat(base, {"model": "m", "max_tokens": 300, "messages": msgs, "tools": tools})
+        live = engine.last_ids + list(engine.script)
+        call = b["choices"][0]["message"]["tool_calls"][0]
+        msgs += [{"role": "assistant", "content": None, "tool_calls": [call]},
+                 {"role": "tool", "tool_call_id": call["id"], "content": "4"}]
+        self.chat(base, {"model": "m", "max_tokens": 300, "messages": msgs, "tools": tools})
+        self.assertEqual(engine.last_ids[:len(live)], live)
+        msgs[1] = dict(msgs[1], reasoning_content="My own words.")          # a client that sends its own
+        self.chat(base, {"model": "m", "max_tokens": 300, "messages": msgs, "tools": tools})
+        text = bytes(t for t in engine.last_ids if t < 256).decode()
+        self.assertIn("My own words.", text)
+        self.assertNotIn("Need the tool.", text)
+
+    def test_chat_py_sends_its_reasoning_back(self):
+        sys.path.insert(0, str(ROOT))
+        import chat
+        _, engine, base = self.make(False)                 # a default server: chat.py alone is enough
+        url = base + "/v1/chat/completions"
+        msgs = [{"role": "user", "content": "2+2?"}]
+        parts = list(chat.stream(url, msgs, "high", 200))
+        live = engine.last_ids + list(engine.script)
+        msgs.append(chat.answer_message("".join(p[1] for p in parts), "".join(p[0] for p in parts)))
+        self.assertEqual(msgs[-1]["reasoning_content"], "Let me think.\nStill thinking.\n")
+        msgs.append({"role": "user", "content": "and 3+3?"})
+        list(chat.stream(url, msgs, "high", 200))
+        self.assertEqual(engine.last_ids[:len(live)], live)
+        self.assertNotIn("reasoning_content", chat.answer_message("a", "b", drop_thinking=True))
+
+    def test_bench_turns(self):
+        """tools/bench_turns.py, the A/B client of the doc, against this server."""
+        import contextlib
+        import io
+        import tempfile
+        sys.path.insert(0, str(ROOT / "tools"))
+        import bench_turns
+        _, engine, base = self.make(True)
+        port = int(base.rsplit(":", 1)[1])
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bench_turns.main(["--port", str(port), "--turns", "3", "--context-chars", "600",
+                                               "--max-tokens", "100", "--json", d + "/rows.json"]), 0)
+            rows = json.loads(Path(d, "rows.json").read_text())
+        self.assertEqual([r["turn"] for r in rows], [1, 2, 3])
+        self.assertTrue(all(r["first_text_s"] is not None for r in rows))
+        self.assertLess(rows[0]["prompt_tokens"], rows[1]["prompt_tokens"])
+        self.assertIn("Still thinking", bytes(t for t in engine.last_ids if t < 256).decode())   # recalled
+
+    def test_bounded(self):
+        from serve.server import ReasoningRecall
+        import hashlib
+        r = ReasoningRecall(max_entries=3, max_chars=100)
+        for i in range(10):
+            h = hashlib.sha256(str(i).encode())
+            r.remember(h, f"answer {i}", [], "x" * 30)
+        self.assertLessEqual(len(r.table), 3)
+        self.assertLessEqual(r.chars, 100)
+
+
+class VisionCache(unittest.TestCase):
+    """Issue #35: an image already encoded is found by its raw bytes, before any conversion, and a request with one
+    image links its cached embeddings instead of copying them."""
+
+    def make_vision(self):
+        import tempfile
+        from serve.server import Vision
+
+        class FakeProc:
+            def __init__(self):
+                self.stdin, self.stdout, self.encodes = self, self, 0
+
+            def write(self, line):
+                _, img, out = line.split()
+                Path(out).write_bytes(b"EMB" + Path(img).read_bytes())
+                self.encodes += 1
+
+            def flush(self):
+                pass
+
+            def readline(self):
+                return "OK 3\n"
+        v = Vision.__new__(Vision)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        v.dir, v.lock, v.cache, v.proc = Path(tmp.name), __import__("threading").Lock(), {}, FakeProc()
+        v.normalized = 0
+
+        def normalize(data):
+            v.normalized += 1
+            return b"PNG:" + data
+        v.normalize = normalize
+        return v
+
+    def test_raw_bytes_hit_before_normalize(self):
+        import base64
+        v = self.make_vision()
+        src = "data:image/webp;base64," + base64.b64encode(b"RIFF....WEBPVP8 fake").decode()
+        a = v.encode(src)
+        b = v.encode(src)
+        self.assertEqual(a, b)
+        self.assertEqual(v.normalized, 1)
+        self.assertEqual(v.proc.encodes, 1)
+        self.assertEqual(a[0].read_bytes(), b"EMBPNG:RIFF....WEBPVP8 fake")
+
+    def test_one_image_request_links(self):
+        import base64
+        v = self.make_vision()
+        tok = ByteTokenizer()
+        svc = Service(RecordingPrompt(tok, "</think>\n\nok", max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"), vision=v)
+        src = "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\nimage").decode()
+        msgs = [{"role": "user", "content": [{"type": "image", "source": src}, {"type": "text", "text": "what?"}]}]
+        ids, _, _ = svc.prepare(msgs, None, {}, 16)
+        self.assertEqual(ids.count(256 + ByteTokenizer.SPECIALS.index("<|image_pad|>")), 3)
+        req = Path(svc.embeddings.path)
+        cached = v.cache[next(iter(v.cache))][0]
+        self.assertEqual(req.read_bytes(), cached.read_bytes())
+        req.unlink()                                     # what Service.run does after the request
+        self.assertTrue(cached.exists())
+        msgs[0]["content"].append({"type": "image", "source": src})      # two images: one file, both in order
+        ids, _, _ = svc.prepare(msgs, None, {}, 16)
+        self.assertEqual(Path(svc.embeddings.path).read_bytes(), cached.read_bytes() * 2)
+        self.assertEqual(v.proc.encodes, 1)
 
 
 if __name__ == "__main__":
