@@ -150,6 +150,8 @@ private:
     uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;
     uint32_t* h_flagA_ = nullptr; uint32_t* m_flagA_ = nullptr;  // the GPU plan is in place
     uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
+    uint32_t* h_flagP_ = nullptr; uint32_t* m_flagP_ = nullptr;  // issue #15: the PLE rows are in h_ple_
+    bool ple_late_ = true;   // issue #15: PLE reads overlap layer 0 (STRATA_OLD_PLE_STAGING=1: read before launch)
     cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
     struct FlagSet { uint32_t* flag; uint32_t value; };
     FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)

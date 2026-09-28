@@ -103,8 +103,8 @@ void diag_active_verifier(std::FILE* f) {
 void Verifier::diag(std::FILE* f) const {
     auto rd = [](const uint32_t* p) { return p ? *(const volatile uint32_t*) p : 0u; };
     std::fprintf(f, "  verify window: %d tokens at position %lld, host at layer step %u; the GPU rang %u; flags: "
-                    "served %u, plan (A) %u, copies (B) %u\n", last_t_, (long long) last_pos0_, cur_layer_ + 1,
-                 rd(h_seq_), rd(h_flag_), rd(h_flagA_), rd(h_flagB_));
+                    "served %u, plan (A) %u, copies (B) %u, ple rows (P) %u\n", last_t_, (long long) last_pos0_,
+                 cur_layer_ + 1, rd(h_seq_), rd(h_flag_), rd(h_flagA_), rd(h_flagB_), rd(h_flagP_));
 }
 
 Verifier::~Verifier() {
@@ -118,7 +118,7 @@ Verifier::~Verifier() {
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (arena_) cudaFree(arena_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_};
+                     h_flagA_, h_plan_, h_flagB_, h_flagP_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
@@ -185,8 +185,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_flag_, (void**) &m_flag_) &&
               mapped(64, (void**) &h_flagA_, (void**) &m_flagA_) &&
               mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
+              mapped(64, (void**) &h_flagP_, (void**) &m_flagP_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
+    // Issue #15: the window's graph waits for the PLE rows just before layer 1 instead of copying them at its head,
+    // so the host reads them from the SSD while the GPU computes the embedding and layer 0. Same bytes, same
+    // kernels, same order of arithmetic; STRATA_OLD_PLE_STAGING=1 restores the read-before-launch path (A/B).
+    ple_late_ = std::getenv("STRATA_OLD_PLE_STAGING") == nullptr;
     // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
     {
         const int64_t cap = (int64_t) (T * K);
@@ -307,7 +312,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     copy_i32_from_mapped(tok_, m_tok_, T, cs);
     copy_i32_from_mapped(step_, m_step_, (int64_t) T * kStepCount, cs);
     copy_i32_from_mapped(pos_, m_pos_, (int64_t) T * NH, cs);
-    if (ple_on) copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
+    if (ple_on && !ple_late_) copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
 
     // ---- the embeddings, broadcast to the hc streams
     if (const NativeEmbed* ne = native_embed()) {       // plan v0.3 P6: the GGUF-form table
@@ -356,6 +361,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // already applied it)
         bool pending = l > 0 && !cvec().covers(l - 1);
         if (l == 1 && ple_on) {
+            if (ple_late_ && grp == 0) {                   // issue #15: the host raises P once h_ple_ is filled
+                wait_flag_ge(m_flagP_, 1u, cs);
+                copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
+            }
             float* normalized = (float*) ((uint8_t*) ss.ple.scratch + ple_block_scratch_bytes());
             for (int t = tb; t < te; ++t) {
                 gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
@@ -765,12 +774,28 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             prev[0] = prev[1];
             prev[1] = tokens[t];
         }
-        if (!ss.ple.table->gather_batch(rows, (size_t) T, h_ple_, err)) return false;
+        // Issue #15: late staging only starts the reads here; they land in h_ple_ after the launch (below).
+        if (ple_late_ ? !ss.ple.table->issue_batch(rows, (size_t) T, err)
+                      : !ss.ple.table->gather_batch(rows, (size_t) T, h_ple_, err))
+            return false;
     }
+    const bool ple_pending = ple_late_ && ss.ple.ready();
+    std::string ple_err;
+    // A batch issued and not collected is collected on any early return, so the table takes the next window's.
+    struct PleGuard {
+        strata::kernels::PleTable* table;
+        float* out;
+        bool open;
+        ~PleGuard() {
+            std::string e;
+            if (open) (void) table->collect_batch(out, e);
+        }
+    } ple_guard{ss.ple.table, h_ple_, ple_pending};
     *(volatile uint32_t*) h_seq_ = 0;
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    *(volatile uint32_t*) h_flagP_ = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = T;
     last_pos0_ = pos0;
@@ -834,12 +859,27 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
+        if (k == 0 && ple_pending) {
+            // Issue #15: the rows were read while the GPU ran the embedding and layer 0 and the pool served its
+            // first group; the graph waits for P just before layer 1 (after post(0, first group), so a split
+            // window's second group of layer 0 is served while the GPU is already in layer 1). On a failed read
+            // the window still runs to its end on whatever h_ple_ holds - a graph stopped halfway would hang the
+            // stream - and the call fails after it.
+            const Clock::time_point c0 = Clock::now();
+            ple_guard.open = false;
+            if (!ss.ple.table->collect_batch(h_ple_, ple_err) && ple_err.empty()) ple_err = "verify: a PLE read failed";
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            _mm_sfence();
+            *(volatile uint32_t*) h_flagP_ = 1u;
+            ms_host += ms_since(c0);
+        }
     }
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
+    if (!ple_err.empty()) { err = ple_err; return false; }
     // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
     // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
     // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever
