@@ -3,6 +3,7 @@
 // The per-token arithmetic of every kernel here is transcribed from its single-token original (fused_gdn.cu,
 // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/launch_grid.hpp"
 
 #include <cuda_runtime.h>
 
@@ -111,6 +112,87 @@ __global__ void __launch_bounds__(256) gdn_ab_multi_kernel(const float* __restri
     }
 }
 
+// Issue #26 (O7): the same rows, one per block of four warps (96 blocks instead of 12).  All 128 threads stage the
+// row's weights in shared memory at once (4 chunks of 8 each at most), then warp w runs tokens w and w + 4: each
+// (lane, token) chain is the kernel's above - same chunks in the same order, same fmaf sequence, same butterfly and
+// epilogue - so gate and beta are bitwise its own.
+constexpr int ABM_THREADS = 128;
+constexpr int ABM_LOADS = 4;                      // n_embd <= 4 * 128 * 8 = 4096
+static_assert(kVerifyMaxT <= 2 * (ABM_THREADS / 32), "gdn_ab_multi_row_kernel runs two tokens per warp");
+
+__device__ __forceinline__ void ab_multi_out(float a, bool is_beta, int r, int t, int h_v, const float* __restrict__ dt,
+                                             const float* __restrict__ ssm_a, float* __restrict__ gate,
+                                             float* __restrict__ beta) {
+    for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+    if ((threadIdx.x & 31) != 0) return;
+    if (is_beta) {
+        beta[(size_t) t * h_v + r] = 1.0f / (1.0f + __expf(-a));
+    } else {
+        const float v = a + dt[r];
+        const float sp = v > 20.0f ? v : log1pf(__expf(v));
+        gate[(size_t) t * h_v + r] = sp * ssm_a[r];
+    }
+}
+
+__global__ void __launch_bounds__(ABM_THREADS) gdn_ab_multi_row_kernel(const float* __restrict__ x,
+                                                                       const uint16_t* __restrict__ wa,
+                                                                       const uint16_t* __restrict__ wb,
+                                                                       const float* __restrict__ dt,
+                                                                       const float* __restrict__ ssm_a,
+                                                                       float* __restrict__ gate,
+                                                                       float* __restrict__ beta, int n, int h_v,
+                                                                       int T) {
+    extern __shared__ uint4 abm_w[];              // the row: n/8 chunks of 8 bf16
+    const int n8 = n / 8;
+    const int row = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const bool is_beta = row >= h_v;
+    const int r = is_beta ? row - h_v : row;
+    const uint4* w4 = reinterpret_cast<const uint4*>((is_beta ? wb : wa) + (size_t) r * n);
+    uint4 wv[ABM_LOADS];
+#pragma unroll
+    for (int u = 0; u < ABM_LOADS; ++u) {
+        const int j = (int) threadIdx.x + u * ABM_THREADS;
+        if (j < n8) wv[u] = __ldg(w4 + j);
+    }
+#pragma unroll
+    for (int u = 0; u < ABM_LOADS; ++u) {
+        const int j = (int) threadIdx.x + u * ABM_THREADS;
+        if (j < n8) abm_w[j] = wv[u];
+    }
+    __syncthreads();
+    const int t0 = warp, t1 = warp + ABM_THREADS / 32;
+    if (t0 >= T) return;
+    const bool two = t1 < T;
+    const float* x0 = x + (size_t) t0 * n;
+    const float* x1 = x + (size_t) (two ? t1 : t0) * n;
+    float acc0 = 0.0f, acc1 = 0.0f;
+    for (int j = lane; j < n8; j += 32) {
+        const uint4 wv = abm_w[j];
+        {
+            const float4 xa = *reinterpret_cast<const float4*>(x0 + j * 8);
+            const float4 xb = *reinterpret_cast<const float4*>(x0 + j * 8 + 4);
+            float a = acc0;
+            a = fmaf(__uint_as_float(wv.x << 16), xa.x, a); a = fmaf(__uint_as_float(wv.x & 0xffff0000u), xa.y, a);
+            a = fmaf(__uint_as_float(wv.y << 16), xa.z, a); a = fmaf(__uint_as_float(wv.y & 0xffff0000u), xa.w, a);
+            a = fmaf(__uint_as_float(wv.z << 16), xb.x, a); a = fmaf(__uint_as_float(wv.z & 0xffff0000u), xb.y, a);
+            a = fmaf(__uint_as_float(wv.w << 16), xb.z, a); a = fmaf(__uint_as_float(wv.w & 0xffff0000u), xb.w, a);
+            acc0 = a;
+        }
+        if (two) {
+            const float4 xa = *reinterpret_cast<const float4*>(x1 + j * 8);
+            const float4 xb = *reinterpret_cast<const float4*>(x1 + j * 8 + 4);
+            float a = acc1;
+            a = fmaf(__uint_as_float(wv.x << 16), xa.x, a); a = fmaf(__uint_as_float(wv.x & 0xffff0000u), xa.y, a);
+            a = fmaf(__uint_as_float(wv.y << 16), xa.z, a); a = fmaf(__uint_as_float(wv.y & 0xffff0000u), xa.w, a);
+            a = fmaf(__uint_as_float(wv.z << 16), xb.x, a); a = fmaf(__uint_as_float(wv.z & 0xffff0000u), xb.y, a);
+            a = fmaf(__uint_as_float(wv.w << 16), xb.z, a); a = fmaf(__uint_as_float(wv.w & 0xffff0000u), xb.w, a);
+            acc1 = a;
+        }
+    }
+    ab_multi_out(acc0, is_beta, r, t0, h_v, dt, ssm_a, gate, beta);
+    if (two) ab_multi_out(acc1, is_beta, r, t1, h_v, dt, ssm_a, gate, beta);
+}
+
 __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __restrict__ state,
                                                                      const float* __restrict__ hbuf, int C,
                                                                      const float* __restrict__ gate,
@@ -177,6 +259,113 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
 #pragma unroll
         for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
     }
+}
+
+// Issue #26 (O7): the kernel above with a head's 128 columns split over a cluster of GC blocks (32 columns x 4 row
+// groups each): 4x the SMs on the state load and the commit's store.  A column's arithmetic is the kernel's above
+// line for line.  Two things move, neither touching a value:
+//   * the RMS norm of token t needs the whole head, so it waits until after the token loop: warp 0 of each block
+//     (32 consecutive columns, the same lane per column as warp `part` above, hence the same butterfly) pushes its
+//     sum for t into every block of the cluster, and after one cluster barrier `ss` adds the same four warp sums in
+//     the same order;
+//   * the kv and o partials use separate arrays, which removes the barrier between reading one and writing the
+//     other: with the norm's barrier gone too, 4 block barriers per token instead of 6 (5 for a replayed token).
+// sm_90 and newer; the launcher checks before using it.
+constexpr int GC = 4;                             // blocks per head
+constexpr int GCW = S / GC;                       // 32 columns per block
+
+__global__ void __launch_bounds__(GCW * RG) gdn_step_norm_multi_cluster_kernel(float* __restrict__ state,
+                                                                               const float* __restrict__ hbuf, int C,
+                                                                               const float* __restrict__ gate,
+                                                                               const float* __restrict__ beta,
+                                                                               const float* __restrict__ z,
+                                                                               const float* __restrict__ gamma,
+                                                                               float eps, float* __restrict__ y,
+                                                                               int h_k, int h_v, int T,
+                                                                               const int32_t* __restrict__ n_keep,
+                                                                               int t_out_begin) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    __shared__ float sk[S], sq[S];
+    __shared__ float red_kv[RG][GCW], red_o[RG][GCW];
+    __shared__ float wsum[kVerifyMaxT][S / 32];   // per token, the head's four warp sums (one pushed by each block)
+    __shared__ float ocs[kVerifyMaxT][GCW];       // row group 0's outputs, normed after the token loop
+    __cluster_barrier_arrive_relaxed();           // waited below, before the first store into another block
+    const int part = (int) __clusterRelativeBlockRank();
+    const int head = blockIdx.x / GC;
+    const int c = threadIdx.x;                    // 0..31
+    const int col = part * GCW + c;
+    const int rg = threadIdx.y;                   // 0..3
+    const int tid = rg * GCW + c;                 // 0..127
+    const int qh = head % h_k;
+    const int qk = S * h_k;                       // q at [0, qk), k at [qk, 2qk), v at [2qk, ...)
+    const int value_dim = S * h_v;
+    const int n = n_keep ? *n_keep : T;
+    // wsum/ocs hold kVerifyMaxT tokens; the host keeps T and *n_keep within it.  More is a broken caller, where the
+    // kernel above would run it (reading past hbuf): stop here rather than silently run fewer tokens than it.
+    if (n > kVerifyMaxT) __trap();
+    float s[RPG];
+    float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+    const size_t row_stride = (size_t) h_v * S;
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+    __cluster_barrier_wait();                     // every block of the cluster is running: DSMEM is live
+    for (int t = 0; t < n; ++t) {
+        const float* ht = hbuf + (size_t) t * C;
+        __syncthreads();                          // the previous token is done with sk/sq, red_kv and red_o
+        if (tid < S) { sk[tid] = ht[qk + qh * S + tid]; sq[tid] = ht[qh * S + tid]; }
+        __syncthreads();
+        const float g = __expf(gate[(size_t) t * h_v + head]);
+        float kv = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
+        red_kv[rg][c] = kv;
+        __syncthreads();
+        const float kv_col = red_kv[0][c] + red_kv[1][c] + red_kv[2][c] + red_kv[3][c];
+        const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
+        float o = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) {
+            s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
+            o = fmaf(s[r], sq[rg * RPG + r], o);
+        }
+        red_o[rg][c] = o;
+        __syncthreads();
+        float oc = 0.0f, sq_part = 0.0f;
+        if (rg == 0) {
+            oc = (red_o[0][c] + red_o[1][c] + red_o[2][c] + red_o[3][c]) * rsqrtf((float) S);
+            sq_part = oc * oc;
+        }
+        if (t < t_out_begin) continue;   // a replayed token: its state update is needed, its output is not
+        for (int o2 = 16; o2 > 0; o2 >>= 1) sq_part += __shfl_xor_sync(0xffffffffu, sq_part, o2);
+        if (rg == 0) {
+            ocs[t][c] = oc;
+            if (c == 0) {
+#pragma unroll
+                for (int b = 0; b < GC; ++b)
+                    static_cast<float*>(__cluster_map_shared_rank(&wsum[t][0], (unsigned) b))[part] = sq_part;
+            }
+        }
+    }
+    __cluster_barrier_arrive();                   // release: every push above ...
+    __cluster_barrier_wait();                     // ... is visible here, and no block reads another after this
+    if (rg == 0) {
+        for (int t = t_out_begin; t < n; ++t) {
+            const float ss = wsum[t][0] + wsum[t][1] + wsum[t][2] + wsum[t][3];
+            const float scale = rsqrtf(ss / (float) S + eps);
+            const float zz = z[(size_t) t * value_dim + head * S + col];
+            y[(size_t) t * value_dim + head * S + col] = ocs[t][c] * scale * gamma[col] * (1.0f / (1.0f + __expf(-zz)));
+        }
+    }
+    if (n_keep != nullptr && n > 0) {
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
+    }
+#endif
+}
+
+bool multi_cluster_ready() {
+    static const bool ready = cluster_launchable(gdn_step_norm_multi_cluster_kernel, dim3(GCW, RG), GC);
+    return ready;
 }
 
 __global__ void embedding_gather_dev_kernel(const uint8_t* __restrict__ codes, const float* __restrict__ scales,
@@ -307,7 +496,9 @@ __global__ void dense_steps_kernel(const int32_t* __restrict__ cells, int n, int
 void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream) {
     if (cap <= 0) return;
     if (blob_bytes % 16 != 0) { std::fprintf(stderr, "fetch_blobs: blob size must be a multiple of 16\n"); std::exit(1); }
-    fetch_blobs_kernel<<<48 * 8, 256, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst, (long long) (blob_bytes / 16));
+    // issue #26: 8 blocks per SM of THIS device (48 * 8 was the RTX 5070's); a grid-stride copy, so any grid is exact
+    fetch_blobs_kernel<<<(unsigned) (grid_sms() * 8), 256, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst,
+                                                                                         (long long) (blob_bytes / 16));
     check("fetch_blobs");
 }
 
@@ -337,12 +528,13 @@ void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const 
 
 void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int64_t n, uint8_t* dst, void* stream) {
     cudaStream_t s = (cudaStream_t) stream;
+    const unsigned blocks = (unsigned) (grid_sms() * 8);   // issue #26: this device's SMs; a grid-stride copy
     if (row_bytes % 16 == 0)
-        gather_rows_kernel<<<48 * 8, 256, 0, s>>>((const uint4*) src, row_bytes / 16, ids, n, (uint4*) dst);
+        gather_rows_kernel<<<blocks, 256, 0, s>>>((const uint4*) src, row_bytes / 16, ids, n, (uint4*) dst);
     else if (row_bytes % 4 == 0)
-        gather_rows_kernel<<<48 * 8, 256, 0, s>>>((const uint32_t*) src, row_bytes / 4, ids, n, (uint32_t*) dst);
+        gather_rows_kernel<<<blocks, 256, 0, s>>>((const uint32_t*) src, row_bytes / 4, ids, n, (uint32_t*) dst);
     else
-        gather_rows_kernel<<<48 * 8, 256, 0, s>>>(src, row_bytes, ids, n, dst);
+        gather_rows_kernel<<<blocks, 256, 0, s>>>(src, row_bytes, ids, n, dst);
     check("gather_rows");
 }
 
@@ -403,8 +595,12 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
         std::fprintf(stderr, "gdn_ab_multi: invalid arguments\n");
         std::exit(1);
     }
-    gdn_ab_multi_kernel<<<(unsigned) ((2 * h_v + 7) / 8), 256, 0, (cudaStream_t) stream>>>(
-        x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
+    if (old_gdn_ab().on() || n_embd > ABM_LOADS * ABM_THREADS * 8)
+        gdn_ab_multi_kernel<<<(unsigned) ((2 * h_v + 7) / 8), 256, 0, (cudaStream_t) stream>>>(
+            x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
+    else
+        gdn_ab_multi_row_kernel<<<(unsigned) (2 * h_v), ABM_THREADS, (size_t) (n_embd / 8) * 16, (cudaStream_t) stream>>>(
+            x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
     check("gdn_ab_multi");
 }
 
@@ -416,9 +612,34 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         std::fprintf(stderr, "gdn_step_norm_multi: invalid arguments\n");
         std::exit(1);
     }
-    gdn_step_norm_multi_kernel<<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(
-        state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin);
+    if (gdn_step_norm_multi_cluster_path()) {
+        cudaLaunchAttribute at{};
+        at.id = cudaLaunchAttributeClusterDimension;
+        at.val.clusterDim.x = GC;
+        at.val.clusterDim.y = 1;
+        at.val.clusterDim.z = 1;
+        cudaLaunchConfig_t cfg{};
+        cfg.gridDim = dim3((unsigned) (h_v * GC));
+        cfg.blockDim = dim3(GCW, RG);
+        cfg.stream = (cudaStream_t) stream;
+        cfg.attrs = &at;
+        cfg.numAttrs = 1;
+        const cudaError_t e = cudaLaunchKernelEx(&cfg, gdn_step_norm_multi_cluster_kernel, state, h, conv_channels, gate,
+                                                 beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin);
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "gdn_step_norm_multi (cluster; STRATA_OLD_GDN_STEP=1 avoids it): %s\n",
+                         cudaGetErrorString(e));
+            std::exit(1);
+        }
+    } else {
+        gdn_step_norm_multi_kernel<<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(
+            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin);
+    }
     check("gdn_step_norm_multi");
+}
+
+bool gdn_step_norm_multi_cluster_path() {
+    return !old_gdn_step().on() && multi_cluster_ready();
 }
 
 namespace {
