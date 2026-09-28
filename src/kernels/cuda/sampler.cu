@@ -10,9 +10,11 @@
 // produces a valid token, so only a comparison at the distribution level can tell them apart; the parity test
 // does that against an independently computed distribution.
 //
-// Both kernels put ONE BLOCK per token over the vocabulary: `sampler_greedy_kernel` is the plain argmax,
-// `sampler_kernel` runs the sampled chain as `top_k` block-argmax rounds followed by the top_p / temperature /
-// draw chain (its header says why the selection must be parallel and why the tie rule keeps the semantics).
+// `sampler_greedy_kernel` is the plain argmax, one block per token over the vocabulary.  The sampled chain has
+// two implementations that pick the same token, bit for bit (issue #20):
+//   - `sampler_one_block_kernel` (default): one block per token, `top_k` block-argmax rounds, each over the
+//     logits after the previous pick, then the top_p / min_p / temperature / draw tail on one warp;
+//   - `sampler_kernel` (`STRATA_OLD_SAMPLER=1`), the kernel of engine 0.1.20, kept as the reference.
 #include "strata/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
@@ -20,6 +22,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace strata::kernels {
 namespace {
@@ -170,6 +173,11 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
 /// serial scan's strict `>` keeps the first maximum it meets), so the kept sequence - both its set and its
 /// order - is unchanged; `top_p`'s cut reads that order in double arithmetic as before; temperature and the
 /// Philox draw apply after the cut.  `sampler_parity` pins all of it against the host reference.
+///
+/// **KEPT AS THE REFERENCE, BEHIND `STRATA_OLD_SAMPLER=1` (issue #20).**  Two costs remain in it: the `taken`
+/// sweep is O(k) per logit per round, O(k^2 x n_vocab) per row (47 M shared-memory compares at k = 20, 500 M at
+/// 64), and the double-precision tail runs on all 1,024 threads where one warp suffices - GeForce issues FP64 at
+/// 1/64 of FP32.  The kernels after this one remove both and select the same list in the same order.
 __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, int n_tokens,
                                const int* __restrict__ history, int history_len, const SamplerParams p,
                                int* __restrict__ out) {
@@ -302,6 +310,185 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
     if (threadIdx.x == 0) out[t] = pick;
 }
 
+// ---- issue #20: the same list, in the same order, without the `taken` sweep ----
+//
+// THE SELECTION ORDER.  `sampler_kernel`'s rounds rank a candidate (value, id) before (value', id') when value >
+// value', or value == value' and id < id' - each thread's ascending scan keeps the first maximum it meets (strict
+// `>`), and the reductions resolve a tie to the lower id.  That is a strict total order (-0 and +0 compare equal and
+// fall to the id, as there), so round i picks the i-th logit of the order.  NaN and -inf are never picked (`s > bv`
+// from -inf fails); a round that finds nothing yields the SENTINEL (-inf, n_vocab), stored as id 0.
+
+constexpr int kSelMax = 64;               // the widest top_k list, `sampler_kernel`'s KMAX
+constexpr unsigned kFullMask = 0xFFFFFFFFu;
+
+// top_k 1..64 as given; 0 ("off") and anything wider keep 64; never more than the vocabulary
+__host__ __device__ __forceinline__ int sampled_k(int top_k, int n_vocab) {
+    int k = (top_k > 0 && top_k < kSelMax) ? top_k : kSelMax;
+    return k > n_vocab ? n_vocab : k;
+}
+
+/// **THE TAIL ON ONE WARP, WITH `sampler_kernel`'S ARITHMETIC.**  `sel_ids` / `sel_logit` (shared, `k` entries) are
+/// the top_k list in selection order; the 32 lanes of one warp call this and lane 0 writes `out[t]`.  The old tail
+/// ran on all 1,024 threads, each computing the same ~4k double `exp`s - FP64 issues at 1/64 of FP32 on GeForce.
+/// Here the lanes share the `exp`s (one per entry, into `ex`) and then the quotients, and lane 0 alone runs the two
+/// ORDERED sums and the two cumulative scans.  Every double is the one the old chain computed: the same `exp` of
+/// the same argument, the sums in the same order, `cum += e / sum` with the same correctly rounded quotient - so
+/// the cut, the survivors and the pick are the same.  (`n_keep == 0`, reachable only with min_p > 1, which the
+/// callers clamp, read `sel_ids[-1]` in the old tail; it reads `sel_ids[0]` here.)
+__device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, int k, const SamplerParams& p, int t,
+                                  int* __restrict__ out, double* ex) {
+    const int lane = (int) (threadIdx.x & 31);
+    const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
+    int n_keep = k;
+    float mx = sel_logit[0];
+    for (int i = 1; i < k; ++i) mx = fmaxf(mx, sel_logit[i]);
+    if (p.top_p < 1.0f) {
+        for (int i = lane; i < k; i += 32) ex[i] = exp((double) sel_logit[i] - (double) mx);
+        __syncwarp();
+        double sum = 0.0;
+        if (lane == 0)
+            for (int i = 0; i < k; ++i) sum += ex[i];
+        sum = __shfl_sync(kFullMask, sum, 0);
+        __syncwarp();                            // lane 0 has read every `ex` before it is overwritten
+        for (int i = lane; i < k; i += 32) ex[i] = ex[i] / sum;
+        __syncwarp();
+        int cut = k;
+        if (lane == 0) {
+            double cum = 0.0;
+            for (int i = 0; i < k; ++i) {
+                cum += ex[i];
+                if (cum >= (double) p.top_p) { cut = i + 1; break; }
+            }
+        }
+        cut = __shfl_sync(kFullMask, cut, 0);
+        if (cut < p.min_keep) cut = p.min_keep < k ? p.min_keep : k;
+        n_keep = cut;
+        __syncwarp();                            // `ex` is written again below
+    }
+    // min_p on top_p's survivors, as in `sampler_kernel` (every lane, the same float arithmetic)
+    if (p.min_p > 0.0f) {
+        const float thresh = sel_logit[0] + logf(p.min_p);
+        for (int i = 0; i < n_keep; ++i)
+            if (sel_logit[i] < thresh) { n_keep = i; break; }
+    }
+    // temperature, then one Philox draw
+    float smx = sel_logit[0] * inv_t;
+    for (int i = 1; i < n_keep; ++i) smx = fmaxf(smx, sel_logit[i] * inv_t);
+    for (int i = lane; i < n_keep; i += 32) ex[i] = exp((double) (sel_logit[i] * inv_t) - (double) smx);
+    __syncwarp();
+    double sum = 0.0;
+    if (lane == 0)
+        for (int i = 0; i < n_keep; ++i) sum += ex[i];
+    sum = __shfl_sync(kFullMask, sum, 0);
+    __syncwarp();
+    for (int i = lane; i < n_keep; i += 32) ex[i] = ex[i] / sum;
+    __syncwarp();
+    if (lane == 0) {
+        const float u = philox_uniform(p.seed, p.counter + (uint64_t) t);
+        double cum = 0.0;
+        int pick = sel_ids[n_keep > 0 ? n_keep - 1 : 0];
+        for (int i = 0; i < n_keep; ++i) {
+            cum += ex[i];
+            if ((double) u < cum) { pick = sel_ids[i]; break; }
+        }
+        out[t] = pick;
+    }
+}
+
+/// **THE ONE-BLOCK SAMPLED PATH: `sampler_kernel` WITHOUT THE `taken` SWEEP.**  Round i's candidates are the logits
+/// strictly AFTER round i-1's pick in the selection order, `s < prev_v || (s == prev_v && v > prev_i)`, which is
+/// exactly the set `taken` left: the picks so far are the first i of the order, so what comes after the last one is
+/// what has not been picked.  The round is then the same block argmax with the same tie rule, so the list is the
+/// same list in the same order.  An empty round leaves (-inf, id 0) as before, and every round after it is empty
+/// in both versions (nothing after -inf beats -inf).  O(k x n_vocab) per row instead of O(k^2 x n_vocab), then warp
+/// 0 runs the tail.
+__global__ void __launch_bounds__(1024)
+sampler_one_block_kernel(const float* __restrict__ logits, int n_vocab, const int* __restrict__ history,
+                         int history_len, const SamplerParams p, int* __restrict__ out) {
+    const int t = blockIdx.x;
+    const float* l = logits + (size_t) t * n_vocab;
+
+    // the penalty window and its membership bitmap, exactly as in `sampler_kernel`
+    const int* hrow = history ? history + (size_t) t * history_len : nullptr;
+    int hlen = 0;
+    if (hrow) {
+        hlen = p.penalty_last_n < history_len ? p.penalty_last_n : history_len;
+        if (hlen < 0) hlen = 0;
+        hrow += history_len - hlen;          // the window is the TAIL
+    }
+    extern __shared__ unsigned int penal_bits[];
+    const int bits_words = (int) ((n_vocab + 31) / 32);
+    const bool use_bits = hrow != nullptr && hlen > 0 && bits_words > 0;
+    if (use_bits) {
+        for (int w = threadIdx.x; w < bits_words; w += blockDim.x) penal_bits[w] = 0u;
+        __syncthreads();
+        for (int i = threadIdx.x; i < hlen; i += blockDim.x)
+            if (hrow[i] >= 0 && hrow[i] < n_vocab)   // an id outside the vocabulary is never a candidate
+                atomicOr(&penal_bits[hrow[i] >> 5], 1u << (hrow[i] & 31));
+        __syncthreads();
+    }
+    auto hit_count = [&](int v) -> int {
+        if (!use_bits || !(penal_bits[v >> 5] & (1u << (v & 31)))) return 0;
+        return history_count(hrow, hlen, v);
+    };
+
+    const int k = sampled_k(p.top_k, n_vocab);
+    __shared__ int sel_ids[kSelMax];
+    __shared__ float sel_logit[kSelMax];
+    __shared__ double ex[kSelMax];
+    __shared__ float sv[32];
+    __shared__ int si[32];
+    const int warp = (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31);
+    float prev_v = __int_as_float(0x7f800000);   // +inf and id -1: round 0 takes every logit
+    int prev_i = -1;
+    for (int i = 0; i < k; ++i) {
+        float bv = __int_as_float(0xff800000);   // -inf
+        int best = n_vocab;
+        for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) {
+            const float s = apply_penalties(l[v], hit_count(v), p);
+            if ((s < prev_v || (s == prev_v && v > prev_i)) && s > bv) { bv = s; best = v; }
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_down_sync(0xFFFFFFFFu, bv, off);
+            const int oi = __shfl_down_sync(0xFFFFFFFFu, best, off);
+            if (ov > bv || (ov == bv && oi < best)) { bv = ov; best = oi; }
+        }
+        if (lane == 0) { sv[warp] = bv; si[warp] = best; }
+        __syncthreads();
+        if (warp == 0) {
+            const int nw = (int) ((blockDim.x + 31) >> 5);
+            float wv = lane < nw ? sv[lane] : __int_as_float(0xff800000);
+            int wi = lane < nw ? si[lane] : n_vocab;
+            for (int off = 16; off > 0; off >>= 1) {
+                const float ov = __shfl_down_sync(0xFFFFFFFFu, wv, off);
+                const int oi = __shfl_down_sync(0xFFFFFFFFu, wi, off);
+                if (ov > wv || (ov == wv && oi < wi)) { wv = ov; wi = oi; }
+            }
+            if (lane == 0) { sel_ids[i] = (wi < n_vocab) ? wi : 0; sel_logit[i] = wv; }
+        }
+        __syncthreads();
+        // An empty round leaves (-inf, 0): nothing comes after it, as nothing was left untaken.
+        prev_v = sel_logit[i];
+        prev_i = sel_ids[i];
+    }
+    if (warp != 0) return;
+    sampled_tail_warp(sel_ids, sel_logit, k, p, t, out, ex);
+}
+
+// Which sampled path runs, read once (issue #20): `STRATA_OLD_SAMPLER=1` is `sampler_kernel` (engine 0.1.20);
+// by default the one-block kernel.
+enum class SampledPath { OneBlock, Old };
+
+bool env_flag(const char* name) {
+    const char* e = std::getenv(name);
+    return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
+}
+
+SampledPath sampled_path() {
+    static const SampledPath path = env_flag("STRATA_OLD_SAMPLER") ? SampledPath::Old : SampledPath::OneBlock;
+    return path;
+}
+
 }  // namespace
 
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
@@ -320,11 +507,15 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
         const int gthreads = 1024;
         sampler_greedy_kernel<<<(unsigned) n_tokens, gthreads, shmem, (cudaStream_t) stream>>>(
             logits, n_vocab, history, history_len, p, p.penalty_last_n, p.penalty_last_n, out);
-    } else {
+    } else if (sampled_path() == SampledPath::Old) {
         // The same block-per-token shape: the selection's k argmax rounds reduce inside the block.  See
         // `sampler_kernel`'s header for what the old one-thread-per-token launch cost.
         sampler_kernel<<<(unsigned) n_tokens, 1024, shmem, (cudaStream_t) stream>>>(
             logits, n_vocab, n_tokens, history, history_len, p, out);
+    } else {
+        // The same shape without the `taken` sweep, and the tail on one warp: `sampler_one_block_kernel`.
+        sampler_one_block_kernel<<<(unsigned) n_tokens, 1024, shmem, (cudaStream_t) stream>>>(
+            logits, n_vocab, history, history_len, p, out);
     }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
