@@ -299,8 +299,10 @@ __global__ void __launch_bounds__(GCW * RG) gdn_step_norm_multi_cluster_kernel(f
     const int qh = head % h_k;
     const int qk = S * h_k;                       // q at [0, qk), k at [qk, 2qk), v at [2qk, ...)
     const int value_dim = S * h_v;
-    const int n_run = n_keep ? *n_keep : T;
-    const int n = n_run < kVerifyMaxT ? n_run : kVerifyMaxT;   // the host keeps T <= kVerifyMaxT; wsum/ocs hold that
+    const int n = n_keep ? *n_keep : T;
+    // wsum/ocs hold kVerifyMaxT tokens; the host keeps T and *n_keep within it.  More is a broken caller, where the
+    // kernel above would run it (reading past hbuf): stop here rather than silently run fewer tokens than it.
+    if (n > kVerifyMaxT) __trap();
     float s[RPG];
     float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
     const size_t row_stride = (size_t) h_v * S;
