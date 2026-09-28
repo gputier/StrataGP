@@ -14,6 +14,7 @@
 //   5. the router (B8): route_native over a chunk against native_router_top10 token by token (ids and weights
 //      bitwise, with ties, a flat row and underflowing probabilities), route_decode's dispatch, and - reported, not
 //      judged - how often the default prompt router (precise expf) picks a different set.
+// `--bench [T]` times old against new at a real chunk size (8192 by default) instead: no checks.
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/router_top10.hpp"
 #include "strata/prefill/kernels.hpp"
@@ -390,10 +391,99 @@ void test_route(std::mt19937& rng) {
                 "on %lld rows (ids or order), max weight difference %.2g\n", (long long) T, (long long) rows, wmax);
     cudaFree(d_lg); cudaFree(id_a); cudaFree(id_b); cudaFree(w_a); cudaFree(w_b);
 }
+
+// ---------------------------------------------------------------- --bench: old against new at a real chunk size
+template <class F> double time_ms(F&& f, int reps = 5) {
+    cudaEvent_t a, b;
+    ck(cudaEventCreate(&a), "event");
+    ck(cudaEventCreate(&b), "event");
+    f();   // warm-up
+    ck(cudaEventRecord(a, g_s), "record");
+    for (int i = 0; i < reps; ++i) f();
+    ck(cudaEventRecord(b, g_s), "record");
+    ck(cudaEventSynchronize(b), "sync");
+    float ms = 0.0f;
+    ck(cudaEventElapsedTime(&ms, a, b), "elapsed");
+    cudaEventDestroy(a);
+    cudaEventDestroy(b);
+    return ms / reps;
+}
+void bench(int64_t T) {
+    std::mt19937 rng(1);
+    std::printf("bench: T = %lld tokens, ms per call (old -> new)\n", (long long) T);
+    const float eps = 1e-6f;
+    // GDN: conv (h in qkv out), then the recurrence on unit-norm q/k
+    {
+        float *qkv = dalloc<float>((size_t) T * C), *hbuf = dalloc<float>((size_t) T * C), *w = dalloc<float>((size_t) C * 4);
+        float* hist = dalloc<float>((size_t) C * 3);
+        h2d(qkv, normal(rng, (size_t) T * C, 1.0f));
+        h2d(w, normal(rng, (size_t) C * 4, 0.5f));
+        const double c_old = time_ms([&] { p::gdn_conv(hist, qkv, w, hbuf, T, eps, g_s, p::KernelPath::Old); });
+        const double c_new = time_ms([&] { p::gdn_conv(hist, qkv, w, hbuf, T, eps, g_s, p::KernelPath::New); });
+        std::printf("  gdn_conv         %8.3f -> %8.3f  (x%.2f)\n", c_old, c_new, c_old / c_new);
+        const size_t n_state = (size_t) S * HV * S;
+        float *st = dalloc<float>(n_state), *gate = dalloc<float>((size_t) T * HV), *beta = dalloc<float>((size_t) T * HV);
+        float *z = dalloc<float>((size_t) T * HV * S), *gamma = dalloc<float>(S), *y = dalloc<float>((size_t) T * HV * S);
+        uint16_t* y16 = dalloc<uint16_t>((size_t) T * HV * S);
+        std::vector<float> gt((size_t) T * HV), bt((size_t) T * HV);
+        std::uniform_real_distribution<float> ud(0.0f, 1.0f);
+        for (auto& v : gt) v = -2.0f * ud(rng);
+        for (auto& v : bt) v = ud(rng);
+        h2d(gate, gt); h2d(beta, bt);
+        h2d(z, normal(rng, (size_t) T * HV * S, 1.0f));
+        h2d(gamma, normal(rng, S, 0.2f, 1.0f));
+        h2d(st, normal(rng, n_state, 0.05f));
+        const double r_old = time_ms([&] { p::gdn_recurrence(st, hbuf, gate, beta, z, gamma, eps, y, y16, T, g_s, p::KernelPath::Old); }, 3);
+        const double r_new = time_ms([&] { p::gdn_recurrence(st, hbuf, gate, beta, z, gamma, eps, y, y16, T, g_s, p::KernelPath::New); }, 3);
+        std::printf("  gdn_recurrence   %8.3f -> %8.3f  (x%.2f)\n", r_old, r_new, r_old / r_new);
+        for (void* q : {(void*) qkv, (void*) hbuf, (void*) w, (void*) hist, (void*) st, (void*) gate, (void*) beta,
+                        (void*) z, (void*) gamma, (void*) y, (void*) y16})
+            cudaFree(q);
+    }
+    // GR, one half: old write + next norm + mix, new fused write+norm + mix from the scales
+    {
+        float *R = dalloc<float>((size_t) T * D), *xn = dalloc<float>((size_t) T * D), *rs = dalloc<float>((size_t) T * 4);
+        float *gated = dalloc<float>((size_t) T * D), *bo = dalloc<float>((size_t) T * N), *inj = dalloc<float>((size_t) T * 4);
+        float *w = dalloc<float>(D), *mixed = dalloc<float>((size_t) T * N);
+        uint16_t *x16 = dalloc<uint16_t>((size_t) T * D), *m16 = dalloc<uint16_t>((size_t) T * N), *mh = dalloc<uint16_t>((size_t) T * N);
+        h2d(R, normal(rng, (size_t) T * D, 1.0f));
+        h2d(gated, normal(rng, (size_t) T * D, 1.0f));
+        h2d(bo, normal(rng, (size_t) T * N, 0.01f));
+        h2d(inj, normal(rng, (size_t) T * 4, 1.0f));
+        h2d(w, normal(rng, D, 0.1f, 1.0f));
+        const double g_old = time_ms([&] {
+            p::gr_write(R, bo, inj, 4, T, g_s);
+            p::gr_norm(R, w, eps, xn, x16, T, g_s);
+            p::gr_mix(xn, gated, mixed, m16, T, g_s, mh);
+        });
+        const double g_new = time_ms([&] {
+            p::gr_write_norm(R, bo, inj, 4, w, eps, rs, x16, T, g_s);
+            p::gr_mix_scale(R, rs, w, gated, mixed, m16, T, g_s, mh);
+        });
+        std::printf("  gr write+norm+mix %7.3f -> %8.3f  (x%.2f)\n", g_old, g_new, g_old / g_new);
+        for (void* q : {(void*) R, (void*) xn, (void*) rs, (void*) gated, (void*) bo, (void*) inj, (void*) w,
+                        (void*) mixed, (void*) x16, (void*) m16, (void*) mh})
+            cudaFree(q);
+    }
+    // the router: default prompt router -> the token path's native one (opt-in, for its cost)
+    {
+        float *lg = dalloc<float>((size_t) T * 512), *wt = dalloc<float>((size_t) T * 10);
+        int32_t* ids = dalloc<int32_t>((size_t) T * 10);
+        h2d(lg, normal(rng, (size_t) T * 512, 2.0f));
+        const double a = time_ms([&] { p::route(lg, ids, wt, T, 512, g_s); });
+        const double b = time_ms([&] { p::route_native(lg, ids, wt, T, g_s); });
+        std::printf("  route (opt-in)   %8.3f -> %8.3f\n", a, b);
+        cudaFree(lg); cudaFree(wt); cudaFree(ids);
+    }
+}
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     ck(cudaStreamCreate(&g_s), "stream");   // a blocking stream: ordered with the plain cudaMemcpy/cudaMemset
+    if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {   // --bench [T]: old against new, no checks
+        bench(argc > 2 ? std::atoll(argv[2]) : 8192);
+        return 0;
+    }
     std::mt19937 rng(20260928);
     test_conv(rng);
     test_rec(rng);
