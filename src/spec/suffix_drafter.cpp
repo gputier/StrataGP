@@ -26,8 +26,24 @@ SuffixDrafter::SuffixDrafter(int min_match, int max_match, size_t capacity_token
 
 void SuffixDrafter::reset() {
     hist_.clear();
-    std::fill(table_.begin(), table_.end(), Slot{});
+    // issue #46: a new epoch instead of rewriting the table (16 MB at 128K of context, 32 MB at 262K); only the
+    // wrap of the counter, after 2^32 resets, clears it for real
+    if (++epoch_ == 0) {
+        std::fill(table_.begin(), table_.end(), Slot{});
+        epoch_ = 1;
+    }
     last_match_ = 0;
+}
+
+bool SuffixDrafter::sync(const int32_t* tokens, size_t n) {
+    const size_t h = hist_.size();
+    if (h <= n && std::equal(hist_.begin(), hist_.end(), tokens)) {
+        append(tokens + h, n - h);
+        return true;
+    }
+    reset();
+    append(tokens, n);
+    return false;
 }
 
 uint64_t SuffixDrafter::key_at(size_t end) const {
@@ -38,12 +54,14 @@ uint64_t SuffixDrafter::key_at(size_t end) const {
 SuffixDrafter::Slot* SuffixDrafter::find_slot(uint64_t key, bool insert) {
     for (size_t i = key & mask_, probes = 0; probes <= mask_; i = (i + 1) & mask_, ++probes) {
         Slot& s = table_[i];
-        if (s.key == key) return &s;
-        if (s.key == 0) {
+        if (s.epoch != epoch_ || s.key == 0) {                  // empty (or written before the last reset)
             if (!insert) return nullptr;
+            s = Slot{};
             s.key = key;
+            s.epoch = epoch_;
             return &s;
         }
+        if (s.key == key) return &s;
     }
     return nullptr;                                         // table full: the history outgrew its capacity
 }

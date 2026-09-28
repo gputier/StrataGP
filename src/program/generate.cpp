@@ -3154,8 +3154,13 @@ int main(int argc, char** argv) {
             std::vector<float> dprob((size_t) S, 0.0f);
             std::vector<int32_t> sbuf((size_t) S, 0);
             if (o.suffix_draft > 0) {
-                sfx.reset();
-                for (int64_t t : ids) sfx.append((int32_t) t);
+                // issue #46: a request that continues the drafter's history (the conversation so far, the reply
+                // included) only appends its new tokens, and any other one resets it in O(1) - the index is the one
+                // a rebuild gives.  STRATA_OLD_SFX_RESET=1 rebuilds it from the whole prompt (the A/B)
+                static const bool sfx_rebuild = std::getenv("STRATA_OLD_SFX_RESET") != nullptr;
+                const std::vector<int32_t> ids32(ids.begin(), ids.end());
+                if (sfx_rebuild) sfx.reset();
+                sfx.sync(ids32.data(), ids32.size());
             }
             bool first_window = true;
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;

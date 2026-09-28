@@ -22,10 +22,16 @@ public:
 
     explicit SuffixDrafter(int min_match = 3, int max_match = 32, size_t capacity_tokens = 1u << 19);
 
+    /// Empty history.  O(1): the table's slots are cleared lazily (a slot of an older epoch reads as empty).
     void reset();
     /// Add tokens to the history (the prompt, then every accepted token).
     void append(const int32_t* tokens, size_t n);
     void append(int32_t token) { append(&token, 1); }
+    /// Issue #46: make the history exactly tokens[0, n) - by appending only the new tokens when the history is a
+    /// prefix of them (a request that continues the conversation), else by reset() + append.  The index is then
+    /// the one a fresh drafter builds from the same tokens (it depends only on the sequence appended since the
+    /// last reset).  Returns whether the history was kept.
+    bool sync(const int32_t* tokens, size_t n);
 
     /// Write up to `max_k` proposed next tokens to `out`; returns how many (0 = no match of at least min_match).
     int propose(int max_k, int32_t* out);
@@ -39,6 +45,7 @@ private:
         uint64_t key = 0;             // trigram hash + 1 (0 = empty)
         uint32_t pos[WAYS] = {};      // end positions, most recent first
         uint8_t n = 0;
+        uint32_t epoch = 0;           // the reset it was written after; another epoch's slot is empty (32 B still)
     };
     Slot* find_slot(uint64_t key, bool insert);
     uint64_t key_at(size_t end) const;
@@ -48,6 +55,7 @@ private:
     std::vector<Slot> table_;
     size_t mask_ = 0;
     int last_match_ = 0;
+    uint32_t epoch_ = 1;
 };
 
 }  // namespace strata::spec
