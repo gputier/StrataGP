@@ -287,6 +287,12 @@ if(STRATA_ENABLE_CUDA)
   target_include_directories(shared_expert_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(shared_expert_parity PRIVATE strata_kernels CUDA::cudart)
   add_test(NAME shared_expert_parity COMMAND shared_expert_parity --selftest)
+  # #19/#44: the verify window's batched router, MMVF, shared expert and combination vs the per-token launches,
+  # bitwise (GPU, synthetic, no model).
+  add_executable(window_batch_parity src/kernels/window_batch_parity.cpp)
+  target_include_directories(window_batch_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(window_batch_parity PRIVATE strata_kernels CUDA::cudart)
+  add_test(NAME window_batch_parity COMMAND window_batch_parity --selftest)
 
   add_executable(gr_parity src/kernels/gr_parity.cpp)
   target_include_directories(gr_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
