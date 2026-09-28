@@ -84,7 +84,15 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // both set (and on a CPU without AVX-512, STRATA_NO_IQ512 changes nothing).
     static const bool avx512 = cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr;
     static const bool avx2 = std::getenv("STRATA_NO_IQ256") == nullptr;
-    if (nt >= 2 && iq512_supported(f.gu_type)) {   // one token: ggml-cpu is as fast or faster
+    // O8d (#30): with the gathered decode the AVX-512 kernel outruns ggml-cpu at one token too (iq512_test --bench),
+    // but its float additions run in another order than ggml's, so sending the single-token experts to it changes
+    // the last bits: opt-in, STRATA_IQ512_ONE=1.  Every token of a window then takes the same kernel, whatever the
+    // number of tokens routed to its expert.
+    static const bool one = [] {
+        const char* e = std::getenv("STRATA_IQ512_ONE");
+        return e != nullptr && e[0] == '1';
+    }();
+    if ((nt >= 2 || (one && avx512)) && iq512_supported(f.gu_type)) {   // one token: ggml-cpu, unless STRATA_IQ512_ONE
         if (avx512) {
             iq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
             return;

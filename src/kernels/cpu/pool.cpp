@@ -176,6 +176,7 @@ void ExpertPool::diag(std::FILE* f) const {
 ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works) : host_works_(host_works) {
     if (const char* e = std::getenv("STRATA_POOL_SPIN_US"))   // a test knob; see kSpinBeforeSleep
         spin_before_sleep_ = std::chrono::microseconds((std::max)(0, std::atoi(e)));
+    if (const char* e = std::getenv("STRATA_OLD_RUN_SPLIT"); e != nullptr && e[0] == '1') flat_split_ = false;
     const std::vector<int> cores = physical_cores(true);
     n_ = n_workers > 0 ? n_workers : (int) cores.size();
     if (n_ < 1) n_ = 1;
@@ -347,6 +348,18 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
         if (mode_ == 0) {
             const ExpertJob& j = jobs_[i];
             s2_expert_vnni_q(j.blob, *j.act, j.out, scratch);
+        } else if (mode_ <= 2 && flat_split_) {
+            // O8 (#27): an equal range of the phase's rows across ALL its experts, as in run_split_multi below.
+            // Each row still goes through the same `row_dot`, so the result is bitwise the per-expert split's.
+            const int per = mode_ == 1 ? FF : H;
+            const int64_t g0 = mrows_ * (int64_t) i / mtasks_, g1 = mrows_ * (int64_t) (i + 1) / mtasks_;
+            for (int64_t r = g0; r < g1;) {
+                const int e = (int) (r / per), r0 = (int) (r % per);
+                const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
+                if (mode_ == 1) s2_expert_gu_rows(jobs_[e].blob, *jobs_[e].act, split_[(size_t) e].ff, r0, r1);
+                else s2_expert_down_rows(jobs_[e].blob, split_[(size_t) e].a2, jobs_[e].out, r0, r1);
+                r += r1 - r0;
+            }
         } else if (mode_ == 1) {
             const int e = (int) i / parts_a_, part = (int) i % parts_a_;
             const int r0 = FF * part / parts_a_, r1 = FF * (part + 1) / parts_a_;
@@ -434,6 +447,20 @@ void ExpertPool::run_split(ExpertJob* jobs, int n) {
     const auto t0 = std::chrono::steady_clock::now();
     jobs_ = jobs;
     const int threads = n_ + (host_works_ ? 1 : 0);
+    if (flat_split_) {
+        // O8 (#27): exactly three tasks per thread in each phase, each an equal share of ALL the phase's rows.
+        // Cutting every expert into the same number of parts gave 10 experts on 6 threads 20 tasks (4/4/3/3/3/3),
+        // and the last wave ran on 2 threads of 6.
+        mtasks_ = 3 * threads;
+        mrows_ = (int64_t) n * FF;
+        run_phase(1, mtasks_);
+        for (int e = 0; e < n; ++e) act_quant_q8_1(split_[(size_t) e].ff, FF, split_[(size_t) e].a2);
+        mrows_ = (int64_t) n * H;
+        run_phase(2, mtasks_);
+        mode_ = 0;
+        ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        return;
+    }
     // about three tasks per thread in each phase, so the tail is short
     parts_a_ = (std::max)(1, (3 * threads + n - 1) / n);
     parts_b_ = parts_a_;
