@@ -38,10 +38,17 @@ Concerné, par morceau : GDN `attn_qkv`, `attn_gate`, `ssm_out` (36 couches) ; Q
    kernel et le même calcul (colonne j du produit = ligne j de Y dans les deux cas), mais sans les deux tableaux sur
    le GPU. Ceux-ci vivraient dans les emplacements prêtés du cache d'experts et devraient être réécrits à chaque
    prompt, comme `ids_identity`.
-3. **Mémoire** : rien de plus en VRAM. Le tampon de déquantification (64 Mio, déjà emprunté) accueille les lignes
+3. **Mémoire** : pas de nouveau tampon de travail en VRAM (voir la réserve sur le « stream-k fixup » ci-dessous). Le tampon de déquantification (64 Mio, déjà emprunté) accueille les lignes
    q8_1. Si les lignes d'un morceau n'y tiennent pas, le produit est fait par tranches de tokens (multiples de 128).
    À 8192 tokens, seul `attn_output` (K = 6144, source FP16 élargie) est coupé, en 4 tranches de 2048. Le contexte
    de lancement MMQ (et son pool pour le « stream-k fixup ») est celui des experts.
+   **Réserve** : ce pool (`CachingPool`, `src/prefill/ggml_cuda_host.cu`) fait un `cudaMalloc` au premier usage,
+   pendant le prompt, jusqu'à nsm × 128 × 128 × 4 o (~11 Mo sur une 5090), et `CUDA_CHECK` arrête le processus si la
+   VRAM est épuisée. Quand les experts passent déjà par MMQ, ce tampon est partagé et ne coûte rien de plus. Quand ils
+   n'y passent pas (`STRATA_PREFILL_MMQ=0`, ou experts IQ1_M : `mmq_plan().any` faux), `--prefill-dense-mmq` ajoute
+   cette allocation, que `bytes_needed` ne compte pas : garder ~16 Mo de marge VRAM dans ce cas.
+   Quand `native_mmq` refuse une projection (type non couvert, K % 4 != 0, tampon trop petit, build sans MMQ), le
+   prefill l'écrit sur stderr une fois par couple (type, raison), avec la raison, et la projection reste en FP16.
 4. **Lecture au-delà du poids** : MMQ lit une ligne de poids par tuiles de 256 valeurs (llama.cpp remplit chaque
    ligne quantifiée jusqu'à un multiple de 512 pour cela). Quand K n'est pas un multiple de 512 (`ffn_down_shexp`,
    K = 640), la dernière tuile de la dernière ligne déborde du tenseur. Ces valeurs rencontrent des activations
@@ -122,7 +129,9 @@ Sur la machine de développement (CPU seulement) :
 - Construction complète (`cmake --build build-wp -j 3`, Release, CUDA 13.0, sm_120) : **OK**.
 - `ple_reader_selftest`, `platform_memory_test`, `pool_stress`, `expert_multi_test`, `suffix_drafter_test`,
   `draft_policy_test`, `controller_test`, `conv_cache_test` : **OK**. `pool_test` échoue comme attendu (il lui faut un
-  pack de modèle). `python3 serve/test_server.py` : **OK** (26 tests).
+  pack de modèle). `python3 serve/test_server.py` : **OK** (26 tests). Note : `ple_reader_selftest` passe quand il
+  tourne seul, mais écrit un fichier fixe (`/tmp/ple_reader_selftest.bin`) et peut échouer s'il est lancé en même temps
+  depuis un autre arbre de travail (il a échoué une fois ainsi ; relancé seul, OK).
 - Calibrage des bornes du test GPU sur CPU (programme jetable, non versionné) : voir « Précision ».
 
 Nouveau test GPU, **compilé, pas exécuté** : `prefill_dense_mmq_parity` (ctest,
