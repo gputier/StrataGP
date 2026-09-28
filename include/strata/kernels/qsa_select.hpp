@@ -26,8 +26,21 @@ namespace strata::kernels {
 void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
                       int64_t max_blocks, const QsaShapes& s, float* scores, void* stream);
 
+/// O6 (#21): the same scores from the fp16 SHADOW of the pooled keys (`QsaIndexerBuffers::pooled16`/`dead16`, written
+/// by the pooling kernels next to the fp32 rows): half the bytes per block, and exactly the fp32 arithmetic on the
+/// keys rounded to fp16.  That rounding CAN CHANGE THE SELECTION (`qsa.hpp`, INDEXER KEYS), so it is opt-in
+/// (`--idx-fp16` or STRATA_IDX_FP16=1).
+void qsa_block_scores_f16(const uint16_t* pooled16, const uint16_t* dead16, const float* q_idx, const int32_t* steps,
+                          int64_t nq, int64_t max_blocks, const QsaShapes& s, float* scores, void* stream);
+
 /// ids [nq, cap] (cells, ascending); `cap` >= the largest selection width.
+///
+/// O6b (#22): by default a kernel with coalesced histogram passes, warp-aggregated per-warp histograms and scans in
+/// place of thread 0's serial walks - the same integer counts, so the same selection.  STRATA_OLD_TOPK=1 (or
+/// `qsa_block_topk_set_old`, before capture) keeps the previous kernel for A/B.
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                     const QsaShapes& s, int32_t* ids, void* stream);
+bool qsa_block_topk_old();
+void qsa_block_topk_set_old(bool old);
 
 }  // namespace strata::kernels

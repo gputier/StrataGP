@@ -19,6 +19,7 @@
 // SOFTWARE.
 
 #include "strata/kernels/native_qsa_indexer.hpp"
+#include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/mrope.hpp"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -43,7 +44,8 @@ __global__ void append(const float* __restrict__ raw, const int32_t* __restrict_
                         int pos_base, const float* __restrict__ gamma, float epsilon,
                         float* __restrict__ tail, float* __restrict__ dead,
                         float* __restrict__ pooled, int32_t* __restrict__ block_pos,
-                        int max_cells, float theta_scale, const int32_t* __restrict__ mtab) {
+                        int max_cells, float theta_scale, const int32_t* __restrict__ mtab,
+                        uint16_t* __restrict__ pooled16, uint16_t* __restrict__ dead16) {
     const int pos = *pos_dev, d = threadIdx.x;
     if (pos < 0 || pos >= max_cells) return;
     const int slot = pos % R;
@@ -92,6 +94,12 @@ __global__ void append(const float* __restrict__ raw, const int32_t* __restrict_
     if (pos == 0) dead[d] = y;
     else pooled[std::size_t(b + 1) * D + d] = dead[d];
     if (d == 0 && pos != 0) *block_pos = rope_pos;
+    if (pooled16 != nullptr) {   // O6 (#21): the fp16 shadow of the rows written above (integer rounding, exact)
+        const uint16_t y16 = f16_from_f32(y);
+        pooled16[std::size_t(b) * D + d] = y16;
+        if (pos == 0) dead16[d] = y16;
+        else pooled16[std::size_t(b + 1) * D + d] = f16_from_f32(dead[d]);
+    }
 }
 struct Span { const void* p; std::size_t n; };
 void validate(Span s) {
@@ -120,9 +128,20 @@ void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_dev
     for (const auto& span : spans) validate(span);
     for (int i = 0; i < 7; ++i) for (int j = i + 1; j < 7; ++j)
         if (overlaps(spans[i], spans[j])) throw std::invalid_argument("native QSA indexer buffers overlap");
+    if ((b.pooled16 == nullptr) != (b.dead16 == nullptr))
+        throw std::invalid_argument("native QSA indexer: the fp16 shadow needs both pooled16 and dead16");
+    if (b.pooled16 != nullptr) {   // O6: the shadow is disjoint from everything above and from itself
+        const Span shadow[] = {{b.pooled16,std::size_t(max_cells/R+1)*D*2},{b.dead16,D*2}};
+        for (const auto& span : shadow) {
+            validate(span);
+            for (const auto& other : spans)
+                if (overlaps(span, other)) throw std::invalid_argument("native QSA indexer buffers overlap");
+        }
+        if (overlaps(shadow[0], shadow[1])) throw std::invalid_argument("native QSA indexer buffers overlap");
+    }
     const float theta_scale = powf(freq_base, -2.0f / ROT);
     append<<<1,THREADS,0,static_cast<cudaStream_t>(stream)>>>(raw,relative_pos_device,pos_base,gamma,epsilon,
-        b.tail,b.dead,b.pooled,b.block_pos,int(max_cells),theta_scale,mrope_table());
+        b.tail,b.dead,b.pooled,b.block_pos,int(max_cells),theta_scale,mrope_table(),b.pooled16,b.dead16);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

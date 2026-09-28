@@ -250,6 +250,9 @@ struct QsaState {
     float* idx_dead = nullptr;       ///< (idx_dim,): the spare slot's key, CONSTANT for the sequence
     float* idx_pooled = nullptr;     ///< (max_cells/idx_block + 2, idx_dim)
     int32_t* idx_block_pos = nullptr;
+    /// O6 (#21), only with qsa_set_idx_fp16: the fp16 shadow of `idx_pooled`/`idx_dead` the selection scores from
+    uint16_t* idx_pooled16 = nullptr;
+    uint16_t* idx_dead16 = nullptr;
 
     float* cos_tab = nullptr;        ///< (max_cells, n_rot/2), built on the HOST in float64
     float* sin_tab = nullptr;
@@ -300,6 +303,17 @@ bool qsa_kv_int8();
 /// PR #21: store K/V as Q4_0 after a Hadamard rotation (`--kv q4_0`): 576 B per cell, vs 1,056 in INT8.
 void qsa_set_kv_q4(bool enabled);
 bool qsa_kv_q4();
+/// O6 (#21): keep an fp16 shadow of the pooled indexer keys and score the block selection from it (`--idx-fp16`,
+/// STRATA_IDX_FP16=1): half the indexer bytes read per query at long context, 256 B per block and layer more VRAM.
+/// It CHANGES WHICH CELLS ARE SELECTED near the boundary (qsa.hpp, INDEXER KEYS), so it is off by default.  Set
+/// before sizing and initializing the session.
+void qsa_set_idx_fp16(bool enabled);
+bool qsa_idx_fp16();
+/// The indexer buffers of a state, with its fp16 shadow when it has one.
+strata::kernels::QsaIndexerBuffers qsa_indexer_buffers(const QsaState& st);
+/// The block scores of `nq` queries (qsa_select.hpp) from the state's fp32 keys, or from its fp16 shadow.
+void qsa_index_scores(const QsaState& st, const float* q_idx, const int32_t* steps, int64_t nq, int64_t max_blocks,
+                      const strata::kernels::QsaShapes& s, float* scores, void* stream);
 /// The state's KV format for the block-moving functions of kv_stream.hpp (kKvF16 / kKvInt8 / kKvQ4).
 inline int qsa_kv_format(const QsaState& st) {
     return st.kv_q4 ? strata::kernels::kKvQ4 : st.kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;

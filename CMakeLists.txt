@@ -397,6 +397,20 @@ if(STRATA_ENABLE_CUDA)
   target_link_libraries(kv_stream_parity PRIVATE strata_kernels CUDA::cudart)
   add_test(NAME kv_stream_parity COMMAND kv_stream_parity)
 
+  # O6 (#21, #22): block scores and block top-k (default and previous kernel) against host references, and the
+  # fp16 shadow of the pooled indexer keys (GPU, synthetic, no model).
+  add_executable(qsa_select_parity src/kernels/qsa_select_parity.cpp)
+  target_include_directories(qsa_select_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(qsa_select_parity PRIVATE strata_kernels CUDA::cudart)
+  add_test(NAME qsa_select_parity COMMAND qsa_select_parity)
+
+  # O6c (#23), B14 (#12): the split-K decode attention, every variant against a host softmax, the prefetching
+  # kernel bitwise against the previous one, unresolved pages masked (GPU, synthetic, no model).
+  add_executable(qsa_decode_attn_parity src/kernels/qsa_decode_attn_parity.cpp)
+  target_include_directories(qsa_decode_attn_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(qsa_decode_attn_parity PRIVATE strata_kernels CUDA::cudart)
+  add_test(NAME qsa_decode_attn_parity COMMAND qsa_decode_attn_parity)
+
   # PR #21: Q4_0 KV with Walsh-Hadamard rotation vs a host reference (GPU, synthetic, no model).
   add_executable(kv_q4_parity src/kernels/kv_q4_parity.cpp)
   target_include_directories(kv_q4_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
