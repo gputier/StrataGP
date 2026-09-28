@@ -420,7 +420,8 @@ void test_qsa_rows(std::mt19937& rng) {
 int main(int argc, char** argv) {
     const bool selftest = argc > 1 && std::strcmp(argv[1], "--selftest") == 0;
     ck(cudaSetDeviceFlags(cudaDeviceMapHost), "device flags");
-    ck(cudaStreamCreateWithFlags(&g_cs, cudaStreamNonBlocking), "stream");
+    // a BLOCKING stream: the plain cudaMemset/cudaMemcpy calls below (legacy default stream) stay ordered with it
+    ck(cudaStreamCreate(&g_cs), "stream");
     std::mt19937 rng(20260928);
     try {
         test_mmvf(rng);
