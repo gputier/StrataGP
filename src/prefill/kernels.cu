@@ -348,16 +348,23 @@ __global__ void __launch_bounds__(S * RG) gdn_rec_kernel(float* __restrict__ sta
 }
 // P3: the columns of a value head are independent (only the output norm couples them): grid (48 heads, 4 quarters of
 // 32 columns).  A warp holds 8 columns x the 4 row groups of 32 rows (lane = 4 * column + group), so kv and o are
-// gdn_rec_kernel's four partial sums, added in its order through shuffles instead of shared memory and barriers.  q|k
-// of a token go through shared memory, double-buffered (one barrier a token), and the next token's inputs are loaded
-// while this one runs.  o * rsqrt(128) goes to `o`; gdn_out_norm_kernel applies the norm.  Same bits.
+// gdn_rec_kernel's four partial sums, added in its order through shuffles instead of shared memory and barriers.
+// The q|k of a token go through shared memory, three buffers deep: token t+1's are written before token t's barrier,
+// so the chain of kv(t+1) (the updated state against k(t+1)) runs alongside the chain of o(t) - the same operations
+// in the same order as computing it at the next token - and the next inputs are loaded while a token runs.  One
+// barrier a token.  o * rsqrt(128) goes to `o`; gdn_out_norm_kernel applies the norm.  Same bits.
 constexpr int SPLIT = 4, SC = S / SPLIT, QK_LD = RPG + 4;   // column blocks per head, their columns, a group's stride
+__device__ __forceinline__ float col_sum(float x, int src) {   // the column's four row-group partials, in order
+    return __shfl_sync(0xffffffffu, x, src) + __shfl_sync(0xffffffffu, x, src + 1) +
+           __shfl_sync(0xffffffffu, x, src + 2) + __shfl_sync(0xffffffffu, x, src + 3);
+}
 __global__ void __launch_bounds__(SC * RG) gdn_rec_split_kernel(float* __restrict__ state, const float* __restrict__ h,
                                                                const float* __restrict__ gate,
                                                                const float* __restrict__ beta, float* __restrict__ o,
                                                                int64_t T) {
-    // q and k by row group, 32 rows at stride QK_LD: the four groups of a warp read four different sets of banks
-    __shared__ __align__(16) float sqk[2][2][RG][QK_LD];
+    // q and k by row group, 32 rows at stride QK_LD: the four groups of a warp read four different sets of banks.
+    // Buffer (t % 3) holds token t: written before barrier t-1, last read before barrier t+1.
+    __shared__ __align__(16) float sqk[3][2][RG][QK_LD];
     const int head = blockIdx.x, tid = threadIdx.x, lane = tid & 31, rg = lane & 3, src = lane & ~3;
     const int col = blockIdx.y * SC + (tid >> 5) * 8 + (lane >> 2), qh = head % HK;
     float s[RPG];
@@ -365,25 +372,20 @@ __global__ void __launch_bounds__(SC * RG) gdn_rec_split_kernel(float* __restric
     const size_t rs = (size_t) HV * S;
 #pragma unroll
     for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
-    // token 0's inputs (T >= 1); thread tid carries q[tid] and k[tid] into shared memory
-    float nq = h[qh * S + tid], nk = h[HK * S + qh * S + tid];
+    // token 0 (T >= 1): its q|k to buffer 0 and its kv; token 1's q|k and token 0's gate, beta, v in registers.
+    // Thread tid carries q[tid] and k[tid].
+    sqk[0][0][tid >> 5][tid & 31] = h[qh * S + tid];
+    sqk[0][1][tid >> 5][tid & 31] = h[HK * S + qh * S + tid];
+    float nq = 0.0f, nk = 0.0f;
+    if (T > 1) {
+        nq = h[C + qh * S + tid];
+        nk = h[C + HK * S + qh * S + tid];
+    }
     float ng = gate[head], nb = beta[head], nv = h[2 * HK * S + head * S + col];
-    for (int64_t t = 0; t < T; ++t) {
-        float (*qk)[RG][QK_LD] = sqk[t & 1];
-        qk[0][tid >> 5][tid & 31] = nq;
-        qk[1][tid >> 5][tid & 31] = nk;
-        const float g = __expf(ng), bt = nb, vt = nv;
-        if (t + 1 < T) {
-            const float* hn = h + (t + 1) * C;
-            nq = hn[qh * S + tid];
-            nk = hn[HK * S + qh * S + tid];
-            ng = gate[(t + 1) * HV + head];
-            nb = beta[(t + 1) * HV + head];
-            nv = hn[2 * HK * S + head * S + col];
-        }
-        __syncthreads();   // the buffer written two tokens from now is read before the next barrier
-        const float4* q4 = reinterpret_cast<const float4*>(qk[0][rg]);
-        const float4* k4 = reinterpret_cast<const float4*>(qk[1][rg]);
+    __syncthreads();
+    float kv_col;
+    {
+        const float4* k4 = reinterpret_cast<const float4*>(sqk[0][1][rg]);
         float kv = 0.0f;
 #pragma unroll
         for (int i = 0; i < RPG / 4; ++i) {
@@ -393,26 +395,52 @@ __global__ void __launch_bounds__(SC * RG) gdn_rec_split_kernel(float* __restric
             kv = fmaf(s[4 * i + 2], k.z, kv);
             kv = fmaf(s[4 * i + 3], k.w, kv);
         }
-        const float kv_col = __shfl_sync(0xffffffffu, kv, src) + __shfl_sync(0xffffffffu, kv, src + 1) +
-                             __shfl_sync(0xffffffffu, kv, src + 2) + __shfl_sync(0xffffffffu, kv, src + 3);
+        kv_col = col_sum(kv, src);
+    }
+    int b = 0, bn = 1;   // the buffers of tokens t and t+1
+    for (int64_t t = 0; t < T; ++t) {
+        if (t + 1 < T) {
+            sqk[bn][0][tid >> 5][tid & 31] = nq;
+            sqk[bn][1][tid >> 5][tid & 31] = nk;
+        }
+        const float g = __expf(ng), bt = nb, vt = nv;
+        if (t + 2 < T) {
+            const float* h2 = h + (t + 2) * C;
+            nq = h2[qh * S + tid];
+            nk = h2[HK * S + qh * S + tid];
+        }
+        if (t + 1 < T) {
+            ng = gate[(t + 1) * HV + head];
+            nb = beta[(t + 1) * HV + head];
+            nv = h[(t + 1) * C + 2 * HK * S + head * S + col];
+        }
+        __syncthreads();
         const float delta = (vt - g * kv_col) * bt;
-        float oo = 0.0f;
+        const float4* q4 = reinterpret_cast<const float4*>(sqk[b][0][rg]);
+        const float4* k4 = reinterpret_cast<const float4*>(sqk[b][1][rg]);
+        const float4* kn4 = reinterpret_cast<const float4*>(sqk[bn][1][rg]);   // stale at the last token: unused
+        float oo = 0.0f, kv = 0.0f;
 #pragma unroll
         for (int i = 0; i < RPG / 4; ++i) {
-            const float4 k = k4[i], q = q4[i];
+            const float4 k = k4[i], q = q4[i], kn = kn4[i];
             s[4 * i] = fmaf(g, s[4 * i], k.x * delta);
             oo = fmaf(s[4 * i], q.x, oo);
+            kv = fmaf(s[4 * i], kn.x, kv);
             s[4 * i + 1] = fmaf(g, s[4 * i + 1], k.y * delta);
             oo = fmaf(s[4 * i + 1], q.y, oo);
+            kv = fmaf(s[4 * i + 1], kn.y, kv);
             s[4 * i + 2] = fmaf(g, s[4 * i + 2], k.z * delta);
             oo = fmaf(s[4 * i + 2], q.z, oo);
+            kv = fmaf(s[4 * i + 2], kn.z, kv);
             s[4 * i + 3] = fmaf(g, s[4 * i + 3], k.w * delta);
             oo = fmaf(s[4 * i + 3], q.w, oo);
+            kv = fmaf(s[4 * i + 3], kn.w, kv);
         }
-        const float oc = (__shfl_sync(0xffffffffu, oo, src) + __shfl_sync(0xffffffffu, oo, src + 1) +
-                          __shfl_sync(0xffffffffu, oo, src + 2) + __shfl_sync(0xffffffffu, oo, src + 3)) *
-                         rsqrtf((float) S);
+        const float oc = col_sum(oo, src) * rsqrtf((float) S);
         if (rg == 0) o[t * HV * S + head * S + col] = oc;
+        kv_col = col_sum(kv, src);
+        b = bn;
+        bn = bn == 2 ? 0 : bn + 1;
     }
 #pragma unroll
     for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
