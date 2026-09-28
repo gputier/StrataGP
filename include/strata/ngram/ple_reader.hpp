@@ -75,6 +75,8 @@ public:
     /// Read with no ticket in flight (the worker updates these while reads are outstanding).
     const ReaderStats& stats() const;
     void reset_stats();
+    /// The DirectFile backend the reads go through ("iocp", "uring", "threads" or "sync").
+    const char* backend() const;
     uint64_t cache_capacity() const;
     uint64_t cache_size() const;
 

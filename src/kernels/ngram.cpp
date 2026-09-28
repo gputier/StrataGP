@@ -121,6 +121,11 @@ struct PleTable::Impl {
     bool pending = false;
     uint32_t rows[PLE_N_HEADS] = {};
     uint8_t raw[PLE_N_HEADS * PLE_ROW_BYTES] = {};
+    // issue_batch / collect_batch
+    bool batch_pending = false;
+    strata::ngram::PleReader::Ticket batch_ticket;
+    std::vector<uint32_t> batch_rows;
+    std::vector<uint8_t> batch_raw;
 };
 
 PleTable::PleTable() : impl_(new Impl) {}
@@ -202,6 +207,7 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
 void PleTable::close() {
     impl_->reader.close();
     impl_->pending = false;
+    impl_->batch_pending = false;
     impl_->mode = PleIo::Mmap;
     delete impl_->file;
     impl_->file = nullptr;
@@ -236,6 +242,7 @@ void PleTable::read_row(uint32_t row, float* out160) const {
 }
 
 bool PleTable::issue(const uint32_t* rows16) {
+    if (impl_->batch_pending) return false;
     std::memcpy(impl_->rows, rows16, sizeof impl_->rows);
     if (impl_->mode == PleIo::Direct) {
         if (impl_->pending) return false;              // one token in flight per table
@@ -276,6 +283,7 @@ bool PleTable::collect(float* out2560, std::string& err) {
 
 bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err) {
     if (impl_->pending) { err = "PleTable::gather_batch while a token is in flight"; return false; }
+    if (impl_->batch_pending) { err = "PleTable::gather_batch while a batch is in flight"; return false; }
     const size_t n = n_tokens * (size_t) PLE_N_HEADS;
     if (impl_->mode == PleIo::Direct) {
         std::vector<uint8_t> raw(n * PLE_ROW_BYTES);
@@ -289,19 +297,47 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
     return true;
 }
 
+bool PleTable::issue_batch(const uint32_t* rows, size_t n_tokens, std::string& err) {
+    if (impl_->pending) { err = "PleTable::issue_batch while a token is in flight"; return false; }
+    if (impl_->batch_pending) { err = "PleTable::issue_batch while a batch is in flight"; return false; }
+    const size_t n = n_tokens * (size_t) PLE_N_HEADS;
+    impl_->batch_rows.assign(rows, rows + n);
+    if (impl_->mode == PleIo::Direct) {
+        impl_->batch_raw.resize(n * PLE_ROW_BYTES);
+        impl_->batch_ticket = impl_->reader.issue(impl_->batch_rows.data(), n, impl_->batch_raw.data());
+    }
+    impl_->batch_pending = true;
+    return true;
+}
+
+bool PleTable::collect_batch(float* out, std::string& err) {
+    if (!impl_->batch_pending) { err = "PleTable::collect_batch without issue_batch"; return false; }
+    impl_->batch_pending = false;
+    const size_t n = impl_->batch_rows.size();
+    if (impl_->mode == PleIo::Direct) {
+        if (!impl_->reader.collect(impl_->batch_ticket, err)) return false;
+        for (size_t i = 0; i < n; ++i)
+            iq4nl_dequant_row(impl_->batch_raw.data() + i * PLE_ROW_BYTES, out + i * PLE_HEAD_DIM);
+        impl_->bytes_read += (uint64_t) n * PLE_ROW_BYTES;
+        return true;
+    }
+    for (size_t i = 0; i < n; ++i) read_row(impl_->batch_rows[i], out + i * PLE_HEAD_DIM);
+    return true;
+}
+
 void PleTable::set_injected_delay_us(double us) { impl_->reader.set_injected_delay_us(us); }
 
 std::string PleTable::io_report() const {
     if (impl_->mode != PleIo::Direct || !impl_->reader.is_open()) return {};
     const strata::ngram::ReaderStats& s = impl_->reader.stats();
-    char buf[320];
+    char buf[352];
     std::snprintf(buf, sizeof buf,
                   "ple io: %llu rows, %.1f%% row-cache hits, %llu SSD reads (%.1f MB), read p50 %.0f us p99 %.0f us, "
-                  "blocked %.3f ms total (submit %.3f ms), cache %llu/%llu rows",
+                  "blocked %.3f ms total (submit %.3f ms), cache %llu/%llu rows, backend %s",
                   (unsigned long long) s.requests, s.requests ? 100.0 * (double) s.cache_hits / (double) s.requests : 0.0,
                   (unsigned long long) s.reads, (double) s.bytes / 1e6, s.percentile(0.5), s.percentile(0.99),
                   s.wait_us / 1000.0, s.submit_us / 1000.0, (unsigned long long) impl_->reader.cache_size(),
-                  (unsigned long long) impl_->reader.cache_capacity());
+                  (unsigned long long) impl_->reader.cache_capacity(), impl_->reader.backend());
     return buf;
 }
 

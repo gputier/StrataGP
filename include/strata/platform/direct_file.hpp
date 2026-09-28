@@ -2,7 +2,9 @@
 //
 // The n-gram table (26.8 GiB) stays on the SSD and must never occupy RAM, including the OS file cache. A memory
 // map cannot promise that; an unbuffered read can. On Windows this is FILE_FLAG_NO_BUFFERING | OVERLAPPED with
-// an I/O completion port; on Linux, O_DIRECT (synchronous pread for now; io_uring is phase L).
+// an I/O completion port; on Linux, O_DIRECT through io_uring, or a pool of pread threads where io_uring is not
+// available (issue #15). STRATA_PLE_IO_BACKEND=uring|threads|sync picks the Linux backend; `sync` is the previous
+// pread-inside-submit path, kept as the A/B arm.
 //
 // Contract of every read: offset, length and buffer address are multiples of `alignment()` (4096 here).
 // Reads past end of file return the bytes that exist; `Completion::bytes` says how many.
@@ -26,11 +28,15 @@ public:
     DirectFile(const DirectFile&) = delete;
     DirectFile& operator=(const DirectFile&) = delete;
 
-    bool open(const std::string& path, std::string& err);
+    /// `queue_depth` is the most reads the caller keeps in flight: it sizes the io_uring rings and caps the pread
+    /// pool at 16 threads (STRATA_PLE_IO_THREADS overrides). Windows ignores it.
+    bool open(const std::string& path, std::string& err, uint32_t queue_depth = 16);
     void close();
     bool is_open() const;
     uint64_t size() const;
     static constexpr uint32_t alignment() { return 4096; }
+    /// The backend in use: "iocp", "uring", "threads" or "sync".
+    const char* backend() const;
 
     /// Queue one read. Returns false (and sets `err`) if the request could not be queued; a queued request
     /// always produces exactly one completion.
