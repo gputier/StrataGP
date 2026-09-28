@@ -46,7 +46,8 @@ struct QsaNormRope {
 /// Whether the fused preparation covers this geometry and arithmetic: head_dim 256 (one row per 256-thread block,
 /// and the Hadamard size), idx_dim at most 256, an even n_rot inside both widths, and each variant's own contract
 /// (the native rotation: n_rot 64, widths 128/256 and a finite base above 1, as `native_rope_apply` requires; the
-/// table rotation: its tables). A caller keeps the separate launches otherwise.
+/// table rotation: its tables), and idx_n_head <= n_head (the indexer query's rows read their positions from the
+/// same n_head entries per token as q's). A caller keeps the separate launches otherwise.
 bool qsa_prep_supported(const QsaShapes& s, const QsaNormRope& nr);
 
 /// K and V of `n_tok` cells into the cache, bitwise the `norm(K) ; rope(K) ; kv_append*_step` sequence (for Q4 with

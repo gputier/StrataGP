@@ -869,8 +869,10 @@ if (!w_attnk->native_data || !w_attnv->native_data || !w_attnq->native_data) {
 // local vector here would be captured as a dangling POINTER and replayed as garbage - see the note in
 // `layer.hpp`.  That is a silent failure, not a fault: the copy succeeds, the counts are wrong, and the
 // token that comes out is plausible.
-// O6d: a state whose buffers are the first QSA layer's (`step_shared`) has them already, uploaded once this token.
-if (!st.step_shared) {        qsa_step_fill(st.host_step, pos, s);        for (int64_t h = 0; h < g.n_head; ++h) st.host_pos[h] = (int32_t) (pos_base + pos);
+// O6d: a state whose device buffers are the first QSA layer's (`step_shared`) has them already, uploaded once
+// this token; its host staging is still filled, so every state's `host_step`/`host_pos` stays current.
+        qsa_step_fill(st.host_step, pos, s);        for (int64_t h = 0; h < g.n_head; ++h) st.host_pos[h] = (int32_t) (pos_base + pos);
+if (!st.step_shared) {
         int32_t* m_step = nullptr;
         int32_t* m_pos = nullptr;
         static const bool old_step = std::getenv("STRATA_OLD_QSA_STEP") != nullptr;

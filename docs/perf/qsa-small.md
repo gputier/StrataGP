@@ -40,8 +40,10 @@ propres à chaque token) précisément pour que `verify.cpp` puisse les adopter 
   token. C'est le cas de tous les chemins qui appellent `qsa_layer` : graphe « token », graphes par couche
   (`session_loop`, `session_replay*`, y compris `--gpu-stages` et ses préfixes, qui rejouent les couches dans
   l'ordre) et `session_token` (`--no-capture`). Le drafter MTP et les fenêtres de vérification ont leurs propres
-  tampons de pas et ne sont pas concernés. Les tampons hôtes épinglés restent remplis par `stage_token` pour les 12
-  états (le dernier élément de `host_step` porte toujours le statut d'attention par couche).
+  tampons de pas et ne sont pas concernés. Les tampons hôtes épinglés (`host_step`, `host_pos`) restent remplis
+  pour les 12 états, sur tous les chemins : par `stage_token` pour les graphes, et par `qsa_layer` lui-même sur le
+  chemin direct, où un état partagé ne saute que le téléversement (le dernier élément de `host_step` porte toujours
+  le statut d'attention par couche).
 - Kernels par token : 24 → 1.
 
 ### 2. Préparation de K et des requêtes en deux lancements (`qsa_prep.hpp`, `qsa_prep.cu`, `kv_q8.cu`, `kv_q4.cu`)
@@ -57,6 +59,8 @@ Nouvelles fonctions (déclarées dans `include/strata/kernels/qsa_prep.hpp`) :
   `qcur` ; les 4 lignes de la requête de l'indexeur sont traitées en place. Pour n'avoir qu'un lancement, la
   projection BF16 de la requête de l'indexeur est faite **avant** (elle ne dépend que de `x` : ordre sans effet).
   La FWHT de q, qui était faite après la sélection, est faite ici (q ne sert qu'à l'attention) ; l'étape 8 la saute.
+- Les lignes de la requête de l'indexeur lisent leur position dans les mêmes `n_head` entrées par token que q :
+  `qsa_prep_supported` exige donc `idx_n_head <= n_head` (4 ≤ 24 ici) ; au-delà, l'appelant garde les lancements séparés.
 - Lancements par couche QSA : FP16/INT8 **8 → 2**, Q4_0 **11 → 2** (dont un nœud de copie `memcpy2D` en moins). Par
   token : −72 (FP16/INT8) ou −108 (Q4_0) nœuds, plus les −23 du point 1.
 - Registres (ptxas, sm_120) : 28 à 36 selon le format et la variante, **0 spill**.
@@ -158,6 +162,16 @@ grep -H '^decode' new_*.log old_*.log          # tok/s : comparer les moyennes p
 for v in STRATA_OLD_QSA_STEP STRATA_OLD_QSA_PREP; do
   env $v=1 $RUN --tokens-file p1.txt > only_$v.log 2> only_$v.err
   diff <(grep '^output' only_$v.log) <(grep '^output' new_p1_1.log) && echo "$v: tokens identiques"
+done
+
+# 2b. le partage du pas sur les trois chemins qui appellent qsa_layer : graphe « token » (défaut), graphes par
+#     couche (--no-token-graph) et appels directs (--no-capture) ; les 11 autres couches QSA doivent lire le pas téléversé
+#     par la première couche QSA, donc des tokens identiques à STRATA_OLD_QSA_STEP=1 sur chaque chemin
+for path in "" "--no-token-graph" "--no-capture"; do
+  tag=${path:-token}
+  $RUN $path --tokens-file p1.txt --max-new 64 > step_new_$tag.log 2>/dev/null
+  STRATA_OLD_QSA_STEP=1 $RUN $path --tokens-file p1.txt --max-new 64 > step_old_$tag.log 2>/dev/null
+  diff <(grep '^output' step_new_$tag.log) <(grep '^output' step_old_$tag.log) && echo "$tag: tokens identiques"
 done
 
 # 3. le temps GPU pur de la couche QSA (graphes rejoués sans l'hôte) : ligne "QSA layers ... ms/token"

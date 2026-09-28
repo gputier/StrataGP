@@ -109,6 +109,8 @@ bool qsa_prep_supported(const QsaShapes& s, const QsaNormRope& nr) {
     if (s.idx_dim < 1 || s.idx_dim > qsa_prep::kThreads || s.idx_n_head < 0) return false;
     if (s.n_rot < 2 || s.n_rot % 2 != 0 || s.n_rot > s.head_dim || s.n_rot > s.idx_dim) return false;
     if (s.n_head + s.idx_n_head > 65535) return false;
+    // the indexer query's rows read their position from the same `n_head` entries per token as q's
+    if (s.idx_n_head > s.n_head) return false;
     if (nr.native_rope) {
         // native_rope_apply's own contract; anything else would throw there
         if (s.n_rot != 64 || (s.idx_dim != 128 && s.idx_dim != 256) || !std::isfinite(nr.freq_base) ||

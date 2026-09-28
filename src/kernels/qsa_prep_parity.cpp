@@ -169,6 +169,9 @@ int main(int argc, char** argv) {
         k::QsaShapes bad = s;
         bad.head_dim = 128;
         if (k::qsa_prep_supported(bad, nr)) { std::fprintf(stderr, "FAIL: head_dim 128 claimed supported\n"); ++g_fail; }
+        bad = s;
+        bad.idx_n_head = s.n_head + 1;
+        if (k::qsa_prep_supported(bad, nr)) { std::fprintf(stderr, "FAIL: idx_n_head > n_head claimed supported\n"); ++g_fail; }
         nr.native_rope = false;
         if (k::qsa_prep_supported(s, nr)) { std::fprintf(stderr, "FAIL: the table rotation without a table\n"); ++g_fail; }
     }
