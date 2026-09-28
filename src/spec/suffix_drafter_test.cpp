@@ -12,10 +12,12 @@
 // No model runs; this measures the drafter on text, not on the model's own outputs.
 #include "strata/spec/suffix_drafter.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -58,6 +60,95 @@ Sim simulate(const std::vector<int32_t>& history, const std::vector<int32_t>& ta
         ++s.steps;
     }
     return s;
+}
+
+// Issue #46: a drafter kept across requests (reset lazily by epoch, extended by sync) must propose exactly what a
+// fresh drafter built from the same tokens proposes.  `a` and `b` are fed the same continuation, a token at a time,
+// and must agree on every proposal (tokens and match length).
+bool same_proposals(SuffixDrafter& a, SuffixDrafter& b, const std::vector<int32_t>& cont) {
+    int32_t oa[16], ob[16];
+    for (size_t i = 0; i <= cont.size(); ++i) {
+        const int na = a.propose(16, oa), nb = b.propose(16, ob);
+        if (na != nb || a.last_match() != b.last_match() || !std::equal(oa, oa + na, ob)) return false;
+        if (i < cont.size()) { a.append(cont[i]); b.append(cont[i]); }
+    }
+    return a.size() == b.size();
+}
+
+// text-like tokens: a small vocabulary with repeated phrases, so trigrams recur and proposals are frequent
+std::vector<int32_t> text_like(std::mt19937& rng, size_t n, int vocab) {
+    std::vector<int32_t> v;
+    std::uniform_int_distribution<int> tok(0, vocab - 1), coin(0, 3);
+    while (v.size() < n) {
+        if (v.size() > 16 && coin(rng) == 0) {   // quote an earlier passage
+            std::uniform_int_distribution<size_t> at(0, v.size() - 8);
+            const size_t s = at(rng);
+            for (size_t i = 0; i < 8 && v.size() < n; ++i) v.push_back(v[s + i]);
+        } else {
+            v.push_back(tok(rng));
+        }
+    }
+    return v;
+}
+
+void incremental_tests() {
+    std::mt19937 rng(46);
+    for (int round = 0; round < 20; ++round) {
+        const size_t cap = round % 2 ? 4096 : 1024;   // 1024: the table fills past its nominal capacity
+        const std::vector<int32_t> conv = text_like(rng, 3000, 40 + round), cont = text_like(rng, 300, 40 + round);
+        // a conversation read in growing requests: every request continues the previous one
+        SuffixDrafter kept(3, 32, cap);
+        bool ok = true;
+        for (size_t end : {size_t(0), size_t(1), size_t(700), size_t(701), size_t(1900), conv.size()}) {
+            const bool extended = kept.sync(conv.data(), end);
+            ok = ok && extended;
+        }
+        check(ok, "sync keeps a history that the request continues");
+        SuffixDrafter fresh(3, 32, cap);
+        fresh.append(conv.data(), conv.size());
+        check(same_proposals(kept, fresh, cont), "a history extended by sync proposes as a fresh one");
+        // a request that does not continue it (an edited message): rebuilt, lazily cleared
+        std::vector<int32_t> edited(conv.begin(), conv.begin() + 1200);
+        edited.push_back(-7);
+        edited.insert(edited.end(), conv.begin() + 900, conv.begin() + 2500);
+        check(!kept.sync(edited.data(), edited.size()), "sync rebuilds a history the request does not continue");
+        SuffixDrafter fresh2(3, 32, cap);
+        fresh2.append(edited.data(), edited.size());
+        check(same_proposals(kept, fresh2, cont), "a rebuilt history proposes as a fresh one");
+        // reset then the same text again: every trigram is already in the (stale) table
+        kept.reset();
+        kept.append(conv.data(), 1500);
+        SuffixDrafter fresh3(3, 32, cap);
+        fresh3.append(conv.data(), 1500);
+        check(same_proposals(kept, fresh3, cont), "after a lazy reset the old slots are gone");
+        // many resets in a row, then a short history (most of the table is stale)
+        for (int i = 0; i < 1000; ++i) kept.reset();
+        kept.sync(cont.data(), 40);
+        SuffixDrafter fresh4(3, 32, cap);
+        fresh4.append(cont.data(), 40);
+        check(same_proposals(kept, fresh4, conv), "after a thousand resets");
+    }
+    {   // a small table filled in every epoch: a slot of an older epoch must be free again, or the table stays full
+        SuffixDrafter kept(3, 32, 64);   // 128 slots
+        std::uniform_int_distribution<int32_t> tok(0, 1 << 20);
+        bool ok = true;
+        for (int epoch = 0; epoch < 8 && ok; ++epoch) {
+            std::vector<int32_t> h;
+            for (int i = 0; i < 100; ++i) h.push_back(tok(rng));   // ~98 distinct trigrams
+            std::vector<int32_t> cont(h.begin() + 30, h.begin() + 60);
+            kept.reset();
+            kept.append(h.data(), h.size());
+            SuffixDrafter fresh(3, 32, 64);
+            fresh.append(h.data(), h.size());
+            ok = same_proposals(kept, fresh, cont);
+            int32_t out[4];
+            kept.append(h[30]);
+            kept.append(h[31]);
+            kept.append(h[32]);
+            ok = ok && kept.propose(4, out) > 0;   // the repeated passage is still found
+        }
+        check(ok, "a table refilled after every reset");
+    }
 }
 
 void unit_tests() {
@@ -111,6 +202,7 @@ void unit_tests() {
         int32_t out[4];
         check(d.propose(4, out) > 0, "propose after overflow of nominal capacity");
     }
+    incremental_tests();
     std::printf("suffix_drafter unit tests: %s\n", g_fail ? "FAILED" : "OK");
 }
 }  // namespace

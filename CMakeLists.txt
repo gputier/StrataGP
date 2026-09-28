@@ -262,6 +262,7 @@ if(STRATA_ENABLE_CUDA)
   # against llama.cpp on the SAME ids and a tokenizer on one side of that comparison is a second variable.
   # plan v0.3 P5: batched prompt processing (tensor-core GEMMs through cuBLAS).
   add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
+  target_sources(strata_prefill PRIVATE src/prefill/moe_group.cu)   # issue #36: the experts grouped on the device
   target_include_directories(strata_prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(strata_prefill PUBLIC strata_engine CUDA::cublas CUDA::cudart)
   # B8 (STRATA_PREFILL_ROUTE_DECODE=1): the token path's native router over a prompt chunk, with its --use_fast_math
@@ -278,6 +279,11 @@ if(STRATA_ENABLE_CUDA)
   target_include_directories(prefill_kernels_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(prefill_kernels_parity PRIVATE strata_prefill CUDA::cudart)
   add_test(NAME prefill_kernels_parity COMMAND prefill_kernels_parity)
+  # Issue #36: the prompt path's expert grouping on the device and its batched gathers vs the host sort and the
+  # per-expert gathers, entry for entry and byte for byte (GPU, synthetic, no model).
+  add_executable(moe_group_parity src/prefill/moe_group_parity.cpp)
+  target_link_libraries(moe_group_parity PRIVATE strata_prefill CUDA::cudart)
+  add_test(NAME moe_group_parity COMMAND moe_group_parity)
 
   add_executable(dequant_s2_parity src/kernels/dequant_s2_parity.cpp)
   # The tests are HOST C++ files that call cudaMalloc/cudaMemcpy themselves, so they need the toolkit headers
@@ -391,6 +397,12 @@ if(STRATA_ENABLE_CUDA)
   target_include_directories(qsa_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(qsa_parity PRIVATE strata_kernels CUDA::cudart)
   add_test(NAME qsa_parity COMMAND qsa_parity --selftest)
+
+  # Issue #40: the prompt path's chunked indexer append vs the per-cell kernel, bitwise (GPU, synthetic, no model).
+  add_executable(qsa_indexer_chunk_parity src/kernels/qsa_indexer_chunk_parity.cpp)
+  target_include_directories(qsa_indexer_chunk_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(qsa_indexer_chunk_parity PRIVATE strata_kernels CUDA::cudart)
+  add_test(NAME qsa_indexer_chunk_parity COMMAND qsa_indexer_chunk_parity)
 
   # ---- P2.S4: the PLE n-gram hash, the IQ4_NL table read, and the PLE block ----
   # `ngram.cpp` is host-only but lives in `strata_kernels` because `ple.cu` shares its geometry constants, and

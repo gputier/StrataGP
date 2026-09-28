@@ -631,8 +631,56 @@ struct ImgKey {
 struct ConvCheckpoint {
     std::vector<int32_t> ids;     ///< the tokens this state has consumed
     std::vector<ImgKey> imgs;     ///< the images among them
-    std::vector<uint8_t> gdn, ple, tails;
+    std::vector<uint8_t> gdn, ple, tails;   ///< STRATA_OLD_CKPT=1: pageable copies
+    std::shared_ptr<uint8_t> state;         ///< issue #45: GDN | PLE | tails in one buffer of a CkptPool
+    size_t ple_bytes = 0;                   ///< ...of which the PLE history (0: none)
     uint64_t used = 0;            ///< last-use stamp for the retention policy (conv_cache.hpp)
+};
+
+// Issue #45: the checkpoints' host buffers.  Until 0.1.20 a checkpoint synchronized the device and copied its ~118 MB
+// with a synchronous cudaMemcpy per piece into freshly allocated pageable vectors (the pages faulted in by the copy
+// itself).  Here each checkpoint takes one pinned buffer of the pool, handed back when the checkpoint is dropped (so
+// the pool holds at most --prompt-cache + 1 of them), and the pieces are queued on a stream of their own with one
+// wait for all of them: DMA at the link's speed, no allocation, no fault.  Pageable when no more RAM can be pinned.
+// The bytes are the same either way.  Declared before the checkpoints, so it outlives them.
+struct CkptPool {
+    size_t bytes = 0;                                   ///< one checkpoint's running state
+    std::vector<std::pair<uint8_t*, bool>> free_list;   ///< (buffer, pinned)
+    cudaStream_t stream = nullptr;
+    ~CkptPool() {
+        for (const auto& [p, pinned] : free_list) {
+            if (pinned) cudaFreeHost(p);
+            else delete[] p;
+        }
+        if (stream) cudaStreamDestroy(stream);
+    }
+    /// A buffer of `bytes`, back in the pool when its last owner drops it; null on failure.
+    std::shared_ptr<uint8_t> take() {
+        if (stream == nullptr && cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) return nullptr;
+        std::pair<uint8_t*, bool> b{nullptr, false};
+        if (!free_list.empty()) {
+            b = free_list.back();
+            free_list.pop_back();
+        } else if (cudaHostAlloc((void**) &b.first, bytes, cudaHostAllocDefault) == cudaSuccess) {
+            b.second = true;
+        } else {
+            (void) cudaGetLastError();
+            b.first = new (std::nothrow) uint8_t[bytes];
+            if (b.first == nullptr) return nullptr;
+        }
+        return std::shared_ptr<uint8_t>(b.first, [this, pinned = b.second](uint8_t* p) { free_list.emplace_back(p, pinned); });
+    }
+    /// Frees the idle buffers beyond `keep`: once checkpoints are dropped (a new conversation, a control-vector
+    /// switch) their ~118 MB each would otherwise stay pinned for the server's lifetime.  Every copy into or out of
+    /// a buffer has been waited for when its checkpoint is dropped.
+    void trim(size_t keep) {
+        while (free_list.size() > keep) {
+            const auto [p, pinned] = free_list.back();
+            free_list.pop_back();
+            if (pinned) cudaFreeHost(p);
+            else delete[] p;
+        }
+    }
 };
 
 uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull) {
@@ -655,9 +703,26 @@ ConvStateSizes conv_state_sizes(const strata::core::ModelGeometry& g) {
     return z;
 }
 
-/// Copies the running state out.  The caller has synchronized the device.
-bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
+/// Copies the running state out.  The caller has synchronized the device.  With a pool (issue #45): into one of its
+/// buffers, on its stream; without (STRATA_OLD_CKPT=1): into pageable vectors, synchronously.
+bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, const strata::core::ModelGeometry& g,
+                     CkptPool* pool = nullptr) {
     const ConvStateSizes z = conv_state_sizes(g);
+    if (pool != nullptr) {
+        const size_t ple = ss.ple_hist != nullptr ? z.ple : 0, tails = z.tail * (size_t) g.n_qsa_layers();
+        pool->bytes = z.gdn + z.ple + tails;
+        c.state = pool->take();
+        c.ple_bytes = ple;
+        if (c.state == nullptr) return false;
+        uint8_t* p = c.state.get();
+        bool ok = cudaMemcpyAsync(p, ss.gdn_state, z.gdn, cudaMemcpyDeviceToHost, pool->stream) == cudaSuccess;
+        if (ple > 0)
+            ok = ok && cudaMemcpyAsync(p + z.gdn, ss.ple_hist, ple, cudaMemcpyDeviceToHost, pool->stream) == cudaSuccess;
+        for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
+            ok = ok && cudaMemcpyAsync(p + z.gdn + ple + (size_t) i * z.tail, ss.qsa_states[i].idx_tail, z.tail,
+                                       cudaMemcpyDeviceToHost, pool->stream) == cudaSuccess;
+        return cudaStreamSynchronize(pool->stream) == cudaSuccess && ok;
+    }
     c.gdn.resize(z.gdn);
     c.ple.resize(ss.ple_hist != nullptr ? z.ple : 0);
     c.tails.resize(z.tail * (size_t) g.n_qsa_layers());
@@ -672,8 +737,25 @@ bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, co
 }
 
 /// Puts a checkpoint's running state back; the positional cells below it are the caller's to guarantee.
-bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
+bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss, const strata::core::ModelGeometry& g,
+                        CkptPool* pool = nullptr) {
     const ConvStateSizes z = conv_state_sizes(g);
+    if (c.state != nullptr) {   // saved into a pool's buffer (issue #45): back on its stream
+        if (pool == nullptr || pool->stream == nullptr || (c.ple_bytes > 0 && ss.ple_hist == nullptr)) return false;
+        if (cudaDeviceSynchronize() != cudaSuccess) return false;   // nothing may still be reading the state
+        const uint8_t* p = c.state.get();
+        bool ok = cudaMemcpyAsync(ss.gdn_state, p, z.gdn, cudaMemcpyHostToDevice, pool->stream) == cudaSuccess;
+        if (c.ple_bytes > 0)
+            ok = ok && cudaMemcpyAsync(ss.ple_hist, p + z.gdn, c.ple_bytes, cudaMemcpyHostToDevice, pool->stream) == cudaSuccess;
+        for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
+            ok = ok && cudaMemcpyAsync(ss.qsa_states[i].idx_tail, p + z.gdn + c.ple_bytes + (size_t) i * z.tail, z.tail,
+                                       cudaMemcpyHostToDevice, pool->stream) == cudaSuccess;
+        if (cudaStreamSynchronize(pool->stream) != cudaSuccess || !ok) return false;
+        const size_t L = c.ids.size();
+        ss.ple_prev[0] = L >= 2 ? c.ids[L - 2] : -1;
+        ss.ple_prev[1] = L >= 1 ? c.ids[L - 1] : -1;
+        return cudaDeviceSynchronize() == cudaSuccess;
+    }
     if (c.gdn.size() != z.gdn || c.tails.size() != z.tail * (size_t) g.n_qsa_layers()) return false;
     if (cudaMemcpy(ss.gdn_state, c.gdn.data(), z.gdn, cudaMemcpyHostToDevice) != cudaSuccess) return false;
     if (!c.ple.empty() && cudaMemcpy(ss.ple_hist, c.ple.data(), z.ple, cudaMemcpyHostToDevice) != cudaSuccess)
@@ -687,6 +769,19 @@ bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss,
     ss.ple_prev[0] = L >= 2 ? c.ids[L - 2] : -1;
     ss.ple_prev[1] = L >= 1 ? c.ids[L - 1] : -1;
     return cudaDeviceSynchronize() == cudaSuccess;
+}
+
+// Issue #42: STRATA_ASYNC_REFILL=1 - the expert-cache slots lent to the prompt path are refilled on the refill stream
+// and re-admitted like the adaptive tier's swaps (`pending`, checked before every window) once their copies have
+// landed, instead of one blocking copy per slot before the first window (~180 ms serving, more from the command
+// line).  Opt-in: until the copies land those experts are computed on the CPU, which rounds differently, and when
+// they land depends on timing.
+bool async_refill_on() {
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_ASYNC_REFILL");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return v;
 }
 
 // --control-vector-scaled: llama.cpp's `common_control_vector_load` (every file's `direction.<l>` times its scale,
@@ -1693,30 +1788,64 @@ int main(int argc, char** argv) {
     int64_t prefilled = 0;
     if (!profile.empty() && srcp != nullptr) {
         const int64_t want = std::min<int64_t>((int64_t) profile.size(), xcache.slots());
+        // issue #48: the fills are queued on one stream and waited for once - a blocking copy per slot (4,105 on a
+        // 12 GB card, ~16,000 on a 32 GB one) left the copy engine idle between slots.  STRATA_OLD_PROFILE_FILL=1
+        // keeps the blocking copies (the A/B; the slots hold the same bytes either way)
+        cudaStream_t fill_stream = nullptr;
+        if (std::getenv("STRATA_OLD_PROFILE_FILL") == nullptr &&
+            cudaStreamCreateWithFlags(&fill_stream, cudaStreamNonBlocking) != cudaSuccess) {
+            (void) cudaGetLastError();
+            fill_stream = nullptr;
+        }
+        // a non-blocking stream is not ordered after the legacy stream: the arena's zeroing `cudaMemset` in
+        // `ExpertCache::open` (queued on stream 0, not waited for when `--expert-cache N` is fixed or the auto
+        // loop leaves through its attempt cap) could otherwise land on top of the copies below
+        if (fill_stream != nullptr && cudaDeviceSynchronize() != cudaSuccess) {
+            std::fprintf(stderr, "strata generate: the profile fill failed: %s\n",
+                         cudaGetErrorString(cudaGetLastError()));
+            cudaStreamDestroy(fill_stream);
+            return 1;
+        }
+        const Clock::time_point tf = Clock::now();
         for (int64_t i = 0; i < want; ++i) {
             const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
             if (slot == strata::core::kNotResident) break;
             const uint8_t* b = srcp->blob(profile[(size_t) i].first, profile[(size_t) i].second);
-            if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
-                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first))) {
+            const int64_t bytes = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
+            if (b == nullptr || !(fill_stream != nullptr ? xcache.fill_slot(slot, b, fill_stream, err, bytes)
+                                                         : xcache.fill_slot_blocking(slot, b, err, bytes))) {
                 std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
                              (long long) i, err.c_str());
                 return 1;
             }
             ++prefilled;
         }
-        // **AND ONE SLOT IS READ BACK AND COMPARED.**  A residency table that is right about indices and wrong
+        if (fill_stream != nullptr) {
+            const cudaError_t e = cudaStreamSynchronize(fill_stream);
+            cudaStreamDestroy(fill_stream);
+            if (e != cudaSuccess) {
+                std::fprintf(stderr, "strata generate: the profile fill failed: %s\n", cudaGetErrorString(e));
+                return 1;
+            }
+        }
+        const double fill_ms = std::chrono::duration<double, std::milli>(Clock::now() - tf).count();
+        // **AND SLOTS ARE READ BACK AND COMPARED.**  A residency table that is right about indices and wrong
         // about bytes produces a plausible token, which is this project's most expensive failure mode; the
-        // cache's own `verify_slot` is the check and it costs one 1.38 MB D2H at startup.
-        if (prefilled > 0 && !xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
-                                srcp->blob(profile[0].first, profile[0].second), err,
-                                (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[0].first))) {
-            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-            return 1;
+        // cache's own `verify_slot` is the check and it costs one 1.38 MB D2H at startup per slot: the first slot,
+        // and (issue #48: the fills are asynchronous now) the last one filled.  (Only the first was ever read back,
+        // not every slot as issue #48 has it.)
+        for (const int64_t v : {int64_t(0), prefilled - 1}) {
+            if (prefilled == 0) break;
+            const auto& pr = profile[(size_t) v];
+            if (!xcache.verify_slot(xcache.slot_of(pr.first, pr.second), srcp->blob(pr.first, pr.second), err,
+                                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(pr.first))) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
         }
         mem_mark("the profile fill");
-        std::fprintf(stderr, "strata generate: pre-filled %lld of %lld slots from the profile; slot 0 verified\n",
-                     (long long) prefilled, (long long) want);
+        std::fprintf(stderr, "strata generate: pre-filled %lld of %lld slots from the profile in %.0f ms; the first and "
+                             "the last verified\n", (long long) prefilled, (long long) want, fill_ms);
     }
 
     Drive drive;
@@ -2505,6 +2634,10 @@ int main(int argc, char** argv) {
         std::vector<int32_t> live;
         std::vector<ImgKey> live_imgs, req_imgs;
         bool live_ok = false;
+        // issue #45: the checkpoints' pinned buffers (declared first: it outlives them); STRATA_OLD_CKPT=1 keeps the
+        // pageable vectors and synchronous copies (the A/B)
+        CkptPool ckpt_pool;
+        CkptPool* const ckpt_pinned = std::getenv("STRATA_OLD_CKPT") != nullptr ? nullptr : &ckpt_pool;
         std::vector<ConvCheckpoint> checks;
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
@@ -2523,7 +2656,7 @@ int main(int argc, char** argv) {
             ConvCheckpoint c;
             c.ids.assign(cur.begin(), cur.begin() + L);
             c.imgs = imgs_below(req_imgs, L);
-            if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_save(c, ss, g)) return false;
+            if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_save(c, ss, g, ckpt_pinned)) return false;
             c.used = ++check_clock;
             checks.push_back(std::move(c));
             while ((int) checks.size() > o.prompt_cache) {
@@ -2567,6 +2700,7 @@ int main(int argc, char** argv) {
         strata::program::ResidencyUpload res_up;
         cudaEvent_t adapt_ev = nullptr;
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
+        const bool async_refill = async_refill_on();   // issue #42: the lent slots come back through `pending` too
         auto apply_pending = [&](bool wait) {
             if (pending.empty()) return;
             if (wait) cudaEventSynchronize(adapt_ev);
@@ -2951,6 +3085,7 @@ int main(int argc, char** argv) {
             checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& c) {
                              return (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
                          }), checks.end());
+            ckpt_pool.trim(1);   // pinned RAM follows the live checkpoints (one spare for the next save)
             live_ok = false;   // until this request has finished, the session is in between
             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
             if (resume == 0) {
@@ -2973,7 +3108,7 @@ int main(int argc, char** argv) {
                     reread_to = resume;
                     std::fprintf(stderr, "strata serve: STRATA_CKPT_REREAD: reading %lld tokens again instead of "
                                          "restoring\n", (long long) resume);
-                } else if (c == nullptr || !checkpoint_restore(*c, ss, g)) {
+                } else if (c == nullptr || !checkpoint_restore(*c, ss, g, ckpt_pinned)) {
                     std::printf("ERR restoring a conversation checkpoint failed\n");
                     return 1;
                 }
@@ -3025,6 +3160,7 @@ int main(int argc, char** argv) {
                     drive.d.layers = 0;
                     drive.d.experts = 0;
                     drive.d.failed = false;
+                    apply_pending(false);   // lent slots refilled asynchronously (issue #42) as they land
                     if (!ver.run(T, win.data(), q, &drive_pool_multi, &drive, outw.data(), e) || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
@@ -3046,6 +3182,21 @@ int main(int argc, char** argv) {
             auto refill = [&](std::string& e) -> bool {
                 if (lent_now.empty()) return true;
                 tr("refill start", (long long) lent_now.size());
+                if (async_refill) {
+                    // issue #42: queued on the refill stream and re-admitted through `pending` once they have landed
+                    // (apply_pending, before every window); the CPU computes these experts until then
+                    for (const auto& [i, slot] : lent_now) {
+                        const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
+                        if (b == nullptr || !xcache.fill_slot(slot, b, adapt_stream, e,
+                                (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert)))
+                            return false;
+                        pending.emplace_back(i, slot);
+                    }
+                    cudaEventRecord(adapt_ev, adapt_stream);
+                    lent_now.clear();
+                    lent_chunk = 0;
+                    return true;
+                }
                 for (const auto& [i, slot] : lent_now) {
                     const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
                     if (b == nullptr || !xcache.fill_slot_blocking(slot, b, e,
@@ -3067,6 +3218,7 @@ int main(int argc, char** argv) {
                     if (want <= lent_chunk) return true;
                     if (!refill(e)) return false;
                 }
+                apply_pending(true);   // an asynchronous refill of these slots (issue #42) lands before they are lent
                 const int32_t first = std::max<int32_t>(lend_first, (int32_t) (xcache.slots() - lend_slots(want)));
                 if (want != sp.chunk() || first != lend_first_now) {
                     if (!sp.relayout(want, xcache.device_slot(first), lend_bytes(first), e)) return false;
@@ -3172,8 +3324,13 @@ int main(int argc, char** argv) {
             std::vector<float> dprob((size_t) S, 0.0f);
             std::vector<int32_t> sbuf((size_t) S, 0);
             if (o.suffix_draft > 0) {
-                sfx.reset();
-                for (int64_t t : ids) sfx.append((int32_t) t);
+                // issue #46: a request that continues the drafter's history (the conversation so far, the reply
+                // included) only appends its new tokens, and any other one resets it in O(1) - the index is the one
+                // a rebuild gives.  STRATA_OLD_SFX_RESET=1 rebuilds it from the whole prompt (the A/B)
+                static const bool sfx_rebuild = std::getenv("STRATA_OLD_SFX_RESET") != nullptr;
+                const std::vector<int32_t> ids32(ids.begin(), ids.end());
+                if (sfx_rebuild) sfx.reset();
+                sfx.sync(ids32.data(), ids32.size());
             }
             bool first_window = true;
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
@@ -3475,8 +3632,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
-        // refill the lent slots from the arena and give them back to the decode tier
-        if (!lent.empty()) {
+        // refill the lent slots from the arena and give them back to the decode tier (issue #42: with
+        // STRATA_ASYNC_REFILL=1 and a native pack, `lent` is left to the speculative loop, which queues the copies and
+        // re-admits the slots as they land)
+        if (!lent.empty() && !(async_refill_on() && native_pack && o.max_new > 0)) {
             const Clock::time_point tr = Clock::now();
             for (const auto& [i, slot] : lent) {
                 const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
@@ -3490,6 +3649,7 @@ int main(int argc, char** argv) {
             cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
             std::fprintf(stderr, "strata generate: %zu lent slots refilled in %.1f ms\n", lent.size(),
                          std::chrono::duration<double, std::milli>(Clock::now() - tr).count());
+            lent.clear();
         }
         prefill_batched_ms = std::chrono::duration<double, std::milli>(Clock::now() - tp0).count();
         prefill_ms += prefill_batched_ms;
@@ -3794,6 +3954,25 @@ int main(int argc, char** argv) {
             // issue #16: asynchronous behind the swapped blobs; no window reads d_res (the loop's end waits)
             if (d_res != nullptr) res_up.put(d_res, host_res, adapt_stream, wait);
         };
+        if (!lent.empty()) {   // issue #42 (STRATA_ASYNC_REFILL=1): the prompt path's slots, re-admitted as they land
+            if (adapt_stream == nullptr && cudaStreamCreateWithFlags(&adapt_stream, cudaStreamNonBlocking) != cudaSuccess) {
+                std::fprintf(stderr, "strata generate: cannot create the refill stream\n");
+                return 1;
+            }
+            for (const auto& [i, slot] : lent) {
+                const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
+                if (b == nullptr || !xcache.fill_slot(slot, b, adapt_stream, err,
+                        (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert))) {
+                    std::fprintf(stderr, "strata generate: refilling a lent slot failed: %s\n", err.c_str());
+                    return 1;
+                }
+                pending.emplace_back(i, slot);
+            }
+            cudaEventRecord(adapt_ev, adapt_stream);
+            std::fprintf(stderr, "strata generate: %zu lent slots refilled asynchronously (the CPU computes them until "
+                                 "they land)\n", lent.size());
+            lent.clear();
+        }
         // Plan v0.3 P6: the VRAM tier follows the conversation.  Candidates are missing experts routed at least
         // twice (decayed); each is paired with its layer's least-routed resident expert and swapped when it was
         // routed clearly more often.  Copies run between rounds, when the GPU is idle.

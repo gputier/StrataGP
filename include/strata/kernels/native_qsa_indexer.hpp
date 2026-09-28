@@ -34,4 +34,14 @@ void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_dev
                                const QsaIndexerBuffers& buffers, const QsaShapes& shapes,
                                int64_t max_cells, float freq_base, void* stream);
 
+// Issue #40: cells [cell0, cell0 + n) of a text sequence in two launches, their raw
+// keys `raw` [n][128] back to back. The buffers end exactly as n calls of the
+// function above at cells cell0.. leave them: the same arithmetic, statement for
+// statement, and the events of a chunk (the spare, each completed block) read only
+// the tail as the chunk found it and the chunk's own keys. The prompt path's append.
+void native_qsa_indexer_append_chunk(const float* raw, int64_t n, int64_t cell0,
+                                     int32_t pos_base, const float* gamma, float epsilon,
+                                     const QsaIndexerBuffers& buffers, const QsaShapes& shapes,
+                                     int64_t max_cells, float freq_base, void* stream);
+
 } // namespace strata::kernels
