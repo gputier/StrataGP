@@ -507,6 +507,7 @@ constexpr int kSplitWarpSpan = 32 * kSplitPerLane;              // 1,024 logits 
 constexpr int kSplitWarps = 4;
 constexpr int kSplitBlockSpan = kSplitWarps * kSplitWarpSpan;   // 4,096 logits per block
 constexpr int kSplitMaxBlocks = 64;                             // lists the merge holds: n_vocab <= 262,144
+constexpr int kSplitMaxRows = 64;                               // rows per split launch (the scratch's bound)
 
 /// Merge `nl` (<= 64) lists of `k` candidates - list L at `lists[L * stride]`, each in the selection order and
 /// padded with sentinels - into their first `k`: `sink(i, value, id)` runs in every lane for i = 0..k-1 with the
@@ -676,7 +677,7 @@ SampledPath sampled_path() {
     return path;
 }
 
-// A stream being captured into a graph must not reach `split_scratch` (cudaMalloc, cudaStreamSynchronize): it
+// A stream being captured into a graph must not reach `split_scratch` (cudaMalloc): it
 // gets the one-block kernel, which needs no memory of its own.  The legacy stream cannot be captured.
 bool stream_capturing(void* stream) {
     if (stream == nullptr) return false;
@@ -689,17 +690,24 @@ bool stream_capturing(void* stream) {
 }
 
 // The split's block lists, one buffer per (device, stream): launches on one stream run in order, so a stream reuses
-// its buffer with no sync, and two streams never share one.  Grown on demand, never shrunk; nullptr when it cannot
-// be had, and the caller falls back to the one-block kernel.
+// its buffer with no sync, and two streams never share one.  Grown on demand (at least doubling, up to the size of
+// `kSplitMaxRows` rows at the widest vocabulary: 2 MB), never shrunk.  A grown-out buffer is retired, not freed: a
+// pointer handed out earlier (to another host thread on the same stream, say) may still be waiting for its launch,
+// and freeing it would need a sync that proves nothing about that thread.  Doubling keeps a slot's retired buffers
+// smaller than its live one, so a slot holds about 4 MB at most (0.5 MB for the engine's <= 16 rows).  nullptr
+// when the memory cannot be had, and the caller falls back to the one-block kernel; a failed grow is remembered, so
+// later calls of that size do not retry cudaMalloc each time.
 int2* split_scratch(void* stream, size_t entries) {
     struct Slot {
         int device;
         void* stream;
         int2* ptr;
         size_t entries;
+        size_t failed;                       // the smallest size cudaMalloc refused (0: none)
     };
     static std::mutex mu;
     static std::vector<Slot> slots;
+    static std::vector<int2*> retired;
     int device = 0;
     if (cudaGetDevice(&device) != cudaSuccess) {
         (void) cudaGetLastError();
@@ -710,24 +718,27 @@ int2* split_scratch(void* stream, size_t entries) {
     for (Slot& s : slots)
         if (s.device == device && s.stream == stream) slot = &s;
     if (slot == nullptr) {
-        slots.push_back({device, stream, nullptr, 0});
+        slots.push_back({device, stream, nullptr, 0, 0});
         slot = &slots.back();
     }
     if (slot->entries >= entries) return slot->ptr;
-    if (slot->ptr != nullptr) {
-        // the stream's earlier launches may still read the old buffer
-        if (cudaStreamSynchronize((cudaStream_t) stream) != cudaSuccess) return nullptr;
-        cudaFree(slot->ptr);
-        slot->ptr = nullptr;
-        slot->entries = 0;
-    }
+    if (slot->failed != 0 && entries >= slot->failed) return nullptr;
+    constexpr size_t kCap = (size_t) kSplitMaxRows * kSplitMaxBlocks * kSelMax;
+    size_t want = 2 * slot->entries < kCap ? 2 * slot->entries : kCap;
+    if (want < entries) want = entries;
     int2* ptr = nullptr;
-    if (cudaMalloc(&ptr, entries * sizeof(int2)) != cudaSuccess) {
+    if (cudaMalloc(&ptr, want * sizeof(int2)) != cudaSuccess) {
         (void) cudaGetLastError();
-        return nullptr;
+        want = entries;
+        if (cudaMalloc(&ptr, want * sizeof(int2)) != cudaSuccess) {
+            (void) cudaGetLastError();
+            slot->failed = entries;
+            return nullptr;
+        }
     }
+    if (slot->ptr != nullptr) retired.push_back(slot->ptr);
     slot->ptr = ptr;
-    slot->entries = entries;
+    slot->entries = want;
     return ptr;
 }
 
@@ -757,11 +768,12 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
     } else {
         // The split top_k by default: stage 1 over (61 blocks x rows) for 248,320 logits, stage 2 one warp per
         // row.  The one-block kernel when asked for, or when the split cannot run: a wider vocabulary than the merge
-        // holds, more rows than a grid's y, a stream under capture, no scratch.
+        // holds, more than `kSplitMaxRows` rows (the engine samples at most a verify window), a stream under capture,
+        // no scratch.
         const int k = sampled_k(p.top_k, n_vocab);
         const int n_blocks = (n_vocab + kSplitBlockSpan - 1) / kSplitBlockSpan;
         int2* scratch = nullptr;
-        if (sampled_path() == SampledPath::Split && n_blocks <= kSplitMaxBlocks && n_tokens <= 65535 &&
+        if (sampled_path() == SampledPath::Split && n_blocks <= kSplitMaxBlocks && n_tokens <= kSplitMaxRows &&
             !stream_capturing(stream))
             // sized for 16 rows and 64 entries at least, so a verify window or a wider top_k does not regrow it
             scratch = split_scratch(stream, (size_t) (n_tokens > 16 ? n_tokens : 16) * n_blocks * kSelMax);
