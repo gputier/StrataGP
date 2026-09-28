@@ -298,6 +298,13 @@ if(STRATA_ENABLE_CUDA)
   target_link_libraries(gdn_parity PRIVATE strata_kernels CUDA::cudart)
   add_test(NAME gdn_parity COMMAND gdn_parity --selftest)
 
+  # issues #8/#5: the fused and native GDN kernels (the --native path) over 256 steps against float64, the three
+  # softplus forms, fused_gdn_ab, fused_gdn_conv_l2 and the native preprocessing (synthetic data)
+  add_executable(gdn_fused_parity src/kernels/gdn_fused_parity.cpp)
+  target_include_directories(gdn_fused_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(gdn_fused_parity PRIVATE strata_kernels CUDA::cudart)
+  add_test(NAME gdn_fused_parity COMMAND gdn_fused_parity --selftest)
+
   add_executable(s2_gemv_q8_parity src/kernels/s2_gemv_q8_parity.cpp)
   target_include_directories(s2_gemv_q8_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(s2_gemv_q8_parity PRIVATE strata_kernels CUDA::cudart)

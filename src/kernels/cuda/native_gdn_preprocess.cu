@@ -92,6 +92,10 @@ __global__ void gate_softplus(const float* __restrict__ alpha, const float* __re
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
     const float value = __fadd_rn(alpha[i], dt[i]);
+    // #5: ggml-cuda's op_softplus at the pinned llama.cpp, verbatim (unary.cu, threshold 20, both compiled with
+    // --use_fast_math) - so NOT log1pf: 1 + expf(v) rounds to 1 below v ~ -17 and the gate is then exactly 0.
+    // `fused_gdn_ab` (the --native default) uses log1pf(__expf(v)) and the legacy gdn_gate log1pf(expf(v));
+    // gdn_fused_parity asserts this one against llama.cpp's expression and prints the gap per range of v.
     const float softplus = value > 20.0f ? value : logf(1.0f + expf(value));
     gate[i] = softplus * ssm_a[i];
 }
