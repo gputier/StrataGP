@@ -17,8 +17,12 @@
 #else
 #include <sys/mman.h>
 #include <linux/mman.h>
+#include <cerrno>
 #ifndef MAP_HUGE_2MB
 #define MAP_HUGE_2MB (21 << 26)
+#endif
+#ifndef MADV_HUGEPAGE
+#define MADV_HUGEPAGE 14
 #endif
 #endif
 
@@ -86,9 +90,44 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note) {
     note = "MAP_HUGETLB unavailable (no hugetlb pool configured?); using 4 KB pages";
     p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     got = PageBacking::NormalPages;
-    return p == MAP_FAILED ? nullptr : p;
+    if (p == MAP_FAILED) return nullptr;
+    // O8b (#28): ask for TRANSPARENT huge pages instead, before anything touches the arena - `cudaHostRegister`
+    // (or the working-set lock) faults it in right after this, and a page faulted in at 4 KB stays 4 KB.  At 4 KB
+    // an expert spans ~338 pages, each a TLB miss because the experts are drawn at random from tens of GB; the
+    // kernel grants 2 MB pages where it can (`enabled` set to `madvise` or `always`), and the share it actually gave
+    // is reported below.  STRATA_NO_THP=1 is the A/B arm.
+    if (const char* e = std::getenv("STRATA_NO_THP"); e != nullptr && e[0] == '1') {
+        note += " (transparent huge pages skipped: STRATA_NO_THP=1)";
+    } else if (madvise(p, (size_t) bytes, MADV_HUGEPAGE) == 0) {
+        note += " + MADV_HUGEPAGE";
+    } else {
+        note += " (madvise(MADV_HUGEPAGE) refused: " + std::string(std::strerror(errno)) + ")";
+    }
+    return p;
 #endif
 }
+
+#ifndef _WIN32
+// O8b (#28): the part of [p, p + bytes) the kernel backs with transparent huge pages - `AnonHugePages` against
+// `Rss` of every mapping the range covers in /proc/self/smaps (a partial mlock splits it into several).
+std::string thp_share(const void* p, uint64_t bytes) {
+    std::FILE* f = std::fopen("/proc/self/smaps", "r");
+    if (f == nullptr) return "AnonHugePages unknown (no /proc/self/smaps)";
+    const unsigned long long lo = (unsigned long long) (uintptr_t) p, hi = lo + bytes;
+    unsigned long long rss_kb = 0, thp_kb = 0, a = 0, b = 0, v = 0;
+    bool in = false;
+    char line[512];
+    while (std::fgets(line, sizeof line, f)) {
+        if (std::sscanf(line, "%llx-%llx ", &a, &b) == 2) in = a < hi && b > lo;   // a mapping's header line
+        else if (in && std::sscanf(line, "Rss: %llu kB", &v) == 1) rss_kb += v;
+        else if (in && std::sscanf(line, "AnonHugePages: %llu kB", &v) == 1) thp_kb += v;
+    }
+    std::fclose(f);
+    if (rss_kb == 0) return "AnonHugePages: nothing resident yet";
+    return "AnonHugePages " + std::to_string(thp_kb >> 10) + " of " + std::to_string(rss_kb >> 10) + " MiB resident (" +
+           std::to_string((int) (100.0 * (double) thp_kb / (double) rss_kb + 0.5)) + "%)";
+}
+#endif
 
 void release(void* p, uint64_t bytes) {
     if (!p) return;
@@ -193,6 +232,10 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds) : 
                 note = "arena lock disabled (STRATA_ARENA_LOCK=0); " + note;
             }
         }
+#ifndef _WIN32
+        // O8b (#28): registration and the lock have faulted the arena in, so the share is known now
+        if (backing == PageBacking::NormalPages) note += "; " + thp_share(base, bytes);
+#endif
     }
 }
 
