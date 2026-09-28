@@ -50,6 +50,22 @@ double ms_since(Clock::time_point t) { return std::chrono::duration<double, std:
 const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
 #define VDBG(...) do { if (g_dbg) { std::fprintf(stderr, "verify dbg: " __VA_ARGS__); std::fflush(stderr); } } while (0)
 
+// #19 / #44: the window's per-token launches batched (router, indexer projections, shared expert, combination),
+// each token bitwise the loop it replaces.  STRATA_OLD_WINDOW=1 records the loops again, STRATA_OLD_WINDOW_<PART>=1
+// one part (ROUTE, INDEXER, SHARED, COMBINE), for an A/B on the GPU.  Read once: a captured window keeps its choice.
+bool env_on(const char* name) {
+    const char* e = std::getenv(name);
+    return e != nullptr && *e != '\0' && *e != '0';
+}
+const bool g_old_window = env_on("STRATA_OLD_WINDOW");
+const bool g_old_route = g_old_window || env_on("STRATA_OLD_WINDOW_ROUTE");
+const bool g_old_indexer = g_old_window || env_on("STRATA_OLD_WINDOW_INDEXER");
+const bool g_old_shared = g_old_window || env_on("STRATA_OLD_WINDOW_SHARED");
+const bool g_old_combine = g_old_window || env_on("STRATA_OLD_WINDOW_COMBINE");
+// #44 (HYPOTHESIS, opt-in): the CPU only writes y_miss and the GPU reads its CPU rows once, so write-combined
+// pages may make both sides cheaper.  STRATA_YMISS_WC=1; the values are unchanged either way.
+const bool g_ymiss_wc = env_on("STRATA_YMISS_WC");
+
 struct Bump {
     uint8_t* base = nullptr;
     uint64_t used = 0;
@@ -60,8 +76,8 @@ struct Bump {
     }
 };
 
-bool mapped(size_t bytes, void** h, void** d) {
-    if (cudaHostAlloc(h, bytes, cudaHostAllocMapped) != cudaSuccess) return false;
+bool mapped(size_t bytes, void** h, void** d, unsigned flags = cudaHostAllocMapped) {
+    if (cudaHostAlloc(h, bytes, flags) != cudaSuccess) return false;
     std::memset(*h, 0, bytes);
     return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
 }
@@ -185,7 +201,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_flag_, (void**) &m_flag_) &&
               mapped(64, (void**) &h_flagA_, (void**) &m_flagA_) &&
               mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
-              mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
+              mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_,
+                     cudaHostAllocMapped | (g_ymiss_wc ? cudaHostAllocWriteCombined : 0u));
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
     // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
     {
@@ -302,6 +319,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const int G = (split_ && T >= 2) ? 2 : 1;
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
     groups_[T] = G;
+    SharedGate sh_mode[2] = {SharedGate::Applied, SharedGate::Applied};   // what pre() left post() to apply (#19)
 
     // ---- the window's inputs, from mapped staging
     copy_i32_from_mapped(tok_, m_tok_, T, cs);
@@ -440,8 +458,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 };
                 float* idx_raw = idx_raw_L_ + (size_t) qi * MT * ID;
                 native_quantize_q8_1(xm, xq_, (int) N, n, cs);
-                for (int t = tb; t < te; ++t)
-                    bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, cs);
+                if (g_old_indexer)
+                    for (int t = tb; t < te; ++t)
+                        bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, cs);
+                else   // #19: the group's columns in one launch, each bitwise the single-column GEMV
+                    bf16_gemv_fp32_mmvf_multi(xm, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
                 native_mmvq(wk->native_type, wk->native_data, xq_, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
                 native_mmvq(wv->native_type, wv->native_data, xq_, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
                 for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
@@ -479,9 +500,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     norm_rope(qc, wqn, (int) NH, (int) HD, pos_ + t * NH);
                     if (st.kv_q4) fwht256_inplace_cuda(qc, NH, cs);   // <Hq, Hk> = <q, k>
                 }
+                if (!g_old_indexer)   // #19: every column first; each token's norm and rotation touch only its own
+                    bf16_gemv_fp32_mmvf_multi(xm, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID, N,
+                                              IQ * ID, n, cs);
                 for (int t = tb; t < te; ++t) {
                     float* qx = qidx_ + t * IQ * ID;
-                    bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wiq->data, qx, (int) N, (int) (IQ * ID), cs);
+                    if (g_old_indexer)
+                        bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wiq->data, qx, (int) N, (int) (IQ * ID), cs);
                     norm_rope(qx, wiqn, (int) IQ, (int) ID, pos_ + t * NH);
                 }
                 qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n, max_blocks_,
@@ -509,10 +534,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             return false;
         }
         gr_read_group(1, true, inj_, inj2_);
-        for (int t = tb; t < te; ++t) {
+        if (g_old_route) {
+            for (int t = tb; t < te; ++t) {
+                MoEBuffers mb = ss.moe;
+                mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
+                if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
+            }
+        } else {   // #19: one router GEMV and one top-10 for the group
             MoEBuffers mb = ss.moe;
-            mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
-            if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
+            mb.logits = logits_ + tb * NE; mb.ids = ids_ + tb * K; mb.weights = w_ + tb * K;
+            if (!moe_route_multi(wt, g, l, K, mb, xm, n, cs, err)) return false;
         }
         doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
                          m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
@@ -528,10 +559,20 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             nsw.up_type = wsu->native_type; nsw.up_data = wsu->native_data;
             nsw.down_type = wsd->native_type; nsw.down_data = wsd->native_data;
             nsw.q8_1 = xq_;
-            for (int t = tb; t < te; ++t) f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, cs);
             try {
-                shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data, sh_gate_ + (size_t) tb * g.n_ff,
-                                    sh_up_ + (size_t) tb * g.n_ff, sh_g_ + tb, shared_ + tb * N, N, g.n_ff, cs);
+                if (g_old_shared) {
+                    for (int t = tb; t < te; ++t) f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, cs);
+                    shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data, sh_gate_ + (size_t) tb * g.n_ff,
+                                        sh_up_ + (size_t) tb * g.n_ff, sh_g_ + tb, shared_ + tb * N, N, g.n_ff, cs);
+                    sh_mode[grp] = SharedGate::Applied;
+                } else {
+                    // #19: the BF16 image only for the BF16 gate, in one launch; the shared expert's own per-token
+                    // launches batched, and its gate left to the combination unless that is the old one
+                    if (!shared_expert_native_bf16()) f32_to_bf16_bulk(xm, sh_bf16_ + tb * N, (int64_t) n * N, cs);
+                    sh_mode[grp] = shared_expert_multi_batched(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data,
+                                                               sh_gate_ + (size_t) tb * g.n_ff, sh_up_ + (size_t) tb * g.n_ff,
+                                                               sh_g_ + tb, shared_ + tb * N, N, g.n_ff, cs, !g_old_combine);
+                }
             } catch (const std::exception& e) {
                 err = std::string("verify shared expert: ") + e.what();
                 return false;
@@ -585,12 +626,26 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         grouped(p_ptr2, p_start2, p_counts + 2);
         wait_flag_ge(m_flag_, ring, cs);                       // the CPU's share is in the mapped rows
-        copy_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
-        moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
-        for (int t = tb; t < te; ++t) {
-            MoEBuffers mb = ss.moe;
-            mb.weights = w_ + t * K; mb.shared = shared_ + t * N;
-            if (!moe_combine_parts(g, l, K, mb, parts_ + (size_t) t * K * N, bo_ + t * N, cs, err)) return false;
+        if (g_old_combine) {
+            copy_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
+            moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
+            for (int t = tb; t < te; ++t) {
+                MoEBuffers mb = ss.moe;
+                mb.weights = w_ + t * K; mb.shared = shared_ + t * N;
+                if (!moe_combine_parts(g, l, K, mb, parts_ + (size_t) t * K * N, bo_ + t * N, cs, err)) return false;
+            }
+        } else {
+            // #44 (E1): one launch for the group; only the CPU's rows cross PCIe, the GPU's are read in VRAM (the
+            // pool zeroed their y_miss rows, so `0 + hit` as moe_hit_add made it), and the shared gate is applied
+            // here when the shared expert deferred it
+            MoeRows rows;
+            rows.y_miss = m_ymiss_ + (size_t) tb * K * N;
+            rows.hit_out = hit_out;
+            rows.hit_dst = p_dst;
+            rows.hit_count = p_counts + 1;
+            if (!moe_combine_rows(g, l, K, n, w_ + tb * K, shared_ + tb * N, sh_g_ + tb, (int) sh_mode[grp], rows,
+                                  bo_ + tb * N, cs, err))
+                return false;
         }
         if (l == g.n_layers - 1) {
             for (int t = tb; t < te; ++t) gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);

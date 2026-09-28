@@ -183,6 +183,27 @@ bool moe_shared(const WeightTable& tables, const ModelGeometry& g, int64_t layer
 bool moe_combine_parts(const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b, const float* parts,
                        float* out, void* stream, std::string& err);
 
+/// #19: `moe_route` for `n_tok` tokens in one GEMV and one top-k launch (no doorbell: the verify window
+/// publishes its own).  `x` is n_tok rows of n_embd; `b.logits`/`b.ids`/`b.weights` are n_tok consecutive rows
+/// of n_expert/k/k.  Token for token bitwise `moe_route`; without the native BF16 projections it IS the loop.
+bool moe_route_multi(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,
+                     const float* x, int n_tok, void* stream, std::string& err);
+
+/// #44 (E1): where the routed rows were left, for a combination that reads them in place.  Row i = t * k + e.
+struct MoeRows {
+    const float* y_miss = nullptr;      ///< the device alias of the mapped staging the CPU pool wrote
+    const float* hit_out = nullptr;     ///< the GPU experts' rows (device)
+    const int32_t* hit_dst = nullptr;   ///< the GPU's rows, as a device list (null with hit_count: none)
+    const int32_t* hit_count = nullptr; ///< its length, on the device
+};
+
+/// #44 (E1) + #19: `n_tok` tokens' combinations in one launch, bitwise copy_from_mapped + moe_hit_add +
+/// `moe_combine_parts` per token (the pool zeroes the GPU's rows of y_miss, so a GPU row is 0 + hit either way).
+/// `shared_gate`/`gate_mode` fold the shared expert's gate in (strata::kernels::SharedGate; 0 = `shared` final).
+bool moe_combine_rows(const ModelGeometry& g, int64_t layer, int64_t k, int n_tok, const float* weights,
+                      const float* shared, const float* shared_gate, int gate_mode, const MoeRows& rows, float* out,
+                      void* stream, std::string& err);
+
 /// Plan v0.3 P3 (default ON): the shared expert runs at the END OF `pre[l]`, after the doorbell has rung, so
 /// the GPU computes it while the host runs the CPU pool; `post[l]` then only combines.  Same kernels on the
 /// same inputs in the same stream order relative to their consumers, so the result is bitwise unchanged.
@@ -596,8 +617,10 @@ bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t 
                      const Doorbell* db = nullptr, const PleRun* ple = nullptr, int half = 0,
                      int stage_prefix = 0);
 
+/// `rows` (#44): the combination reads the routed rows where they were left (`moe_combine_rows`) instead of
+/// from `parts`, which is then not read.
 bool block_layer_post(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k,
                       const MoEBuffers& mb, const BlockBuffers& bb, const float* parts, void* stream,
-                      std::string& err);
+                      std::string& err, const MoeRows* rows = nullptr);
 
 }  // namespace strata::core

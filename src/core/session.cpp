@@ -840,11 +840,28 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
                                                     hits->x_scale);
         }
         strata::kernels::doorbell_wait(s.db->d_flag, s.db->d_seq, (void*) cs);
-        // A kernel, not a memcpy node: a copy-engine node splits the WDDM submission (measured 67 flushes/token).
-        strata::kernels::copy_from_mapped(parts_dev, y_dev, (int64_t) (parts_bytes / sizeof(float)), (void*) cs);
-        if (hits != nullptr)
-            strata::kernels::moe_hit_add(parts_dev, hits->hit_out, hits->d_dst, hits->d_count, s.k, g.n_embd, (void*) cs);
-        ok = block_layer_post(tables, g, l, s.k, s.moe, s.block, parts_dev, (void*) cs, err);
+        // #44 (E1): the combination reads the k rows where they were left - the CPU's from the mapped staging, the
+        // GPU's hits from `hit_out` (their staging rows are the pool's zeros) - in one kernel, bitwise the copy +
+        // moe_hit_add + combine below.  STRATA_OLD_TOKEN_COMBINE=1 keeps those three for an A/B.
+        static const bool old_combine = [] {
+            const char* e = std::getenv("STRATA_OLD_TOKEN_COMBINE");
+            return e != nullptr && *e != '\0' && *e != '0';
+        }();
+        const bool in_place = !old_combine && s.k >= 2 && s.k <= 15 && parts_bytes >= (size_t) s.k * g.n_embd * sizeof(float);
+        MoeRows rows;
+        rows.y_miss = y_dev;
+        if (hits != nullptr) {
+            rows.hit_out = hits->hit_out;
+            rows.hit_dst = hits->d_dst;
+            rows.hit_count = hits->d_count;
+        }
+        if (!in_place) {
+            // A kernel, not a memcpy node: a copy-engine node splits the WDDM submission (measured 67 flushes/token).
+            strata::kernels::copy_from_mapped(parts_dev, y_dev, (int64_t) (parts_bytes / sizeof(float)), (void*) cs);
+            if (hits != nullptr)
+                strata::kernels::moe_hit_add(parts_dev, hits->hit_out, hits->d_dst, hits->d_count, s.k, g.n_embd, (void*) cs);
+        }
+        ok = block_layer_post(tables, g, l, s.k, s.moe, s.block, parts_dev, (void*) cs, err, in_place ? &rows : nullptr);
         if (!ok) { err = "session_capture_token: post layer " + std::to_string(l) + ": " + err; break; }
         if (qsa) ++qsa_index;
     }
