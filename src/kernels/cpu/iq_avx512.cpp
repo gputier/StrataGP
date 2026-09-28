@@ -280,8 +280,8 @@ inline void row_dot_g(const uint8_t* row, int nblocks, const int8_t* const* qs, 
 }
 
 // O8d (#30): the tokens' Q8_K values, copied once per call.  In a block_q8_K `qs` sits at offset 4 of 292 bytes,
-// so every 64-value load of it straddled two cache lines; and the pool's activations are exactly kNativeActBytes =
-// 4096 bytes apart, so the same load of every token mapped to the same L1 set.  Here each block's 256 values start
+// so every 64-value load of it straddled two cache lines; and the pool's activations were exactly kNativeActBytes =
+// 4096 bytes apart, so the same load of every token mapped to the same L1 set (they are now 64 bytes more apart).  Here each block's 256 values start
 // on a cache line, and the tokens are kPackStride = 3,648 bytes (57 lines) apart, in different sets.
 constexpr int kPackTokens = 8;   // gu_rows_nt's widest instance
 constexpr int kPackBlocks = (int) (kNativeActBytes / sizeof(block_q8_K));

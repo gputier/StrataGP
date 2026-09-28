@@ -62,13 +62,23 @@ les zones de l'arène) :
 
 ```
 strata generate: expert arena: cudaHostRegister PORTABLE ok; MAP_HUGETLB unavailable (...); using 4 KB pages
-+ MADV_HUGEPAGE; AnonHugePages 34816 of 34820 MiB resident (100%)
++ MADV_HUGEPAGE; pinned/faulted in <t> s; AnonHugePages 34816 of 34820 MiB resident (100%) (smaps read in <n> ms)
 ```
+
+`pinned/faulted in` est le temps de l'enregistrement (ou du verrouillage), c'est-à-dire
+de la mise en mémoire de toute l'arène : c'est la mesure à comparer avec `STRATA_NO_THP=1`. La lecture de `smaps`
+parcourt les tables de pages de l'arène (~10 M entrées à 4 Ko pour 40 Go) ; elle est chronométrée, et
+`STRATA_THP_REPORT=0` la saute. `/proc/self/smaps_rollup` n'aurait rien fait gagner : il parcourt les mêmes tables
+(toutes les zones du processus) et ne donne qu'un total, pas la part de l'arène.
 
 `STRATA_NO_THP=1` saute le `madvise` (la note le dit). Windows et le chemin `hugetlb` ne changent pas.
 
 **Vérifié ici** (sans GPU : `cudaHostRegister` échoue, l'arène est verrouillée par `mlock`) : 512 Mio, 100 %
 en pages de 2 Mo avec le `madvise`, 0 % avec `STRATA_NO_THP=1`.
+Temps (mêmes 512 Mio, 3 passes par bras, VM bruitée) : fault-in 0,11 à 2,75 s avec le `madvise` (les passes à
+2,6-2,75 s incluent vraisemblablement l'initialisation du runtime CUDA par le premier `cudaHostRegister`, ou une
+compaction ; non départagé ici), 0,17 à 0,23 s avec `STRATA_NO_THP=1` ; lecture de `smaps` 0 à 1 ms en pages de 2 Mo,
+7 à 13 ms en pages de 4 Ko, soit par extrapolation linéaire ~0,5 à 1 s pour 40 Go en 4 Ko (HYPOTHÈSE), ~0 avec THP.
 
 **Risque.** Avec `defrag` à `madvise` (valeur courante), un fault dans une zone `MADV_HUGEPAGE` peut compacter la
 mémoire : si la RAM est fragmentée, l'enregistrement de 34 à 50 Go au démarrage peut prendre plus de temps. À surveiller
@@ -111,6 +121,11 @@ Strata et aux lignes down Q2_0 au format GGUF des packs natifs.
   ne reproduisait déjà pas le chemin 512 bits par défaut, et ne reproduit pas non plus ce mode.
 - **Mesuré ici :** entre −16 % et +7 % selon les passes, soit dans le bruit de cette machine.
 
+**Statut de #29 : partiel.** (a) est fait et activé ; (b) n'est fait qu'à moitié : l'amorçage de `vpdpbusd` existe
+mais reste opt-in, donc par défaut le travail en plus par ligne down mesuré par l'issue est inchangé. Restent : le
+noyau down à 4 lignes par itération, et le passage de la correction entière par défaut après revalidation du chemin
+GPU `--expert-cache-cpu-order` (à suivre dans une issue dédiée).
+
 **Non fait :** « traiter 4 lignes par itération » (proposition de l'audit). Réduire 4 accumulateurs ensemble change
 l'ordre de la réduction finale ; pour garder mono-token et multi-tokens identiques, il faudrait un arbre de réduction
 explicite commun aux deux, et le gain de la correction seule n'est pas mesurable ici. Laissé de côté.
@@ -132,6 +147,9 @@ Constat (**MESURÉ** dans le dépôt) : ~5 Go/s par cœur, limité par le décod
   maintenant les valeurs des tokens (10 × 256 o chacun) dans un tampon aligné sur 64 o, au pas de 3 648 o (57 lignes).
   Coût : 40 lectures/écritures de 64 o par token et par appel, contre ~80 lectures par ligne de poids.
 - **Pas des activations down natives** (`pool.hpp`, `hq`) : 1 024 + 64 o au lieu de 1 024 (t et t+4 étaient à 4 Ko).
+- **Pas des activations gate/up natives** (`expert_source.cpp`, `nact_multi`) : `kNativeActBytes` + 64 = 4 160 o au
+  lieu de 4 096, pour les chemins qui les lisent sur place (`STRATA_IQ512_NOPACK=1`, lignes plus larges que la copie
+  alignée, `vec_dot` de ggml-cpu). Seules les adresses changent : identique au bit près, sans interrupteur.
 - Mêmes octets, mêmes opérations après le décodage : identique au bit près à l'ancien noyau, que
   `STRATA_OLD_IQ512=1` conserve (`STRATA_IQ512_NOPACK=1` : les `gather` sans la copie alignée).
 

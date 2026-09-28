@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -171,6 +172,7 @@ PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, un
 PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds) : capacity(bytes) {
     if (bytes == 0) return;
     base = reserve(bytes, backing, note);
+    const auto t_pin = std::chrono::steady_clock::now();   // O8b (#28): the fault-in's time, THP on or off
 
     // Register with CUDA BEFORE any page is touched: cudaHostRegister pins what is resident now, and a region
     // that has already been faulted in page by page is far more expensive to register and may fail outright.
@@ -233,8 +235,23 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds) : 
             }
         }
 #ifndef _WIN32
-        // O8b (#28): registration and the lock have faulted the arena in, so the share is known now
-        if (backing == PageBacking::NormalPages) note += "; " + thp_share(base, bytes);
+        // O8b (#28): registration and the lock have faulted the arena in, so the share is known now.  The pin
+        // time is the A/B for STRATA_NO_THP=1: under MADV_HUGEPAGE with THP `defrag` set to `madvise` the fault-in
+        // may compact memory directly.  Reading smaps walks the arena's page tables (~10 M entries at 4 KB for
+        // 40 GB), so it is timed too; smaps_rollup would walk the same tables and lose the range, so it is not
+        // used.  STRATA_THP_REPORT=0 skips it.
+        const double pin_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_pin).count();
+        char pin_buf[64];
+        std::snprintf(pin_buf, sizeof pin_buf, "; pinned/faulted in %.2f s", pin_s);
+        note += pin_buf;
+        const char* rep = std::getenv("STRATA_THP_REPORT");
+        if (backing == PageBacking::NormalPages && (rep == nullptr || rep[0] != '0')) {
+            const auto t_rep = std::chrono::steady_clock::now();
+            note += "; " + thp_share(base, bytes);
+            std::snprintf(pin_buf, sizeof pin_buf, " (smaps read in %.0f ms)",
+                          1e3 * std::chrono::duration<double>(std::chrono::steady_clock::now() - t_rep).count());
+            note += pin_buf;
+        }
 #endif
     }
 }
