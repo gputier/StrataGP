@@ -80,13 +80,16 @@ private:
     bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err);
     bool capture_prefill(int T, std::string& err);
     bool capture_round(int T, std::string& err);
+    bool record_round(int T, std::string& err);
     bool capture_step(int j, std::string& err);
-    bool capture_chain(std::string& err);
+    bool capture_chain(int T, std::string& err);
     cudaGraphExec_t step_exec_[9] = {};
-    // issue #16: the draft chain as one graph (a WHILE node over the step), unless STRATA_OLD_MTP_CHAIN=1 or the
-    // driver refuses it; then one graph and one synchronization per step, as before
-    cudaGraphExec_t chain_exec_ = nullptr;
+    // issue #16: the round and its whole draft chain as one graph (a WHILE node over the step after the round),
+    // unless STRATA_OLD_MTP_CHAIN=1 or the driver refuses it; then the round's graph and one graph and one
+    // synchronization per step, as before.  STRATA_MTP_CHAIN_CHECK=N runs both for the first N rounds and compares.
+    cudaGraphExec_t chain_exec_[9] = {};
     bool chain_off_ = false;
+    int64_t chain_checks_ = 0, chain_diffs_ = 0;
     cudaEvent_t after_ev_ = nullptr;
     const float* f32(const char* name) const;
     const uint16_t* bf16(const char* name) const;

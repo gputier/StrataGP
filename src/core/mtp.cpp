@@ -86,7 +86,7 @@ MtpDrafter::~MtpDrafter() {
     for (auto& e : prefill_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : round_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : step_exec_) if (e) cudaGraphExecDestroy(e);
-    if (chain_exec_) cudaGraphExecDestroy(chain_exec_);
+    for (auto& e : chain_exec_) if (e) cudaGraphExecDestroy(e);
     if (cs_) cudaStreamDestroy(cs_);
     if (dense_) cudaFree(dense_);
     if (experts_) cudaFree(experts_);
@@ -476,9 +476,15 @@ bool MtpDrafter::capture_prefill(int T, std::string& err) {
 
 bool MtpDrafter::capture_round(int T, std::string& err) {
     if (round_exec_[T]) return true;
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+    const bool ok = record_round(T, err);
+    return finish_capture(cs_, ok, round_exec_[T], "round", err);
+}
+
+// The round's work into the capturing stream: its own graph (`capture_round`), or the head of the chain's.
+bool MtpDrafter::record_round(int T, std::string& err) {
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     bool ok = true;
     copy_i32_from_mapped(tok_, m_tok_, T, cs_);
     copy_i32_from_mapped(step_, m_step_, (int64_t) 2 * T * 4, cs_);
@@ -487,7 +493,8 @@ bool MtpDrafter::capture_round(int T, std::string& err) {
     copy_from_mapped(Rin_, window_R_, (int64_t) T * HCN, cs_);
     // the catch-up: K/V for the window's T cells, then the full layer for row a only (its cell's K/V is written
     // again, identically), staged by the host in step row 2*max_t - 1; the draft chain is one graph per step
-    // (`capture_step`) so the host can stop it when a draft is unlikely
+    // (`capture_step`) so the host can stop it when a draft is unlikely, or (issue #16) the WHILE node that
+    // `capture_chain` appends to this work, stopped by the device
     const int ra = 2 * max_t_ - 1;
     ok = record_forward(T, -1, cs_, err);
     if (ok) mtp_select(Rin_, HCN, tok_, row_, Rin_, tok_, nullptr, 0, cs_);
@@ -497,7 +504,7 @@ bool MtpDrafter::capture_round(int T, std::string& err) {
         ok = record_forward(1, ra, cs_, err);
     }
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, 0, cs_, probs_, m_prob_);
-    return finish_capture(cs_, ok, round_exec_[T], "round", err);
+    return ok;
 }
 
 // Chain step j (1..max_t-2): one row at the cell staged in step row `max_t + j - 1`, from the previous step's
@@ -515,16 +522,19 @@ bool MtpDrafter::capture_step(int j, std::string& err) {
     return finish_capture(cs_, ok, step_exec_[j], "step", err);
 }
 
-// Issue #16: the whole chain in one graph.  A WHILE node runs the step while the last draft is likely enough (the
-// test the host made between the per-step graphs, now made by mtp_chain_next on the device); every step uses step
-// row max_t, into which mtp_chain_stage copies the record the host staged for step j in row max_t + j - 1.
-bool MtpDrafter::capture_chain(std::string& err) {
-    if (chain_exec_) return true;
+// Issue #16: the round of T rows and its whole chain in one graph, so a round is one launch even when its first
+// draft already stops the chain.  After the round's work, a WHILE node runs the step while the last draft is likely
+// enough (the test the host made between the per-step graphs, now made by mtp_chain_init / mtp_chain_next on the
+// device); every step uses step row max_t, into which mtp_chain_stage copies the record the host staged for step j
+// in row max_t + j - 1.
+bool MtpDrafter::capture_chain(int T, std::string& err) {
+    if (chain_exec_[T]) return true;
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd, NH = g_->n_head;
     const int row = max_t_;
     std::string ferr;
     auto head = [&](unsigned long long h) {
+        if (!record_round(T, ferr)) return false;
         mtp_chain_init(chain_ctl_, probs_, row_ + 1, m_chain_, m_chain_ + 2, h, cs_);
         return true;
     };
@@ -540,7 +550,7 @@ bool MtpDrafter::capture_chain(std::string& err) {
         if (!ferr.empty()) err += " (" + ferr + ")";
         return false;
     }
-    chain_exec_ = (cudaGraphExec_t) exec;
+    chain_exec_[T] = (cudaGraphExec_t) exec;
     return true;
 }
 
@@ -586,22 +596,29 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
 bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                        float* probs, float min_p, int* n_drafts) {
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
-    if (!capture_round(T, err)) return false;
     const int limit = std::min(max_t_ - 1, max_drafts_);
     static const bool old_chain = [] {
         const char* v = std::getenv("STRATA_OLD_MTP_CHAIN");
         return v != nullptr && v[0] != '\0' && v[0] != '0';
     }();
+    // STRATA_MTP_CHAIN_CHECK=N: the first N rounds run the one-graph chain, then the per-step path on the same
+    // staging, compare the two bit for bit (stderr) and keep the per-step result (a debug switch: twice the work)
+    static const int64_t check_rounds = [] {
+        const char* v = std::getenv("STRATA_MTP_CHAIN_CHECK");
+        return v != nullptr ? std::max<int64_t>(0, std::atoll(v)) : (int64_t) 0;
+    }();
     bool chain = !old_chain && !chain_off_ && limit > 1;
-    if (chain && !chain_exec_) {
+    if (chain && !chain_exec_[T]) {
         std::string ce;
-        if (!capture_chain(ce)) {
+        if (!capture_chain(T, ce)) {
             chain_off_ = true;
             chain = false;
             std::fprintf(stderr, "strata mtp: the one-graph draft chain is unavailable (%s); one graph per step\n",
                          ce.c_str());
         }
     }
+    const bool check = chain && chain_checks_ < check_rounds;
+    if ((!chain || check) && !capture_round(T, err)) return false;
     const Clock::time_point t0 = Clock::now();
     const int64_t NH = g_->n_head;
     auto put = [&](int row, int64_t cell) {
@@ -630,36 +647,75 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
-    if (cudaGraphLaunch(round_exec_[T], cs_) != cudaSuccess ||
-        (chain && cudaGraphLaunch(chain_exec_, cs_) != cudaSuccess) || cudaStreamSynchronize(cs_) != cudaSuccess) {
-        err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
-        return false;
-    }
-    drafts[0] = ((volatile int32_t*) h_out_)[0];
-    float pj = ((volatile float*) h_prob_)[0];
-    if (probs) probs[0] = pj;
     int n = 1;
-    if (chain) {
-        n = ((volatile int32_t*) h_chain_)[2];
-        if (n < 1 || n > limit) { err = "mtp draft: the chain graph returned an impossible draft count"; return false; }
-        for (int j = 1; j < n; ++j) {
-            drafts[j] = ((volatile int32_t*) h_out_)[j];
-            if (probs) probs[j] = ((volatile float*) h_prob_)[j];
-        }
-    }
-    // the chain continues while the last draft is likely enough to be verified
-    for (int j = 1; !chain && j < limit && pj >= min_p; ++j) {
-        if (!capture_step(j, err)) return false;
-        put(max_t_ + j - 1, p + a + j);
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (cudaGraphLaunch(step_exec_[j], cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) {
-            err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
+    float chain_p[strata::kernels::kVerifyMaxT] = {};
+    if (chain) {   // issue #16: the round and every step it drafts, one launch and one synchronization
+        if (cudaGraphLaunch(chain_exec_[T], cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) {
+            err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }
-        drafts[j] = ((volatile int32_t*) h_out_)[j];
-        pj = ((volatile float*) h_prob_)[j];
-        if (probs) probs[j] = pj;
-        ++n;
+        n = ((volatile int32_t*) h_chain_)[2];
+        if (n < 1 || n > limit) { err = "mtp draft: the chain graph returned an impossible draft count"; return false; }
+        for (int j = 0; j < n; ++j) {
+            drafts[j] = ((volatile int32_t*) h_out_)[j];
+            chain_p[j] = ((volatile float*) h_prob_)[j];
+            if (probs) probs[j] = chain_p[j];
+        }
+    }
+    if (!chain || check) {   // the round's graph, then one graph and one synchronization per step
+        int32_t ref_d[strata::kernels::kVerifyMaxT] = {};
+        float ref_p[strata::kernels::kVerifyMaxT] = {};
+        int32_t* const d = chain ? ref_d : drafts;
+        float* const dp = chain ? ref_p : probs;
+        if (cudaGraphLaunch(round_exec_[T], cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) {
+            err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+        d[0] = ((volatile int32_t*) h_out_)[0];
+        float pj = ((volatile float*) h_prob_)[0];
+        if (dp) dp[0] = pj;
+        int m = 1;
+        // the chain continues while the last draft is likely enough to be verified
+        for (int j = 1; j < limit && pj >= min_p; ++j) {
+            if (!capture_step(j, err)) return false;
+            put(max_t_ + j - 1, p + a + j);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            if (cudaGraphLaunch(step_exec_[j], cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) {
+                err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            d[j] = ((volatile int32_t*) h_out_)[j];
+            pj = ((volatile float*) h_prob_)[j];
+            if (dp) dp[j] = pj;
+            ++m;
+        }
+        if (chain) {   // STRATA_MTP_CHAIN_CHECK: the chain's count, drafts and probabilities against these
+            bool same = m == n;
+            for (int j = 0; same && j < n; ++j)
+                same = ref_d[j] == drafts[j] && std::memcmp(&ref_p[j], &chain_p[j], sizeof(float)) == 0;
+            ++chain_checks_;
+            if (!same) {
+                ++chain_diffs_;
+                std::string line;
+                char buf[96];
+                for (int j = 0; j < std::max(n, m); ++j) {
+                    std::snprintf(buf, sizeof buf, " [%d] %d/%d %.9g/%.9g", j, j < n ? (int) drafts[j] : -1,
+                                  j < m ? (int) ref_d[j] : -1, j < n ? (double) chain_p[j] : -1.0,
+                                  j < m ? (double) ref_p[j] : -1.0);
+                    line += buf;
+                }
+                std::fprintf(stderr, "strata mtp: chain check, round %lld DIFFERS (chain/step: %d/%d drafts):%s\n",
+                             (long long) chain_checks_, n, m, line.c_str());
+            }
+            if (chain_checks_ == check_rounds)
+                std::fprintf(stderr, "strata mtp: chain check: %lld rounds compared, %lld differ\n",
+                             (long long) chain_checks_, (long long) chain_diffs_);
+            for (int j = 0; j < m; ++j) {   // the per-step result: a difference must not change the run
+                drafts[j] = ref_d[j];
+                if (probs) probs[j] = ref_p[j];
+            }
+        }
+        n = m;
     }
     for (int j = n; j < max_t_ - 1; ++j) { drafts[j] = 0; if (probs) probs[j] = 0.0f; }
     if (n_drafts) *n_drafts = n;
