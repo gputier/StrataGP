@@ -10,11 +10,13 @@
 #include "strata/ngram/ple_reader.hpp"
 #include "strata/platform/direct_file.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <random>
 #include <sstream>
 #include <string>
@@ -145,10 +147,21 @@ void check_batches(const std::string& dir, const char* backend) {
     std::filesystem::remove(path);
 }
 
-int selftest(const std::string& dir) {
+int selftest(const std::string& base) {
+    // A directory of its own: several build trees may run this test at once against the same temp directory, and
+    // a table rewritten under a running reader fails its reads.
+    const unsigned long long tag = (unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count() ^
+                                   (unsigned long long) std::random_device{}();
+    const std::string dir = base + "/ple_reader_selftest." + std::to_string(tag);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
     const uint32_t N = 500000;                          // 45 MB: large enough for thousands of distinct pages
     const std::string path = dir + "/ple_reader_selftest.bin";
-    if (!make_table(path, N)) { std::fprintf(stderr, "cannot write %s\n", path.c_str()); return 2; }
+    if (!make_table(path, N)) {
+        std::fprintf(stderr, "cannot write %s\n", path.c_str());
+        std::filesystem::remove_all(dir, ec);
+        return 2;
+    }
     std::mt19937 rng(7);
 #if !defined(_WIN32)
     // Issue #15: every Linux backend runs the whole check (uring falls back to threads where the kernel refuses it).
@@ -221,25 +234,65 @@ int selftest(const std::string& dir) {
             CHECK(rd.cache_size() <= rd.cache_capacity(), "row cache exceeded its bound");
         }
     }
-    // fault injection: a 3 ms delay must be observed, and must not change the bytes
+    // fault injection: a 100 ms delay must be observed, and must not change the bytes (that long because on an
+    // overloaded machine the thread that reaps a read can be descheduled for tens of ms, and then no completion is
+    // early enough to be held back)
     for (bool thr : {false, true}) {
         ng::PleReader rd;
         std::string err;
         CHECK(rd.open(path, HEADER, N, 16, 0, err, thr), "open: %s", err.c_str());
-        rd.set_injected_delay_us(3000);
+        rd.set_injected_delay_us(100000);
         std::vector<uint32_t> rows(16);
         for (auto& r : rows) r = rng() % N;
         const double t0 = now_us();
         check_rows(rd, rows, N, "delayed");
-        CHECK(now_us() - t0 >= 3000, "injected delay not observed (%.0f us)", now_us() - t0);
+        CHECK(now_us() - t0 >= 100000, "injected delay not observed (%.0f us)", now_us() - t0);
         CHECK(rd.stats().late_injected > 0, "no read was held back");
     }
+    // fault injection over more pages than slots: the slot of every held completion is reused (4 slots read 32
+    // distinct pages, 8 in turn each, each no earlier than 1 ms after its issue), and the bytes are unchanged
+    for (bool thr : {false, true}) {
+        ng::PleReader rd;
+        std::string err;
+        CHECK(rd.open(path, HEADER, N, 4, 0, err, thr), "open: %s", err.c_str());
+        rd.set_injected_delay_us(1000);
+        std::vector<uint32_t> rows(32);
+        for (size_t i = 0; i < rows.size(); ++i) rows[i] = (uint32_t) (i * 1000 + 7);   // 90 KB apart
+        const double t0 = now_us();
+        check_rows(rd, rows, N, "delayed, 8 pages per slot");
+        CHECK(now_us() - t0 >= 8000, "4 slots read 32 delayed pages in %.0f us (< 8 x 1 ms)", now_us() - t0);
+        CHECK(rd.stats().reads == 32, "%llu reads for 32 distinct pages", (unsigned long long) rd.stats().reads);
+    }
+#if !defined(_WIN32)
+    // a read error (the table shrank under the reader): the ticket fails, every slot drains, and close returns
+    for (bool thr : {false, true}) {
+        const std::string small = dir + "/ple_reader_selftest_short.bin";
+        const uint32_t M = 20000;
+        if (!make_table(small, M)) { CHECK(false, "cannot write %s", small.c_str()); break; }
+        ng::PleReader rd;
+        std::string err;
+        CHECK(rd.open(small, HEADER, M, 4, 0, err, thr), "open: %s", err.c_str());
+        std::filesystem::resize_file(small, HEADER, ec);
+        std::vector<uint32_t> rows(32);
+        for (size_t i = 0; i < rows.size(); ++i) rows[i] = (uint32_t) (i * 600 + 3);   // 32 distinct pages
+        std::vector<uint8_t> out(rows.size() * ng::ROW_BYTES);
+        const auto t = rd.issue(rows.data(), rows.size(), out.data());
+        CHECK(!ec && !rd.collect(t, err), "[%s] reads past the end of a truncated table succeeded",
+              thr ? "io thread" : "caller");
+        auto closed = std::async(std::launch::async, [&rd] { rd.close(); });
+        if (closed.wait_for(std::chrono::seconds(20)) != std::future_status::ready) {
+            std::fprintf(stderr, "FAIL: close() hangs after a read error (%s)\n", thr ? "io thread" : "caller");
+            std::_Exit(1);                             // the reader's threads cannot be joined
+        }
+        std::filesystem::remove(small, ec);
+    }
+#endif
     }
 #if !defined(_WIN32)
     if (prior != nullptr) setenv("STRATA_PLE_IO_BACKEND", keep.c_str(), 1);
     else unsetenv("STRATA_PLE_IO_BACKEND");
 #endif
-    std::filesystem::remove(path);
+    std::filesystem::remove_all(dir, ec);
     std::printf("ple_reader selftest: %s\n", g_fail ? "FAILED" : "OK");
     return g_fail ? 1 : 0;
 }
