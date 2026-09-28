@@ -122,8 +122,9 @@ int ragged_rows(const Case& cs, long long n_out) {
     int bad = 0;
     for (int kind = 0; kind < 2; ++kind) {           // 0: Q8_K activation, 1: Q8_0 activation
         std::vector<float> want((size_t) n_out);
-        for (long long o = 0; o < n_out; ++o) {
-            double acc = 0;
+        std::vector<double> mag((size_t) n_out);   // sum |w_i a_i| per row: a row whose sum cancels near 0
+        for (long long o = 0; o < n_out; ++o) {    // must not turn f32 rounding into a relative failure
+            double acc = 0, am = 0;
             for (long long i = 0; i < n_in; ++i) {
                 double a;
                 if (kind == 0) {
@@ -134,9 +135,12 @@ int ragged_rows(const Case& cs, long long n_out) {
                     std::memcpy(&dbits, blk, 2);
                     a = (double) strata::kernels::f32_from_f16(dbits) * (double) ((const int8_t*) (blk + 2))[i % 32];
                 }
-                acc += weight_at(codes, scales, offs, f, n_in, o, i) * a;
+                const double wa = weight_at(codes, scales, offs, f, n_in, o, i) * a;
+                acc += wa;
+                am += std::fabs(wa);
             }
             want[(size_t) o] = (float) acc;
+            mag[(size_t) o] = am;
         }
         // the guard band holds a NaN pattern; any write there shows up as a changed bit
         std::vector<uint32_t> sentinel((size_t) (n_out + guard), 0x7FC0DEADu);
@@ -154,7 +158,7 @@ int ragged_rows(const Case& cs, long long n_out) {
         for (long long o = 0; o < n_out; ++o) {
             float v;
             std::memcpy(&v, &got_bits[(size_t) o], 4);
-            m += std::fabs((double) want[(size_t) o]);
+            m += mag[(size_t) o];
             d += std::fabs((double) want[(size_t) o] - (double) v);
         }
         long long touched = 0;
