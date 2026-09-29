@@ -6,7 +6,8 @@
 `server-tools`, `prefill-kernels`, `prefill-host`, `prefill-dense`, `correctness`, `research`. Chaque lot a son
 document dans [`docs/perf/`](perf/). Le moteur amont 0.1.21 (Niko1221/Strata, c1e9033..f1b1d96 : un modèle
 réparti sur deux ou trois GPU, [`docs/MULTI_GPU.md`](MULTI_GPU.md)) a ensuite été fusionné dans `perf/all` ; la
-section 5 dit ce que devient chaque lot dans ce mode.
+section 5 dit ce que devient chaque lot dans ce mode. `perf/all` a ensuite été fusionné dans `main` (avance
+rapide) : c'est ce que télécharge le lien du README.
 
 
 | Lot | Document | Issues |
@@ -389,28 +390,29 @@ K1[,K2]|auto` (et `--split-device`), seulement avec `--serve` ; `--layer-split K
 deux étages sur la même carte en partageant tout (le contrôle au bit près de la passation, pas un mode de vitesse).
 
 **Sur un seul GPU (le défaut), rien ne change** : un seul étage `[0, 48)`, sans passation, et chaque lot se comporte
-exactement comme décrit plus haut. En mode réparti, chaque lot **fonctionne par étage** ; aucun n'est désactivé
-par la fusion. Ce que l'amont désactive lui-même sur plusieurs GPU reste désactivé (images, vecteurs de contrôle,
+exactement comme décrit plus haut. En mode réparti, chaque lot est **conçu pour fonctionner par étage** ; aucun
+n'est désactivé par la fusion. Le tableau décrit la conception et la lecture du code, **pas des mesures** : rien n'a
+encore tourné sur un GPU (voir les limites plus bas). Ce que l'amont désactive lui-même sur plusieurs GPU reste désactivé (images, vecteurs de contrôle,
 streaming KV, `--expert-cache-remote`, `--mmap-experts`, prêt d'emplacements au prompt, points de reprise au milieu
 du prompt).
 
-| Lot | Sur plusieurs GPU | Détail |
+| Lot | Sur plusieurs GPU (attendu, non exécuté) | Détail |
 |---|---|---|
-| `ple-io` (#15) | fonctionne | Seul l'étage qui porte la couche 1 (CUDA0 : les points de coupure valent 2 ou plus) démarre les lectures n-gram, lève `P` et l'attend dans son graphe. **Corrigé à la fusion** : les autres étages ne récupèrent plus un lot qu'ils n'ont pas lancé (`ple_stage()`). Un étage qui commencerait à la couche 1 lirait avant le lancement (ancien chemin). |
-| `round-sync` (#16) | fonctionne | `commit` asynchrone par étage (son flux, son événement, même `wait`) ; `sync_commit()` attend tous les étages ; le tour MTP attend l'événement du dernier étage (même GPU que le drafter). Chaîne MTP en un graphe : sur le GPU du dernier étage. `ResidencyUpload` : un par GPU, derrière les échanges de l'étage sur son flux ; la fin de requête attend tous. `AdaptWorker` inchangé (chaque échange va dans le cache de l'étage de sa couche). Drapeau B par écriture de flux : par vérificateur, sur son flux de copie. |
-| `grouped-experts` (#17), `iq-kernels` (#4, #18) | fonctionne | Kernels sans état par GPU ; chaque étage les lance sur ses propres experts. |
-| `window-batching` (#19, #44) | fonctionne | Les lots et la combinaison en place couvrent les couches de l'étage ; l'écriture en attente (`bo`, `inject`) de la dernière couche d'un étage est ce que la passation transporte, comme sans les lots. |
-| `qsa-small` (#24, #25, #47) | fonctionne | Pas et positions QSA préparés par chaque étage ; la règle de la table RoPE (#47) s'applique à chaque session. |
-| `sampler` (#20) | fonctionne | Tampons déjà rangés par (GPU, flux) ; l'échantillonnage tourne sur le dernier étage. |
-| `qsa-longctx` (#12, #21 à #23) | fonctionne | `--idx-fp16` est un réglage du processus fixé avant la création des sessions : chaque étage a son ombre FP16. |
-| `grids` (#26) | fonctionne | **Corrigé à la fusion** : le nombre de SM et l'accès aux clusters étaient lus une fois par processus. Ils le sont maintenant une fois par GPU (`PerDevice<T>`, `launch_grid.hpp`), de même que la disponibilité des kernels GDN en cluster : une RTX 3090 (sm_86) à côté d'une RTX 5080 garde l'ancien pas GDN au lieu de recevoir un kernel en cluster qu'elle ne peut pas lancer. |
-| `cpu` (#11, #27 à #30) | fonctionne | Un seul pool CPU sert tous les étages (le `SplitDrive` de l'amont choisit le plan et le cache de l'étage pour chaque couche). |
-| `server-tools` (#31 à #35, #49, #50, #52) | fonctionne | `server.py` garde les deux : `gpu_list()`/`engine_args()` de l'amont et `recall_reasoning`. **Corrigé à la fusion** : `calibrate.py` lance maintenant le moteur comme le serveur (`engine_args`), donc une configuration à plusieurs GPU est mesurée répartie (auparavant sur sa première carte seule). `ab_oneshot.py` lance le moteur sans `--serve`, donc sur un seul GPU. |
-| `prefill-kernels` (#6, #7, #37, #38, #43) | fonctionne | **Corrigé à la fusion** : le drapeau `STRATA_PREFILL_F16_SAT` est un `__constant__`, écrit maintenant une fois par GPU. La norme GR portée par la dernière écriture (#43) s'arrête à la fin de l'étage. |
-| `prefill-host` (#36, #40, #42, #45, #46, #48) | fonctionne ; #42 sans objet | Marche groupée et indexeur par morceau sur les couches de l'étage ; points de reprise épinglés par un pool par étage (flux sur le GPU de l'étage) ; #42 ne s'applique pas (pas de prêt d'emplacements sur plusieurs GPU) ; #48 ne concerne que le cache de CUDA0. |
-| `prefill-dense` (#39, #41) | fonctionne | Le contexte MMQ de chaque chemin de prompt est créé sur son GPU. |
-| `correctness` (#2, #3, #5, #8 à #10, #13) | fonctionne | Réglages du processus ; aucun état par GPU. |
-| `research` (#51, #53) | fonctionne | `--gdn-state-bf16` est fixé avant la création des sessions (chaque étage a l'état BF16) ; `--dump-routing` passe par le `Drive` commun. |
+| `ple-io` (#15) | conçu pour | Seul l'étage qui porte la couche 1 (CUDA0 : les points de coupure valent 2 ou plus) démarre les lectures n-gram, lève `P` et l'attend dans son graphe. **Corrigé à la fusion** : les autres étages ne récupèrent plus un lot qu'ils n'ont pas lancé (`ple_stage()`). Un étage qui commencerait à la couche 1 lirait avant le lancement (ancien chemin). |
+| `round-sync` (#16) | conçu pour | `commit` asynchrone par étage (son flux, son événement, même `wait`) ; `sync_commit()` attend tous les étages ; le tour MTP attend l'événement du dernier étage (même GPU que le drafter). Chaîne MTP en un graphe : sur le GPU du dernier étage. `ResidencyUpload` : un par GPU, derrière les échanges de l'étage sur son flux ; la fin de requête attend tous. `AdaptWorker` inchangé (chaque échange va dans le cache de l'étage de sa couche). Drapeau B par écriture de flux : par vérificateur, sur son flux de copie. |
+| `grouped-experts` (#17), `iq-kernels` (#4, #18) | conçu pour | Kernels sans état par GPU ; chaque étage les lance sur ses propres experts. |
+| `window-batching` (#19, #44) | conçu pour | Les lots et la combinaison en place couvrent les couches de l'étage ; l'écriture en attente (`bo`, `inject`) de la dernière couche d'un étage est ce que la passation transporte, comme sans les lots. |
+| `qsa-small` (#24, #25, #47) | conçu pour | Pas et positions QSA préparés par chaque étage ; la règle de la table RoPE (#47) s'applique à chaque session. |
+| `sampler` (#20) | conçu pour | Tampons déjà rangés par (GPU, flux) ; l'échantillonnage tourne sur le dernier étage. |
+| `qsa-longctx` (#12, #21 à #23) | conçu pour | `--idx-fp16` est un réglage du processus fixé avant la création des sessions : chaque étage a son ombre FP16. |
+| `grids` (#26) | conçu pour | **Corrigé à la fusion** : le nombre de SM et l'accès aux clusters étaient lus une fois par processus. Ils le sont maintenant une fois par GPU (`PerDevice<T>`, `launch_grid.hpp`), de même que la disponibilité des kernels GDN en cluster : une RTX 3090 (sm_86) à côté d'une RTX 5080 garde l'ancien pas GDN au lieu de recevoir un kernel en cluster qu'elle ne peut pas lancer. |
+| `cpu` (#11, #27 à #30) | conçu pour | Un seul pool CPU sert tous les étages (le `SplitDrive` de l'amont choisit le plan et le cache de l'étage pour chaque couche). |
+| `server-tools` (#31 à #35, #49, #50, #52) | conçu pour | `server.py` garde les deux : `gpu_list()`/`engine_args()` de l'amont et `recall_reasoning`. **Corrigé à la fusion** : `calibrate.py` lance maintenant le moteur comme le serveur (`engine_args`), donc une configuration à plusieurs GPU est mesurée répartie (auparavant sur sa première carte seule). Sous la répartition, la part PCIe (`--pcie-frac`) **n'est pas mesurée** : une part passée par requête différente de celle du moteur est appliquée à tous les étages, alors que le moteur servi donne à chaque étage après CUDA0 la part sondée sur son propre lien ; aucune valeur mesurée par requête ne correspondrait donc à ce qui tourne. Seuls `--spec-min-p`, `--spec` (sur demande) et `--pool-workers` sont réglés, et `--pcie-frac` reste le choix du moteur (le rapport indique « not measured: layer split »). `ab_oneshot.py` lance le moteur sans `--serve`, donc sur un seul GPU. |
+| `prefill-kernels` (#6, #7, #37, #38, #43) | conçu pour | **Corrigé à la fusion** : le drapeau `STRATA_PREFILL_F16_SAT` est un `__constant__`, écrit maintenant une fois par GPU. La norme GR portée par la dernière écriture (#43) s'arrête à la fin de l'étage. |
+| `prefill-host` (#36, #40, #42, #45, #46, #48) | conçu pour ; #42 sans objet | Marche groupée et indexeur par morceau sur les couches de l'étage ; points de reprise épinglés par un pool par étage (flux sur le GPU de l'étage) ; #42 ne s'applique pas (pas de prêt d'emplacements sur plusieurs GPU) ; #48 ne concerne que le cache de CUDA0. |
+| `prefill-dense` (#39, #41) | conçu pour | Le contexte MMQ de chaque chemin de prompt est créé sur son GPU. |
+| `correctness` (#2, #3, #5, #8 à #10, #13) | conçu pour | Réglages du processus ; aucun état par GPU. |
+| `research` (#51, #53) | conçu pour | `--gdn-state-bf16` est fixé avant la création des sessions (chaque étage a l'état BF16) ; `--dump-routing` passe par le `Drive` commun. |
 
 Limites propres à cette combinaison, en plus de celles de l'amont :
 - `STRATA_STATE_HASH=1` ne hache que la session de CUDA0.

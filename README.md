@@ -15,11 +15,33 @@ of a word): faster than you can read.
 
 - **Free and open source.**
 
-> **Jump to:** [How fast?](#how-fast-is-it) · [Which model?](#which-model-should-i-pick) · [Install](#install) ·
-> [Using it](#using-it) · [Problems?](#something-went-wrong) · [How it works](#how-does-it-work) ·
-> [All the details](docs/DETAILS.md)
+> **Jump to:** [What StrataGP adds](#what-stratagp-adds) · [How fast?](#how-fast-is-it) ·
+> [Which model?](#which-model-should-i-pick) · [Install](#install) · [Using it](#using-it) ·
+> [Problems?](#something-went-wrong) · [How it works](#how-does-it-work) · [All the details](docs/DETAILS.md)
 
 ---
+
+## What StrataGP adds
+
+StrataGP is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata). It follows upstream (currently engine
+**0.1.21**, upstream commit `f1b1d96`, including its experimental layer split: one model across two or three GPUs,
+see [docs/MULTI_GPU.md](docs/MULTI_GPU.md)) and adds on top of it the results of a performance and precision audit
+of the engine:
+
+- **The audit**: [docs/AUDIT-PERF.md](docs/AUDIT-PERF.md) (decode, prompt reading, CPU experts, kernels).
+- **Sixteen packages of changes** that follow from it: `ple-io`, `round-sync`, `grouped-experts`, `iq-kernels`,
+  `window-batching`, `qsa-small`, `sampler`, `qsa-longctx`, `grids`, `cpu`, `server-tools`, `prefill-kernels`,
+  `prefill-host`, `prefill-dense`, `correctness` and `research`. What each one changes, what is on by default, the
+  switch to turn it back off (`STRATA_OLD_*`) and how to A/B it are in
+  [docs/PERF-CHANGES.md](docs/PERF-CHANGES.md), with one page per package in [docs/perf/](docs/perf/).
+- The rule they follow: a change that gives bit-identical results is **on by default** (with a switch back to the
+  old path); a change that alters the numbers is **off by default** (opt-in).
+
+**Not yet validated on a GPU.** All the GPU code builds (CUDA 13.0), and the CPU and Python tests pass, but none of
+these changes has run on a graphics card yet, on one GPU or on several. The layer split together with the sixteen
+packages is designed to work stage by stage ([docs/PERF-CHANGES.md, section 5](docs/PERF-CHANGES.md)) and is
+equally unmeasured. The speed figures below are upstream's measurements of the unchanged engine.
+
 
 ## How fast is it?
 
