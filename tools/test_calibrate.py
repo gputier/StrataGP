@@ -91,6 +91,28 @@ class Calibrate(unittest.TestCase):
         self.assertIsNone(CAL.arg_value(b, "--pool-workers"))
         self.assertEqual(b.count("--spec-min-p"), 1)
 
+    def test_layer_split_measures_no_pcie_share(self):
+        # 0.1.21 layer split: a per-request pcie_frac gives every GPU CUDA0's share while the served engine gives
+        # each later GPU its own probed share, so no share is measured nor written; the draft floor still is
+        tunes = []
+
+        class Recording(FakeEngine):
+            def generate(self, ids, max_new, sampling, cancel):
+                tunes.append(dict(sampling.get("strata_tune") or {}))
+                return super().generate(ids, max_new, sampling, cancel)
+
+        def speed(f, p, w):
+            return 50.0 + (10.0 if abs(f - 0.2) < 1e-6 else 0.0) + (5.0 if abs(p - 0.7) < 1e-6 else 0.0)
+        split = BASE + ["--layer-split", "auto"]
+        starts = []
+        res = CAL.measure(split, [[1, 2, 3]] * 3, lambda a: Recording(a, speed, 6, starts), say=lambda *_: None)
+        self.assertTrue(tunes)
+        self.assertFalse(any("pcie_frac" in t for t in tunes))
+        self.assertNotIn("--pcie-frac", res["settings"])
+        self.assertEqual(res["settings"].get("--spec-min-p"), "0.70")
+        self.assertEqual(res["report"]["pcie_sweep"], "not measured: layer split")
+        self.assertTrue(all(CAL.arg_value(a, "--pcie-frac") is None for a in starts))
+
     def test_worker_candidates(self):
         self.assertEqual(CAL.worker_candidates(6), [6, 4, 3])
         self.assertEqual(CAL.worker_candidates(23), [23, 15, 12])

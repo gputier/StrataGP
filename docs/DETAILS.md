@@ -213,7 +213,8 @@ With more than one model installed, it asks which one to start. `run-<model>.bat
 
 The defaults were measured on a Ryzen 5 7600 with an RTX 5070. Setup offers to measure them on your PC after an
 install; `START-HERE.bat --calibrate` (Linux: `./setup.sh --calibrate`) does it any time. It measures the output
-speed with each setting and keeps one only when it is more than 3% faster. The result is remembered per PC and model
+speed with each setting and keeps one only when it is more than 3% faster. With a model split across two or three
+GPUs (layer split), the PCIe share is not measured: the engine probes each card's own link and keeps that share. The result is remembered per PC and model
 (in the settings file next to the data folder's record), so updates keep it.
 
 ### Chat in the terminal (optional)

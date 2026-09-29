@@ -10,6 +10,8 @@ measured on (a Ryzen 5 7600 + RTX 5070 on PCIe 5):
                   efficiency cores can make the whole window wait for them.
 The first two are measured through one engine (per-request `strata_tune` keys); the worker count needs a restart
 per value.  Decode speed only: the prompt path streams every expert whatever these settings say.
+Under the layer split (a config naming several GPUs) the PCIe share is not measured: each GPU keeps the share its own
+link probed, which a per-request share would override on every GPU.
 
 On request (issue #50), also
   --spec          the verify window: the tokens one round checks (setup writes 4).  With most experts in VRAM (a
@@ -160,6 +162,7 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, specs=()) -
     report: dict = {}
     say("  Loading the model for the measurements ...")
     base_args = apply(base_args, {})                   # the product defaults: what the measurements must beat
+    split = arg_value(base_args, "--layer-split") is not None   # 0.1.21: one model across several GPUs
     eng = start_engine(base_args)
     try:
         info = dict(getattr(eng, "info", {}) or {})
@@ -168,16 +171,26 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, specs=()) -
         d_workers = int(info.get("pool_workers", 0)) or None
         s = Session(eng, ids_list)
         s.warm_up()
-        # 1. the PCIe share, at the default draft floor
+
+        def tune(f, p):
+            # under the layer split, a request's pcie_frac other than the engine's own gives every GPU CUDA0's
+            # share, while the served engine gives each later GPU the share its own link probed: no per-request
+            # share measures the setup that runs, so the split sends none and keeps the engine's
+            return {"spec_min_p": p} if split else {"pcie_frac": f, "spec_min_p": p}
+
+        # 1. the PCIe share, at the default draft floor (not under the layer split, see tune())
         by_pcie = {}
-        for f in sorted(set(PCIE_FRACS) | {round(d_pcie, 2)}):
-            by_pcie[f] = [s.rate({"pcie_frac": f, "spec_min_p": d_minp})]
-            say(f"    PCIe share {f:.2f}: {by_pcie[f][0]:.1f} tok/s")
-        best_pcie = max(by_pcie, key=lambda k: by_pcie[k][0])
+        if split:
+            say("    PCIe share: not measured under the layer split (each GPU keeps its probed share)")
+        else:
+            for f in sorted(set(PCIE_FRACS) | {round(d_pcie, 2)}):
+                by_pcie[f] = [s.rate(tune(f, d_minp))]
+                say(f"    PCIe share {f:.2f}: {by_pcie[f][0]:.1f} tok/s")
+        best_pcie = max(by_pcie, key=lambda k: by_pcie[k][0]) if by_pcie else round(d_pcie, 2)
         # 2. the draft floor, at that share
         by_minp = {}
         for p in sorted(set(SPEC_MIN_PS) | {round(d_minp, 2)}):
-            by_minp[p] = [s.rate({"pcie_frac": best_pcie, "spec_min_p": p})]
+            by_minp[p] = [s.rate(tune(best_pcie, p))]
             say(f"    draft floor {p:.2f}: {by_minp[p][0]:.1f} tok/s")
         best_minp = max(by_minp, key=lambda k: by_minp[k][0])
         # 3. the winner against the default, interleaved, three times each
@@ -186,20 +199,24 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, specs=()) -
         if cand != dflt:
             for _ in range(3):
                 for k in (dflt, cand):
-                    confirm[k].append(s.rate({"pcie_frac": k[0], "spec_min_p": k[1]}))
+                    confirm[k].append(s.rate(tune(k[0], k[1])))
         chosen = pick(confirm, dflt) if cand != dflt else dflt
         report.update(default={"pcie_frac": dflt[0], "spec_min_p": dflt[1], "pool_workers": d_workers},
-                      pcie_sweep={str(k): v for k, v in by_pcie.items()},
+                      pcie_sweep=({str(k): v for k, v in by_pcie.items()} if not split
+                                  else "not measured: layer split"),
                       min_p_sweep={str(k): v for k, v in by_minp.items()},
                       confirm={f"{k[0]}/{k[1]}": v for k, v in confirm.items()})
     finally:
         close(eng)
     settings = {}
     if chosen != dflt:
-        settings["--pcie-frac"] = f"{chosen[0]:.2f}"
+        if not split:
+            settings["--pcie-frac"] = f"{chosen[0]:.2f}"
         settings["--spec-min-p"] = f"{chosen[1]:.2f}"
     base_rate = statistics.median(confirm[chosen]) if confirm.get(chosen) else None
-    tuned = with_arg(with_arg(base_args, "--pcie-frac", f"{chosen[0]:.2f}"), "--spec-min-p", f"{chosen[1]:.2f}")
+    # a --pcie-frac on the command line would also stop the later GPUs of a split from probing their own share
+    tuned = with_arg(with_arg(base_args, "--pcie-frac", None if split else f"{chosen[0]:.2f}"),
+                     "--spec-min-p", f"{chosen[1]:.2f}")
     # 4. on request, the verify window (a restart each, SPEC_RUNS runs of the prompts), with the chosen settings;
     #    every window, the default included, in a fresh engine, so they start from the same expert cache
     d_spec = arg_value(base_args, "--spec")
