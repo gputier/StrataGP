@@ -62,16 +62,15 @@ both. A change that **alters the numbers**, even slightly (lower precision, anot
 and has to be turned on (`--idx-fp16`, `--prefill-dense-mmq`, `--gdn-state-bf16` and a few variables). All the
 switches are listed in [docs/DETAILS.md](docs/DETAILS.md#engine-switches-stratagp).
 
-**First GPU run: one RTX 5090, Windows, 29 September 2026.** The changes were written on a machine without a
-graphics card; they have now run on one RTX 5090 (Ryzen 9 9950X3D, 128 GB, IQ3_S, 262K context, greedy, 256 tokens,
-upstream `f1b1d96` built with the same compiler as the reference). Several GPUs have still not been tried. Measured,
-mean of 3 runs:
+The changes were written on a machine without a graphics card. On 29 September 2026 they ran for the first time,
+on one RTX 5090 under Windows (Ryzen 9 9950X3D, 128 GB, IQ3_S, 262K context, greedy, 256 tokens), against upstream
+`f1b1d96` built with the same compiler. Nobody has tried several GPUs yet. Mean of 3 runs:
 
 | What | Upstream | StrataGP | Gain |
 | --- | ---: | ---: | ---: |
-| Writing answers (3 prompts: 32, 2.5K, 23K tokens) | 115 / 132 / 140 tok/s | 122 / 151 / 155 tok/s | **+5% to +15%** |
-| Reading your prompt, 2.5K tokens | 1,397 tok/s | 1,982 tok/s | **+42%** |
-| Reading your prompt, 23K tokens | 2,074 tok/s | 3,090 tok/s | **+49%** |
+| Writing answers (3 prompts: 32, 2.5K, 23K tokens) | 115 / 132 / 140 tok/s | 122 / 151 / 155 tok/s | +5% to +15% |
+| Reading your prompt, 2.5K tokens | 1,397 tok/s | 1,982 tok/s | +42% |
+| Reading your prompt, 23K tokens | 2,074 tok/s | 3,090 tok/s | +49% |
 
 The audit had estimated +20-40% for writing and +10-20% for reading; it is the other way round. The CPU kernel
 numbers (+25% to +88% for Q2_0, +14% to +137% for IQ2/IQ3) were measured on an Intel VM, for the kernel alone.
@@ -81,8 +80,8 @@ tokens; the third diverges at its 229th token, with or without the `STRATA_OLD_*
 fixed a crash of the prompt path when it has its own buffers (the multi-GPU case). Details and what is left:
 [docs/PERF-CHANGES.md, section 6](docs/PERF-CHANGES.md#6-première-exécution-sur-gpu-rtx-5090-29092026).
 
-**The ready-made engine is upstream's.** `START-HERE.bat` downloads Niko1221's release build, which has none of
-these changes; only the server and tools of StrataGP apply. To run StrataGP's engine, compile it:
+`START-HERE.bat` downloads Niko1221's ready-made engine, which has none of these changes: out of the box you get
+StrataGP's server and tools on upstream's engine. To run StrataGP's engine, compile it with
 `START-HERE.bat --setup --build`.
 
 

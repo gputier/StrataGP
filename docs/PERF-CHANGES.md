@@ -29,9 +29,8 @@ rapide) : c'est ce que télécharge le lien du README.
 | `correctness` | [perf/correctness.md](perf/correctness.md) | #2, #3, #5, #8, #9, #10, #13 |
 | `research` | [perf/research.md](perf/research.md) | #51, #53 |
 
-**Première exécution sur GPU le 29/09/2026**, sur une seule RTX 5090 sous Windows : résultats, correctifs et reste
-à faire en [section 6](#6-première-exécution-sur-gpu-rtx-5090-29092026). Le code a été écrit sur une machine sans
-GPU. Règle suivie par tous les lots : ce qui est identique au bit près par construction est **actif par défaut**
+Le code a été écrit sur une machine sans GPU. Il a tourné pour la première fois le 29/09/2026, sur une seule RTX
+5090 sous Windows : mesures, correctifs et suivi en [section 6](#6-première-exécution-sur-gpu-rtx-5090-29092026). Règle suivie par tous les lots : ce qui est identique au bit près par construction est **actif par défaut**
 avec une variable `STRATA_OLD_*` (ou équivalente) pour l'A/B ; ce qui change des valeurs est **désactivé par
 défaut** (opt-in). Plusieurs GPU n'ont pas encore été essayés.
 
@@ -469,8 +468,9 @@ StrataGP avec toutes les variables `OLD` de 3.4 retombe sur les vitesses de l'am
 
 En `--expert-cache auto`, aucune variante ne sort les tokens de l'amont : la taille du cache suit la VRAM libre, qui
 diffère (12 138 emplacements pour l'amont, 12 163 pour StrataGP, 12 129 avec les variables `OLD`), ce qui change la
-part des experts calculée sur le processeur. Avec un pack natif et un profil, `--expert-cache N` n'est qu'un plafond borné par la VRAM
-libre ; `--expert-cache 8000 --prefill 2048` donne le même cache partout (10 452 emplacements). Dans ce cas :
+part des experts calculée sur le processeur. Avec un pack natif et un profil, `--expert-cache N` n'est qu'un
+plafond borné par la VRAM libre ; `--expert-cache 8000 --prefill 2048` donne le même cache partout (10 452
+emplacements). Dans ce cas :
 - 32 et 23 019 tokens : les 256 tokens sont identiques à l'amont, défauts actifs comme variables `OLD` ;
 - 2 520 tokens : StrataGP diverge au 229e token, avec et sans les variables `OLD` (les deux sorties sont identiques
   entre elles). Un changement que les interrupteurs ne couvrent pas modifie donc un calcul. Non localisé : un pack
