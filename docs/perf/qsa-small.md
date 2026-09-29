@@ -1,5 +1,8 @@
 # qsa-small : moins de lancements dans la couche QSA, pas de table RoPE inutile (issues #24, #25, #47)
 
+*29/09/2026 : ce document a été écrit sur une machine sans GPU ; la première exécution sur une RTX 5090 est dans
+[PERF-CHANGES.md, section 6](../PERF-CHANGES.md#6-première-exécution-sur-gpu-rtx-5090-29092026).*
+
 Branche `perf/qsa-small`, partie de `perf/base` (b858f9b, moteur 0.1.20). **Aucun chiffre GPU n'a été mesuré** :
 la machine de développement n'a pas de GPU. Tout a été compilé (CUDA 13.0, sm_120) et les tests CPU ont été lancés
 (ils passent, sauf `pool_test` qui exige un pack de modèle, comme sur `perf/base`) ; le nouveau test GPU

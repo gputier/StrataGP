@@ -1,5 +1,8 @@
 # Paquet `server-tools` : serveur, tokeniseur et outils
 
+*29/09/2026 : ce document a été écrit sur une machine sans GPU ; la première exécution sur une RTX 5090 est dans
+[PERF-CHANGES.md, section 6](../PERF-CHANGES.md#6-première-exécution-sur-gpu-rtx-5090-29092026).*
+
 Branche `perf/server-tools`, partie de `perf/base` (`b858f9b`, moteur 0.1.20). Issues traitées : #31, #32, #33, #34,
 #35 (serveur, section O9 de l'audit), #49 (E6, `make_profile.py`), #50 (S1, `--spec` dans `calibrate.py`), #52 (S4,
 quantification du brouillon MTP).

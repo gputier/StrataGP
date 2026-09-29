@@ -1,5 +1,8 @@
 # prefill-dense : projections denses du prefill en MMQ int8 (#39, P4) et part de l'attention QSA (#41, P6)
 
+*29/09/2026 : ce document a été écrit sur une machine sans GPU ; la première exécution sur une RTX 5090 est dans
+[PERF-CHANGES.md, section 6](../PERF-CHANGES.md#6-première-exécution-sur-gpu-rtx-5090-29092026).*
+
 Branche `perf/prefill-dense`, partie de `perf/base` (b858f9b, moteur 0.1.20). La machine de développement n'a pas
 de GPU : aucune mesure GPU n'a été faite. Tout ce qui touche au GPU a été compilé (sm_120, CUDA 13.0), rien n'a été
 exécuté. Les gains sont **ESTIMÉ** (calcul) ou **HYPOTHÈSE** (à confirmer au profileur).

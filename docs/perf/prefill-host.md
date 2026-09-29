@@ -1,5 +1,9 @@
 # prefill-host : MoE du prefill, indexeur, re-remplissage, points de reprise, chercheur de suffixe, démarrage
 
+*29/09/2026 : ce document a été écrit sur une machine sans GPU ; la première exécution sur une RTX 5090, et le
+défaut des copies 2D de la marche groupée (#36) qu'elle a trouvé, sont dans
+[PERF-CHANGES.md, section 6](../PERF-CHANGES.md#6-première-exécution-sur-gpu-rtx-5090-29092026).*
+
 Issues #36 (P1), #40 (P5), #42 (P7), #45 (E2), #46 (E3), #48 (E5) de l'audit (`docs/AUDIT-PERF.md`).
 
 Branche `perf/prefill-host`, partie de `perf/base` (b858f9b, moteur 0.1.20). **Aucune mesure GPU n'a été faite** : la

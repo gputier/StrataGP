@@ -1,5 +1,8 @@
 # Experts VRAM au format Q2_0 : kernels groupés et par hit (O3, #17)
 
+*29/09/2026 : ce document a été écrit sur une machine sans GPU ; la première exécution sur une RTX 5090 est dans
+[PERF-CHANGES.md, section 6](../PERF-CHANGES.md#6-première-exécution-sur-gpu-rtx-5090-29092026).*
+
 Branche `perf/grouped-experts`, partie de `perf/base` (moteur 0.1.20). Fichiers modifiés :
 `src/kernels/cuda/s2_expert_grouped.cu`, `include/strata/kernels/s2_expert_grouped.hpp`, et un test,
 `src/kernels/s2_expert_grouped_parity.cpp` (enregistré dans `CMakeLists.txt`).

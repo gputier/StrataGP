@@ -1,5 +1,8 @@
 # ple-io : lectures n-gram (PLE) hors du chemin critique (#15, O1 de l'audit)
 
+*29/09/2026 : ce document a été écrit sur une machine sans GPU ; la première exécution sur une RTX 5090 est dans
+[PERF-CHANGES.md, section 6](../PERF-CHANGES.md#6-première-exécution-sur-gpu-rtx-5090-29092026).*
+
 Branche `perf/ple-io`, partie de `perf/base` (b858f9b, moteur 0.1.20). Aucune mesure GPU n'a été faite : la
 machine de développement n'a pas de GPU. Tout ce qui touche au GPU a été compilé (sm_120, CUDA 13.0) mais pas
 exécuté. Les chiffres de gain sont **ESTIMÉ** (calcul de l'audit) ou **HYPOTHÈSE** (à confirmer au profileur).

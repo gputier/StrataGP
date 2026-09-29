@@ -1,5 +1,8 @@
 # grids : grilles de décodage dimensionnées sur le GPU, plus sur 48 SM (issue #26, O7)
 
+*29/09/2026 : ce document a été écrit sur une machine sans GPU ; la première exécution sur une RTX 5090 est dans
+[PERF-CHANGES.md, section 6](../PERF-CHANGES.md#6-première-exécution-sur-gpu-rtx-5090-29092026).*
+
 Branche `perf/grids`, partie de `perf/base` (b858f9b, moteur 0.1.20). Aucun chiffre GPU n'a été mesuré : la
 machine de développement n'a pas de GPU. Tout a été compilé (CUDA 13.0, sm_120 ; les deux fichiers de kernels aussi
 pour sm_86, pour vérifier la garde des clusters) et les tests CPU ont été lancés ; `grids_parity` compile mais reste

@@ -1,5 +1,8 @@
 # Paquet `cpu` : les experts calculés sur le CPU
 
+*29/09/2026 : ce document a été écrit sur une machine sans GPU ; la première exécution sur une RTX 5090 est dans
+[PERF-CHANGES.md, section 6](../PERF-CHANGES.md#6-première-exécution-sur-gpu-rtx-5090-29092026).*
+
 *Branche `perf/cpu`, partie de `perf/base` (`b858f9b`, moteur 0.1.20). Issues #27 (O8), #28 (O8b), #29 (O8c),
 #30 (O8d) et #11 (B13). Contexte : [`docs/AUDIT-PERF.md`](../AUDIT-PERF.md), section 3 (O8) et section 5 (B11).*
 

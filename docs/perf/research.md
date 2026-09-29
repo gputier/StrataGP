@@ -1,5 +1,8 @@
 # research : localité du routage (#51) et état GDN en BF16 (#53)
 
+*29/09/2026 : ce document a été écrit sur une machine sans GPU ; la première exécution sur une RTX 5090 est dans
+[PERF-CHANGES.md, section 6](../PERF-CHANGES.md#6-première-exécution-sur-gpu-rtx-5090-29092026).*
+
 Branche `perf/research`, partie de `perf/base` (b858f9b, moteur 0.1.20). Aucune mesure GPU n'a été faite : la
 machine de développement n'a pas de GPU. Tout a été compilé (CUDA 13.0, sm_120, aucun spill) ; les tests CPU ont été
 lancés, le nouveau test GPU `gdn_state_bf16_parity` compile et reste à lancer sur la RTX 5090. Étiquettes comme dans

@@ -1,5 +1,8 @@
 # Paquet `qsa-longctx` : indexeur QSA, top-k de blocs et attention au long contexte
 
+*29/09/2026 : ce document a été écrit sur une machine sans GPU ; la première exécution sur une RTX 5090 est dans
+[PERF-CHANGES.md, section 6](../PERF-CHANGES.md#6-première-exécution-sur-gpu-rtx-5090-29092026).*
+
 Branche `perf/qsa-longctx`, partie de `perf/base` (b858f9b, moteur 0.1.20). Issues traitées : **#21** (O6),
 **#22** (O6b), **#23** (O6c) et **#12** (B14).
 
