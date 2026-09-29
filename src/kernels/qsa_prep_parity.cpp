@@ -276,6 +276,9 @@ int main(int argc, char** argv) {
                             ck(cudaMemset(qb, 0, (size_t) n_tok * NH * HD * 4), "qb");
                             const k::KvHostPools host_a = streamed ? ha.host() : k::KvHostPools{};
                             const k::KvHostPools host_b = streamed ? hb.host() : k::KvHostPools{};
+                            // the poison, the copies and the memsets above run on the legacy stream, which the
+                            // non-blocking `cs` does not wait for
+                            ck(cudaDeviceSynchronize(), "setup");
 
                             // ---- the separate launches, token by token
                             auto norm_rope = [&](float* d, const float* g, int nrows, int ncols, const int32_t* p) {

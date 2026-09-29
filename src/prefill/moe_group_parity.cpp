@@ -87,6 +87,8 @@ void group_case(const char* name, int64_t tokens, double skew, bool bad_id, uint
     ck(cudaMemset(scratch, 0x5a, pf::moe_group_scratch_bytes(n, NE)), "junk");
     ck(cudaMemset(d_slot, 0x77, (size_t) n * 4), "junk");
     ck(cudaMemset(d_src, 0x77, (size_t) n * 4), "junk");
+    // cudaMemset runs on the legacy stream, which a non-blocking `cs` does not wait for
+    ck(cudaDeviceSynchronize(), "setup");
     pf::moe_group(d_ids, n, K, NE, d_slot, d_src, scratch, host_out, cs);
     ck(cudaStreamSynchronize(cs), "sync");
     bool ok = true;
@@ -128,6 +130,7 @@ void gather_case(const char* name, bool strata_q2, int n, size_t misalign, uint3
     uint8_t *d_a = dalloc<uint8_t>(d_bytes), *d_b = dalloc<uint8_t>(d_bytes);
     for (uint8_t* p : {gu_a, gu_b}) ck(cudaMemset(p, 0xa5, gu_bytes), "junk");
     for (uint8_t* p : {d_a, d_b}) ck(cudaMemset(p, 0xa5, d_bytes), "junk");
+    ck(cudaDeviceSynchronize(), "setup");   // the legacy-stream memsets before the non-blocking `cs`
     std::vector<int32_t> q(G);
     std::iota(q.begin(), q.end(), 0);
     std::shuffle(q.begin(), q.end(), rng);
