@@ -1,5 +1,6 @@
 // src/prefill/kernels.cu - see include/strata/prefill/kernels.hpp.
 #include "strata/prefill/kernels.hpp"
+#include "strata/kernels/launch_grid.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/router_top10.hpp"
@@ -72,14 +73,12 @@ bool use_old(KernelPath p, bool env_old) { return p == KernelPath::Old || (p == 
 // B7's flag: STRATA_PREFILL_F16_SAT=1 sets it once per device (__constant__ memory is per device, and a layer split
 // runs a prompt path on each of two or three cards), before the first launch there of a kernel that calls hf, with
 // a synchronous copy and a device synchronization, so every later launch sees it whatever its stream.
-// set_f16_saturate (the tests, one GPU) sets it the same way and wins over the variable.
-constexpr int kF16Devices = 64;
-std::once_flag g_f16_once[kF16Devices];
+// set_f16_saturate (the tests, one GPU) sets it the same way and wins over the variable.  Devices are indexed as the
+// grids' per-device answers are (strata::kernels::grid_device_index, launch_grid.hpp).
+std::once_flag g_f16_once[strata::kernels::kGridMaxDevices];
 std::atomic<bool> g_f16_forced{false};
 void f16_mode(void* /*stream*/) {
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= kF16Devices) dev = 0;
-    std::call_once(g_f16_once[dev], [] {
+    std::call_once(g_f16_once[strata::kernels::grid_device_index()], [] {
         const int on = 1;
         if (!g_f16_forced.load() && env_on("STRATA_PREFILL_F16_SAT")) {
             if (cudaMemcpyToSymbol(c_f16_sat, &on, sizeof on) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess)
