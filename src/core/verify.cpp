@@ -226,6 +226,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         const char* old = std::getenv("STRATA_OLD_PLE_STAGING");
         ple_late_ = old == nullptr || old[0] == '\0' || std::strcmp(old, "0") == 0;
     }
+    // Layer split: P is raised once the pool has served the stage's first layer, and the graph waits for it before
+    // layer 1.  That handshake needs layer 0 in the same stage as layer 1; a stage that would start at layer 1 (the
+    // engine never makes one: every split point is 2 or more) reads its rows before the launch instead.
+    if (lb_ != 0) ple_late_ = false;
     // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
     {
         const int64_t cap = (int64_t) (T * K);
@@ -903,7 +907,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                       : !ss.ple.table->gather_batch(rows, (size_t) T, h_ple_, err))
             return false;
     }
-    const bool ple_pending = ple_late_ && ss.ple.ready();
+    // issue #15 under a layer split: only the stage that runs layer 1 (the PLE block) issues the reads, raises P and
+    // has a graph that waits for it; a later stage neither reads rows nor waits
+    const bool ple_pending = ple_late_ && ss.ple.ready() && ple_stage();
     std::string ple_err;
     // A batch issued and not collected is collected on any early return, so the table takes the next window's.
     struct PleGuard {
