@@ -6,7 +6,7 @@ New here? Start with the [README](../README.md) - it has everything you need to 
 > **On this page:** [Speed](#speed-measured) · [Other GPUs](#other-gpus-estimated) · [Which model?](#which-model) ·
 > [Requirements](#before-you-start) · [Windows](#windows) · [Linux](#linux) · [API](#using-it) ·
 > [MCP tools](#tools-from-mcp-servers) · [Images](#images-vision) ·
-> [Troubleshooting](#troubleshooting) · [How it works](#how-it-works)
+> [Engine switches](#engine-switches-stratagp) · [Troubleshooting](#troubleshooting) · [How it works](#how-it-works)
 
 ---
 
@@ -200,6 +200,7 @@ START-HERE.bat --gguf-dir D:\models\IQ2_XS       use GGUF files you already have
 START-HERE.bat --data-dir E:\Strata-data         keep the model files somewhere else
 START-HERE.bat --port 8081                      another port
 START-HERE.bat --gpu 1                          another GPU (numbered as nvidia-smi; setup picks the one with the most VRAM)
+START-HERE.bat --setup --gpus 0,2                split the model across two or three GPUs (experimental, MULTI_GPU.md)
 START-HERE.bat --calibrate                      tune the engine for this PC (about 5-10 minutes), then start
 ```
 
@@ -488,6 +489,121 @@ model's.
 **Measured here** (Q2_0, fixed experts, 2,557 teacher-forced tokens of code, a document and a chat): the top-1 token
 changes at 10% of positions, mean KL from the stock model 0.063 nats (max 4.1), perplexity +15% on code, +2.3% on
 the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
+
+---
+
+## Engine switches (StrataGP)
+
+StrataGP's performance and precision changes ([README](../README.md#what-stratagp-adds),
+[PERF-CHANGES.md](PERF-CHANGES.md)) follow one rule: a change that gives bit-identical results is **on by default** and
+has a switch that brings back upstream's code; a change that alters the numbers is **off by default** (opt-in). None
+of them has run on a GPU yet: see the validation procedure in
+[PERF-CHANGES.md, section 3](PERF-CHANGES.md#3-validation-sur-la-rtx-5090) before trusting the defaults, and use the
+`STRATA_OLD_*` switches below if something misbehaves.
+
+**How to set them.** Engine flags go in the `"args"` list of `strata-<model>.json` (the engine's command line), then
+restart. Environment variables are passed on to the engine the server starts and are read once when it starts; `=1`
+(any non-empty value other than `0`) turns them on. Windows (`cmd`): `set STRATA_OLD_WINDOW=1`, then
+`START-HERE.bat` in the same window; Linux: `STRATA_OLD_WINDOW=1 ./setup.sh`. A CUDA graph that is already captured
+keeps its choice.
+
+### New flags
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `--idx-fp16` | off | Long context: the QSA indexer scores keys from an FP16 copy (half the reads; can change which blocks are picked). Same as `STRATA_IDX_FP16=1`; ignored with `--no-fast-select`. |
+| `--prefill-dense-mmq` | off | Prompt reading: the dense projections use int8 MMQ instead of FP16 cuBLAS (different rounding). Same as `STRATA_PREFILL_DENSE_MMQ=1`. |
+| `--gdn-state-bf16` | off | The GDN recurrent state is stored in BF16 instead of FP32 (half the traffic, FP32 accumulation; may drift on long texts). Needs the fused native GDN step. |
+| `--dump-routing FILE` | off | Writes the expert routing trace, now including the verify windows (accepted tokens only), for `tools/routing_locality.py` and `tools/make_profile.py`. |
+| `serve/server.py --recall-reasoning` | off | The server puts back the thinking a client did not send back, so the conversation cache can be reused. Also `"recall_reasoning": true` in `strata-<model>.json`, or `STRATA_RECALL_REASONING=1`. |
+| `chat.py --drop-thinking` | off | `chat.py` no longer sends the thinking back (its old behaviour; it now sends it back by default). |
+| `tools/calibrate.py --spec 4,5,6` | off | Calibration also measures the draft window size (`--spec`). Also `STRATA_CALIBRATE_SPEC=4,5,6`. |
+| `tools/make_profile.py --trace-weight W` | 0.5 | How much your routing traces count in the expert ranking; `0` gives the old output. |
+| `tools/mtp_pack.py --q2-search grid\|wide\|exact` | `grid` | Scale search when packing the MTP draft layer in Q2_0; `wide` and `exact` also try negative scales. |
+
+The layer split flags (`--layer-split K1[,K2]|auto`, `--split-device`, setup's `--gpus`) are upstream's and are
+described in [MULTI_GPU.md](MULTI_GPU.md). Every StrataGP change is designed to work card by card under the split,
+and the switches below apply to every card; what each package does there is in
+[PERF-CHANGES.md, section 5](PERF-CHANGES.md#5-répartition-des-couches-sur-plusieurs-gpu-moteur-0121) (not run on
+GPUs either). Under the split, `--calibrate` leaves the PCIe share to the engine's per-card probe
+([above](#windows)).
+
+### Back to upstream's code (the defaults are bit-identical)
+
+| Variable | Default | Effect when set | Package |
+| --- | --- | --- | --- |
+| `STRATA_OLD_PLE_STAGING=1` | unset | SSD lookup-table (PLE) rows read before the verify window starts, copied at the head of the graph | ple-io |
+| `STRATA_PLE_IO_BACKEND=uring\|threads\|sync` | `uring` (`threads` if the kernel refuses io_uring) | How PLE rows are read on Linux; `sync` = the old locked read | ple-io |
+| `STRATA_PLE_IO_THREADS=N` | `min(--ple-inflight, 16)` | Threads of the `threads` backend (1-64) | ple-io |
+| `STRATA_OLD_MTP_CHAIN=1` | unset | Draft chain step by step (one graph and one sync per step) instead of one `WHILE` graph | round-sync |
+| `STRATA_OLD_COMMIT_SYNC=1` | unset | The host waits for each `commit` | round-sync |
+| `STRATA_OLD_RES_UPLOAD=1` | unset | Residency table uploaded with a synchronous copy | round-sync |
+| `STRATA_OLD_ADAPT_THREAD=1` | unset | One new thread per adaptation round instead of a persistent one | round-sync |
+| `STRATA_OLD_DMA_FLAG=1` | unset | `--pcie-mode dma`: flag set by host functions | round-sync |
+| `STRATA_OLD_GROUPED=1` | unset | Old grouped and per-hit Q2_0 expert kernels | grouped-experts |
+| `STRATA_GROUPED_PAIR_MIN_HITS=N` | 0 | Keep the old per-hit kernels below N hits | grouped-experts |
+| `STRATA_OLD_IQ_MMVQ=1` | unset | Old IQ expert kernels (grids decoded again for each column) | iq-kernels |
+| `STRATA_OLD_WINDOW=1` | unset | The whole verify window as in 0.1.20 | window-batching |
+| `STRATA_OLD_WINDOW_ROUTE`, `_INDEXER`, `_QSA`, `_SHARED`, `_COMBINE` (`=1`) | unset | One part only: router, indexer projections, QSA q/gate, shared expert, MoE combine | window-batching |
+| `STRATA_OLD_TOKEN_COMBINE=1` | unset | One-token graph combines in three kernels | window-batching |
+| `STRATA_OLD_QSA_STEP=1` | unset | QSA step and positions uploaded by each layer | qsa-small |
+| `STRATA_OLD_QSA_PREP=1` | unset | QSA preparation in separate launches | qsa-small |
+| `STRATA_OLD_ROPE_TABLE=1` | unset | FP64 RoPE table always allocated | qsa-small |
+| `STRATA_OLD_SAMPLER=1` | unset | The 0.1.20 sampler (sampled requests only; greedy is unchanged) | sampler |
+| `STRATA_SAMPLER_ONE_BLOCK=1` | unset | New sampler, but one block per row | sampler |
+| `STRATA_OLD_TOPK=1` | unset | Old long-context block top-k kernel | qsa-longctx |
+| `STRATA_OLD_QSA_ATTN=1` | unset | Old QSA attention kernel (decode and batches) | qsa-longctx |
+| `STRATA_QSA_ATTN_BATCH_OLD=1` | unset | Old QSA attention kernel for batches only (prompt, verify windows) | qsa-longctx |
+| `STRATA_OLD_GRIDS=1` | unset | Expert fetch/gather on the old fixed grids (48 x 8 blocks) | grids |
+| `STRATA_OLD_GDN_AB=1` | unset | `gdn_ab` one warp per row | grids |
+| `STRATA_OLD_GDN_STEP=1` | unset | GDN step one block per head (no thread-block cluster) | grids |
+| `STRATA_OLD_RUN_SPLIT=1` | unset | Old task split in the CPU expert pool | cpu |
+| `STRATA_NO_THP=1` | unset | No `madvise(MADV_HUGEPAGE)` on the expert arena (Linux) | cpu |
+| `STRATA_THP_REPORT=0` | on | Skip the `AnonHugePages` report at startup | cpu |
+| `STRATA_OLD_CPU_PREFETCH=1` | unset | No software prefetch in the CPU Q2_0 kernel | cpu |
+| `STRATA_CPU_PREFETCH=<bytes>`, `STRATA_CPU_PREFETCH_CODES=<bytes>` | 2048 | Prefetch distance (scales, codes); 0 = off | cpu |
+| `STRATA_OLD_IQ512=1` | unset | Old AVX-512 i-quant CPU kernels | cpu |
+| `STRATA_IQ512_NOPACK=1` | unset | No aligned copy of the activations in the i-quant kernels | cpu |
+| `STRATA_OLD_DETOK=1` | unset | The server decodes the whole answer again at every token | server-tools |
+| `STRATA_OLD_PROMPT_ENCODE=1` | unset | The server tokenizes the whole conversation again at every request | server-tools |
+| `STRATA_CHECK_PROMPT_IDS=1` | unset | The server encodes both ways, compares, and falls back to the full encoding if they differ | server-tools |
+| `STRATA_OLD_PREFILL_GDN_CONV`, `_GDN_REC`, `_GR` (`=1`) | unset | Old prompt kernels (`gdn_conv`, GDN recurrence, GR chain) | prefill-kernels |
+| `STRATA_OLD_IDX_APPEND=1` | unset | QSA indexer appended token by token while reading the prompt | prefill-host |
+| `STRATA_OLD_MOE_GROUP=1` | unset | Prompt MoE grouped on the host, experts one by one | prefill-host |
+| `STRATA_PREFILL_COALESCE=0` | 1 | Expert copies one by one (contiguous ones not merged) | prefill-host |
+| `STRATA_OLD_SFX_RESET=1` | unset | Suffix drafter rebuilt at every request | prefill-host |
+| `STRATA_OLD_CKPT=1` | unset | Conversation checkpoints copied synchronously to pageable memory | prefill-host |
+| `STRATA_OLD_PROFILE_FILL=1` | unset | Startup profile fill synchronous, every slot read back in full | prefill-host |
+
+### Opt-ins that change the numbers (off by default)
+
+| Variable or flag | Default | Effect when set | Package |
+| --- | --- | --- | --- |
+| `STRATA_IQ_FASTDIV=1` | unset | Fast division in `quantize_q8_1_rows` and the grouped SwiGLU (the two Q8_1 quantizers then agree) | iq-kernels |
+| `STRATA_YMISS_WC=1` | unset | `y_miss` in write-combined memory (same values; a speed hypothesis) | window-batching |
+| `STRATA_QSA_CHUNK=32` | 64 | QSA attention in chunks of 32 cells (another softmax split) | qsa-longctx |
+| `STRATA_QSA_MERGE_GATE=1` | unset | Sigmoid gate folded into `attn_merge` (bit-identical expected, to confirm; not with `--kv q4_0`) | qsa-longctx |
+| `--idx-fp16` / `STRATA_IDX_FP16=1` | unset | See the flags above | qsa-longctx |
+| `STRATA_CPU_INT_CORR=1` | unset | Integer correction of the Q2_0 down rows on the CPU | cpu |
+| `STRATA_IQ512_ONE=1` | unset | One-token IQ experts on the AVX-512 kernel instead of `vec_dot` | cpu |
+| `STRATA_PREFILL_F16_SAT=1` | unset | FP16 values in the prompt path clamped to ±65504 (no inf) | prefill-kernels |
+| `STRATA_PREFILL_ROUTE_DECODE=1` | unset | The prompt's router computed like the decode router | prefill-kernels |
+| `STRATA_ASYNC_REFILL=1` | unset | Lent expert slots refilled in the background after a prompt (the CPU computes those experts meanwhile) | prefill-host |
+| `--prefill-dense-mmq` / `STRATA_PREFILL_DENSE_MMQ=1` | unset | See the flags above | prefill-dense |
+| `STRATA_ROPE_F64=1` | unset | Native RoPE angle computed in FP64 at decode | correctness |
+| `STRATA_SPEC_T1=1` | unset | `--spec` without `--mtp`: one-token windows instead of windows padded with token 0 | correctness |
+| `--gdn-state-bf16` | unset | See the flags above | research |
+
+### Measurement and checks
+
+| Variable or tool | Default | Effect |
+| --- | --- | --- |
+| `STRATA_MTP_CHAIN_CHECK=N` | 0 | Compares the one-graph draft chain with the old path on N rounds (doubles the draft cost) |
+| `STRATA_PREFILL_TIMING=1` | unset | GPU time of the prompt path per phase and per chunk |
+| `STRATA_DBG_NAN=1` | unset | Reports the first non-finite values in the prompt's MoE layers and the output head |
+| `STRATA_STATE_HASH=1` | unset | Hash of the engine state after each request, for A/B in server mode (only CUDA0's session under the layer split) |
+| `tools/ab_oneshot.py`, `tools/bench_turns.py` | - | Interleaved engine A/B runs; multi-turn timing against a running server |
+| `tools/logits_kl.py`, `tools/routing_locality.py`, `tools/prefill_chunk_check.py` | - | KL between two `--dump-logits` files; routing locality; prompt chunk size comparison |
 
 ---
 

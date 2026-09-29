@@ -23,29 +23,69 @@ of a word): faster than you can read.
 
 ## What StrataGP adds
 
-StrataGP is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata). It follows upstream (currently engine
-**0.1.21**, upstream commit `f1b1d96`, including its experimental layer split: one model across two or three GPUs,
-see [docs/MULTI_GPU.md](docs/MULTI_GPU.md)) and adds on top of it the results of a performance and precision audit
-of the engine:
+StrataGP is a fork of **[Strata](https://github.com/Niko1221/Strata) by Niko1221**. The engine, the installer, the
+app, the measurements and the [paper](docs/paper/Strata-Paper.pdf) are his work; StrataGP follows it (currently engine
+**0.1.21**, upstream commit `f1b1d96`, including its experimental layer split: one model across two or three GPUs, see
+[docs/MULTI_GPU.md](docs/MULTI_GPU.md)) and adds a round of performance and precision work on top of it.
 
-- **The audit**: [docs/AUDIT-PERF.md](docs/AUDIT-PERF.md) (decode, prompt reading, CPU experts, kernels).
-- **Sixteen packages of changes** that follow from it: `ple-io`, `round-sync`, `grouped-experts`, `iq-kernels`,
-  `window-batching`, `qsa-small`, `sampler`, `qsa-longctx`, `grids`, `cpu`, `server-tools`, `prefill-kernels`,
-  `prefill-host`, `prefill-dense`, `correctness` and `research`. What each one changes, what is on by default, the
-  switch to turn it back off (`STRATA_OLD_*`) and how to A/B it are in
-  [docs/PERF-CHANGES.md](docs/PERF-CHANGES.md), with one page per package in [docs/perf/](docs/perf/).
-- The rule they follow: a change that gives bit-identical results is **on by default** (with a switch back to the
-  old path); a change that alters the numbers is **off by default** (opt-in).
+**How it was done.** The engine was read end to end and audited: [docs/AUDIT-PERF.md](docs/AUDIT-PERF.md) lists what
+could be faster or more exact, with an estimate for each item. That gave 53 issues; 52 of them were worked on, in 16
+packages (plus a build fix that upstream also made itself). [docs/PERF-CHANGES.md](docs/PERF-CHANGES.md) has the full table (issue by issue: what changed, what is
+on by default, the exact switch), and [docs/perf/](docs/perf/) has one page per package.
 
-**Not yet validated on a GPU.** All the GPU code builds (CUDA 13.0), and the CPU and Python tests pass, but none of
-these changes has run on a graphics card yet, on one GPU or on several. The layer split together with the sixteen
-packages is designed to work stage by stage ([docs/PERF-CHANGES.md, section 5](docs/PERF-CHANGES.md)) and is
-equally unmeasured. The speed figures below are upstream's measurements of the unchanged engine.
+**What kind of changes**, in plain words:
+
+- **Fewer round trips while writing an answer.** Each "guess, then check" step used to stop several times so the
+  processor and the graphics card could wait for each other; most of these waits are gone (`round-sync`), and many
+  small GPU steps are batched or merged (`window-batching`, `qsa-small`).
+- **SSD reads off the critical path.** The few rows of the lookup table on the SSD are now read while the graphics
+  card works, instead of before it starts (`ple-io`, io_uring on Linux).
+- **Faster GPU kernels for the experts** kept on the graphics card, for Q2_0 and for the IQ sizes (`grouped-experts`,
+  `iq-kernels`).
+- **A faster sampler** when the answer is sampled (temperature, top-k, top-p) rather than greedy (`sampler`).
+- **Long context:** the attention over long conversations reads its data in larger, overlapped pieces (`qsa-longctx`).
+- **Big GPUs such as the RTX 5090** (170 SMs): some work was sized for a 48-SM card and left most of a big card idle;
+  it now scales with the card (`grids`).
+- **CPU expert kernels:** better load balance across threads, large memory pages on Linux, memory prefetching and
+  faster IQ kernels (`cpu`).
+- **Reading your prompt:** fewer synchronisations and CUDA calls per layer, and several prompt kernels rewritten
+  (`prefill-kernels`, `prefill-host`, `prefill-dense`).
+- **The server:** the conversation is no longer re-tokenized from scratch, nor the answer re-decoded, at every
+  request or token (`server-tools`), plus a few tools (`calibrate.py --spec`, `make_profile.py`, `mtp_pack.py`).
+- **Correctness fixes** (`correctness` and others): a GPU barrier that could be skipped, NaN turned into -0 in a BF16
+  conversion, a missing bounds check in long-context attention, fixed-size tables without a guard in the CPU expert
+  pool, `--spec` without a draft layer, and missing parity tests for production kernels (now added).
+
+**What is on by default.** A change that gives **exactly the same result**, bit for bit, is **on by default**, and
+each one has a `STRATA_OLD_*` switch (an environment variable) that brings back the old code, so you can compare
+both. A change that **alters the numbers**, even slightly (lower precision, another rounding), is **off by default**
+and has to be turned on (`--idx-fp16`, `--prefill-dense-mmq`, `--gdn-state-bf16` and a few variables). All the
+switches are listed in [docs/DETAILS.md](docs/DETAILS.md#engine-switches-stratagp).
+
+**Not yet validated on a GPU - please read.** The machine these changes were made on has no graphics card. All the
+GPU code compiles (CUDA 13.0) and the CPU and Python tests pass, but **none of these GPU changes has run on a
+graphics card yet**, on one GPU or on several (the layer split with the 16 packages is designed to work card by card,
+[docs/PERF-CHANGES.md, section 5](docs/PERF-CHANGES.md#5-répartition-des-couches-sur-plusieurs-gpu-moteur-0121), but
+is equally unmeasured). So the gains below are **estimates**, not measurements:
+
+| What | Expected gain | Status |
+| --- | --- | --- |
+| Writing answers, RTX 5090 | roughly **+20-40%** | estimate from the audit, to be confirmed |
+| Reading your prompt | roughly **+10-20%** | estimate from the audit, to be confirmed |
+| CPU expert kernel (Q2_0, prefetch) | **+25% to +88%** on the kernel alone | measured on an Intel VM only |
+| CPU i-quant kernels (IQ2/IQ3) | **+14% to +130%** on the kernel alone (one 3-thread case slower) | measured on an Intel VM only |
+
+The CPU numbers are for the kernel by itself; on a card that holds most experts in VRAM they weigh little in the
+total. The procedure to validate everything on an RTX 5090 (parity tests, then an A/B that must give the same tokens
+with and without the `STRATA_OLD_*` switches, then each opt-in one by one) is in
+[docs/PERF-CHANGES.md, section 3](docs/PERF-CHANGES.md#3-validation-sur-la-rtx-5090). Until that is done, if something
+misbehaves, the `STRATA_OLD_*` switches bring back upstream's code path.
 
 
 ## How fast is it?
 
-Measured on an RTX 5070 (12 GB), a Ryzen 5 7600 and 64 GB of RAM:
+These are **upstream's measurements** (Strata engine 0.1.14, before StrataGP's changes) on an RTX 5070 (12 GB), a
+Ryzen 5 7600 and 64 GB of RAM:
 
 | Size | Writes answers (short chat) | Writes answers (128K context) | Reads your prompt |
 | --- | ---: | ---: | ---: |
@@ -221,6 +261,8 @@ Want the full picture? The [details](docs/DETAILS.md#how-it-works) explain every
 
 ## Credits
 
+- Engine: [Strata](https://github.com/Niko1221/Strata) by Niko1221 - StrataGP is a fork of it; the engine, the
+  installer, the app and the paper are his work.
 - Model: [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team; compressed versions by
   [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF);
   [Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF) by UkisAI. Their licenses apply
