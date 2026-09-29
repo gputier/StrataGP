@@ -643,8 +643,11 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.stage_live[i] = false;                        // a new buffer: nothing of an earlier layout to wait for
     }
     // issue #36: consecutive experts of a layer lie back to back in the arena, so a run of them lands in consecutive
-    // ring slots with one 2D copy - when the slots are evenly spaced (one borrowed region, not separate cudaMallocs)
-    m.stage_stride = m.ring >= 2 && m.stage_dev[0] != nullptr ? (int64_t) (m.stage_dev[1] - m.stage_dev[0]) : 0;
+    // ring slots with one 2D copy - when the slots are evenly spaced within ONE region.  Separate cudaMallocs (the
+    // prompt path's own buffers) can come out evenly spaced too (4 MiB apart on an RTX 5090), and a 2D copy across
+    // two allocations fails with "invalid argument": only a region the slots are carved from qualifies.
+    m.stage_stride = o.base != nullptr && m.ring >= 2 && m.stage_dev[0] != nullptr
+                         ? (int64_t) (m.stage_dev[1] - m.stage_dev[0]) : 0;
     for (int i = 1; i < m.ring && m.stage_stride != 0; ++i)
         if (m.stage_dev[i] != m.stage_dev[0] + (size_t) i * (size_t) m.stage_stride) m.stage_stride = 0;
     if (m.stage_stride < MAXBLOB()) m.stage_stride = 0;
