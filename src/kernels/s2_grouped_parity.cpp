@@ -16,6 +16,9 @@
 //
 // NON-VACUITY.  The same blobs are also run with every scale made positive: both runs must match their
 // references, and the two outputs must differ - a kernel that dropped the sign would pass one and fail the other.
+#ifndef NOMINMAX
+#define NOMINMAX   // dequant.hpp includes gguf_reader.hpp, which includes windows.h
+#endif
 #include "strata/artifact/dequant.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
