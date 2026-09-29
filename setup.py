@@ -221,7 +221,7 @@ def cpu_info():
     name, avx2, avx512 = platform.processor() or "unknown CPU", False, False
     if WIN:
         pf = ctypes.windll.kernel32.IsProcessorFeaturePresent
-        avx2 = bool(pf(40))                       # PF_AVX2_INSTRUCTIONS_AVAILABLE
+        avx2 = bool(pf(40)) or _cpuid_avx2()      # PF_AVX2_INSTRUCTIONS_AVAILABLE, else the CPU itself (#159)
         n = out(["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_Processor).Name"]).strip()
         name = n or name
         avx512 = bool(pf(41)) and _cpuid_avx512_full()
@@ -255,6 +255,47 @@ def _cpuid_avx512_full() -> bool:
         need_ebx = (1 << 16) | (1 << 30) | (1 << 31)                   # F, BW, VL
         need_ecx = (1 << 1) | (1 << 11)                                # VBMI, VNNI
         return (ebx & need_ebx) == need_ebx and (ecx & need_ecx) == need_ecx
+    except Exception:
+        return False
+
+
+def _run_stub(code: bytes, *args) -> None:
+    """Runs a few bytes of x64 machine code (Windows calling convention: the arguments in rcx, rdx)."""
+    k32 = ctypes.windll.kernel32
+    k32.VirtualAlloc.restype = ctypes.c_void_p
+    k32.VirtualFree.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32)
+    buf = k32.VirtualAlloc(None, len(code), 0x3000, 0x40)
+    if not buf:
+        raise OSError("VirtualAlloc failed")
+    try:
+        ctypes.memmove(buf, code, len(code))
+        ctypes.CFUNCTYPE(None, *[ctypes.c_void_p] * len(args))(buf)(*args)
+    finally:
+        k32.VirtualFree(buf, 0, 0x8000)
+
+
+def _cpuid_avx2() -> bool:
+    """AVX2 asked from the CPU (CPUID leaf 7 EBX bit 5), with the OS saving the YMM registers (OSXSAVE + XCR0):
+    Windows' IsProcessorFeaturePresent(PF_AVX2) says no on some PCs whose CPU has it (a Ryzen 9 3950X, #159)."""
+    try:
+        def cpuid(leaf):
+            regs = (ctypes.c_uint32 * 4)()
+            _run_stub(bytes([0x53, 0x49, 0x89, 0xC8, 0x89, 0xD0, 0x31, 0xC9, 0x0F, 0xA2,      # push rbx; r8=rcx; eax=edx; ecx=0; cpuid
+                             0x41, 0x89, 0x00, 0x41, 0x89, 0x58, 0x04, 0x41, 0x89, 0x48, 0x08,  # [r8]=eax, [r8+4]=ebx, [r8+8]=ecx
+                             0x41, 0x89, 0x50, 0x0C, 0x5B, 0xC3]),                             # [r8+12]=edx; pop rbx
+                      ctypes.addressof(regs), leaf)
+            return list(regs)
+        if cpuid(0)[0] < 7:
+            return False
+        ecx1 = cpuid(1)[2]
+        if not (ecx1 >> 27) & 1 or not (ecx1 >> 28) & 1:             # OSXSAVE, AVX
+            return False
+        xcr0 = (ctypes.c_uint32 * 2)()
+        _run_stub(bytes([0x49, 0x89, 0xC8, 0x31, 0xC9, 0x0F, 0x01, 0xD0,                        # r8=rcx; ecx=0; xgetbv
+                         0x41, 0x89, 0x00, 0x41, 0x89, 0x50, 0x04, 0xC3]), ctypes.addressof(xcr0))
+        if xcr0[0] & 6 != 6:                                           # the OS saves XMM and YMM
+            return False
+        return bool((cpuid(7)[1] >> 5) & 1)
     except Exception:
         return False
 
