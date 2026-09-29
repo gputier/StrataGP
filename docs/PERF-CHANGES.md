@@ -492,3 +492,6 @@ Ce cas touche la répartition sur plusieurs GPU, qui impose `--no-prefill-borrow
   [#56](https://github.com/gputier/StrataGP/issues/56).
 - Les options qui changent les valeurs (3.5), le mode serveur et plusieurs GPU :
   [#57](https://github.com/gputier/StrataGP/issues/57).
+- Le retour à l'amont : l'amont 0.1.24 a refait une partie des lots (C-2, C-3, D-2, D-4, F-1, PR #109,
+  top-k QSA sur tensor cores) ; les correctifs et les lots encore nouveaux lui sont proposés dans
+  [Niko1221/Strata#149](https://github.com/Niko1221/Strata/issues/149).
