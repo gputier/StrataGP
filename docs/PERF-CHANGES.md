@@ -438,8 +438,9 @@ Modèle IQ3_S, fenêtre 262 144, `--kv int8 --kv-resident 32768`, glouton, 256 t
 
 ### 6.1 Build
 
-`s2_grouped_parity.cpp` ne compilait pas sous MSVC (`windows.h` atteint par `dequant.hpp` et ses macros `min`/`max`) :
-`NOMINMAX`, comme le reste du code (89e0738).
+`s2_grouped_parity.cpp` ne compilait pas sous MSVC : `gguf_reader.hpp`, qu'il atteint par `dequant.hpp`, inclut
+`windows.h` et ses macros `min`/`max`. `NOMINMAX` est maintenant défini dans `gguf_reader.hpp` lui-même, juste avant
+`windows.h` (32dbbad) ; build MSVC complet vérifié, 253 cibles.
 
 ### 6.2 Tests de parité
 
