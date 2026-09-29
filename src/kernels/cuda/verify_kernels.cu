@@ -371,8 +371,9 @@ __global__ void __launch_bounds__(GCW * RG) gdn_step_norm_multi_cluster_kernel(S
 
 template <typename St>
 bool multi_cluster_ready() {
-    static const bool ready = cluster_launchable(gdn_step_norm_multi_cluster_kernel<St>, dim3(GCW, RG), GC);
-    return ready;
+    // per device: a layer split may pair a card that takes clusters with one that does not (launch_grid.hpp)
+    static PerDevice<bool> ready;
+    return ready.get([] { return cluster_launchable(gdn_step_norm_multi_cluster_kernel<St>, dim3(GCW, RG), GC); });
 }
 
 __global__ void embedding_gather_dev_kernel(const uint8_t* __restrict__ codes, const float* __restrict__ scales,

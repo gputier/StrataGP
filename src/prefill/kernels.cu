@@ -69,13 +69,17 @@ bool env_on(const char* name) {
 }
 // KernelPath::Env -> the rewrite, unless the function's STRATA_OLD_PREFILL_* variable (`env_old`, read once) is 1
 bool use_old(KernelPath p, bool env_old) { return p == KernelPath::Old || (p == KernelPath::Env && env_old); }
-// B7's flag: STRATA_PREFILL_F16_SAT=1 sets it once, before the first launch of a kernel that calls hf, with a
-// synchronous copy and a device synchronization, so every later launch sees it whatever its stream (current device;
-// one GPU). set_f16_saturate (the tests) sets it the same way and wins over the variable.
-std::once_flag g_f16_once;
+// B7's flag: STRATA_PREFILL_F16_SAT=1 sets it once per device (__constant__ memory is per device, and a layer split
+// runs a prompt path on each of two or three cards), before the first launch there of a kernel that calls hf, with
+// a synchronous copy and a device synchronization, so every later launch sees it whatever its stream.
+// set_f16_saturate (the tests, one GPU) sets it the same way and wins over the variable.
+constexpr int kF16Devices = 64;
+std::once_flag g_f16_once[kF16Devices];
 std::atomic<bool> g_f16_forced{false};
 void f16_mode(void* /*stream*/) {
-    std::call_once(g_f16_once, [] {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= kF16Devices) dev = 0;
+    std::call_once(g_f16_once[dev], [] {
         const int on = 1;
         if (!g_f16_forced.load() && env_on("STRATA_PREFILL_F16_SAT")) {
             if (cudaMemcpyToSymbol(c_f16_sat, &on, sizeof on) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess)

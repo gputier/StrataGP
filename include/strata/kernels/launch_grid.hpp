@@ -2,7 +2,7 @@
 //
 // Several decode launches were written for the 48 SMs of the RTX 5070: the blob and row copies ran on `48 * 8`
 // blocks, the GDN alpha/beta projection on 12 blocks (a warp per row) and the GDN step on one block per value head
-// (48).  On a 170-SM RTX 5090 they leave most of the chip idle.  The launchers now read the device once, here.
+// (48).  On a 170-SM RTX 5090 they leave most of the chip idle.  The launchers now read each device once, here.
 //
 // Every change behind these switches is bitwise: the same values reach the same arithmetic in the same order; only
 // the number of blocks, and which warp or block carries a chain, differ.  The previous launches stay selectable, one
@@ -17,10 +17,11 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <mutex>
 
 namespace strata::kernels {
 
-/// What the grids are sized from, read once from the current device (the engine drives one GPU).
+/// What the grids are sized from, read once per device (a layer split drives two or three GPUs: see PerDevice).
 struct GridDevice {
     int sms = 48;             ///< multiprocessors; 48 (the 0.1.20 grids) when the query fails
     int cc_major = 0;         ///< compute capability, major
@@ -40,8 +41,40 @@ void outside_capture_rules(Fn&& fn) {
     if (swapped) cudaThreadExchangeStreamCaptureMode(&mode);
 }
 
+/// The devices a per-device answer is kept for; a larger ordinal shares the last entry.
+constexpr int kGridMaxDevices = 64;
+
+/// The current device's ordinal, clamped to the per-device tables (0 when the query fails).
+inline int grid_device_index() {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return 0;
+    }
+    return dev < 0 ? 0 : dev >= kGridMaxDevices ? kGridMaxDevices - 1 : dev;
+}
+
+/// A one-time answer kept PER DEVICE: a layer split (docs/MULTI_GPU.md) runs the same launchers on two or three
+/// cards, e.g. an RTX 5080 (84 SMs, clusters) beside an RTX 3090 (82 SMs, no clusters), so an answer read once per
+/// process would size one card's grids from the other and launch cluster kernels where they cannot run.
+template <typename T>
+class PerDevice {
+public:
+    template <typename Fn>
+    const T& get(Fn&& fn) {
+        const int d = grid_device_index();
+        std::call_once(once_[d], [&] { value_[d] = fn(); });
+        return value_[d];
+    }
+
+private:
+    std::once_flag once_[kGridMaxDevices];
+    T value_[kGridMaxDevices] = {};
+};
+
 inline const GridDevice& grid_device() {
-    static const GridDevice device = [] {
+    static PerDevice<GridDevice> devices;
+    return devices.get([] {
         GridDevice d;
         outside_capture_rules([&] {
             int dev = 0, v = 0;
@@ -52,8 +85,7 @@ inline const GridDevice& grid_device() {
                 d.clusters = v != 0 && d.cc_major >= 9;
         });
         return d;
-    }();
-    return device;
+    });
 }
 
 /// A `STRATA_OLD_*` switch: read from the environment once; `set` overrides it (the parity test runs both paths).
@@ -79,7 +111,7 @@ inline int grid_sms() { return old_grids().on() ? 48 : grid_device().sms; }
 
 /// Whether `kernel` can be launched here as clusters of `cluster` blocks of `block` threads.  The kernel must have
 /// been compiled for sm_90 or newer: in a build for an older architecture its body is an empty stub, and this says
-/// no.  Called once per kernel (the caller keeps the answer).
+/// no.  Called once per kernel and device (the caller keeps the answer in a PerDevice).
 template <typename Kernel>
 bool cluster_launchable(Kernel* kernel, dim3 block, unsigned cluster) {
     if (!grid_device().clusters) return false;
