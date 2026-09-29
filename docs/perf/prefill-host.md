@@ -277,3 +277,8 @@ restauration, même réponse attendue avec `--adapt-swaps 0`).
 - #42 × `round-sync` (#16) : le prêt et le re-remplissage des emplacements attendent le téléversement asynchrone de
   `d_res` encore en vol avant de le réécrire.
 - #45 × `research` (#53) : voir [research.md](research.md). Détail : [../PERF-CHANGES.md](../PERF-CHANGES.md).
+- Répartition des couches (0.1.21, [../MULTI_GPU.md](../MULTI_GPU.md)) : la marche groupée (#36) et l'ajout de
+  l'indexeur par morceau (#40) ne parcourent que les couches de l'étage ; les points de reprise épinglés (#45)
+  sauvent et restaurent la session de chaque étage par un pool par étage, dont le flux est sur le GPU de l'étage ;
+  #42 ne s'applique pas (sur plusieurs GPU, le prompt ne prête pas d'emplacements) ; #48 ne concerne que le cache de
+  CUDA0 (les étages suivants remplissent le leur comme le fait 0.1.21).

@@ -9,7 +9,7 @@ pour sm_86, pour vérifier la garde des clusters) et les tests CPU ont été lan
 
 | # | Source (issue #26) | Changement | Par défaut | Retour à l'ancien chemin |
 |---|---|---|---|---|
-| 1 | `fetch_blobs`, `gather_rows` : `48 * 8` blocs codés en dur | `8 × multiProcessorCount` du GPU courant, lu une fois (`launch_grid.hpp`). Sur une carte à 48 SM, lancement identique. | **activé** | `STRATA_OLD_GRIDS=1` |
+| 1 | `fetch_blobs`, `gather_rows` : `48 * 8` blocs codés en dur | `8 × multiProcessorCount` du GPU courant, lu une fois par GPU (`launch_grid.hpp`). Sur une carte à 48 SM, lancement identique. | **activé** | `STRATA_OLD_GRIDS=1` |
 | 2 | `gdn_ab_kernel` (et `gdn_ab_multi_kernel` du verify) : 96 lignes sur **12 blocs** (un warp par ligne) | **Un bloc de 4 warps par ligne** (96 blocs) : les 128 threads chargent la ligne en mémoire partagée d'un coup, puis la même chaîne d'`fmaf` qu'avant. | **activé** | `STRATA_OLD_GDN_AB=1` |
 | 3 | Pas GDN (`fused_gdn_step_norm`, `gdn_step_norm_multi`) : **48 blocs** (un par tête de valeur) | Les 128 colonnes d'une tête réparties sur un **cluster de 4 blocs** (192 blocs), somme RMS échangée en mémoire partagée distribuée. sm_90 et plus, vérifié à l'exécution. | **activé** (si le GPU accepte les clusters) | `STRATA_OLD_GDN_STEP=1` |
 | 4 | `qsa_decode_attn` (66 blocs), `gr_down` (41 blocs), prefill `gdn_rec_kernel` (48 blocs), autres | Revus, **non modifiés** (voir « Ce qui reste »). | — | — |
@@ -26,8 +26,11 @@ jeton (`--spec 0`, pack S2).
 
 ### 1. Copies à pas de grille (`src/kernels/cuda/verify_kernels.cu`, `include/strata/kernels/launch_grid.hpp`)
 
-- `grid_device()` lit une fois `cudaDevAttrMultiProcessorCount`, la capacité de calcul et
-  `cudaDevAttrClusterLaunch`. Le premier lancement pouvant se trouver dans une capture de graphe (mode
+- `grid_device()` lit une fois **par GPU** `cudaDevAttrMultiProcessorCount`, la capacité de calcul et
+  `cudaDevAttrClusterLaunch` (`PerDevice<T>` : un `std::call_once` par numéro de GPU ; la réponse « le kernel en
+  cluster se lance-t-il ici » de chaque pas GDN est gardée de la même façon). Avec la répartition des couches
+  sur plusieurs GPU (0.1.21, [../MULTI_GPU.md](../MULTI_GPU.md)), chaque carte a ses propres grilles, et une RTX 3090
+  (sm_86, sans clusters) à côté d'une RTX 5080 garde l'ancien pas GDN au lieu de recevoir les kernels en cluster. Le premier lancement pouvant se trouver dans une capture de graphe (mode
   `ThreadLocal`), les requêtes passent par `cudaThreadExchangeStreamCaptureMode(Relaxed)` ; une requête qui échoue
   n'est pas remontée comme erreur du lancement suivant (48 SM par défaut).
 - `fetch_blobs` et `gather_rows` : `grid_sms() * 8` blocs de 256. Ce sont des boucles à pas de grille : chaque

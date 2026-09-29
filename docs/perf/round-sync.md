@@ -64,12 +64,25 @@ Le coût du brouillon double pendant ces N tours : ne pas mesurer de débit avec
 - Gain réel : quand le MTP est utilisé, son tour attend l'événement puis synchronise son propre flux ; le gain est
   donc une synchronisation de moins et le recouvrement du travail hôte (affichage, suffixes, préparation MTP) avec
   le `commit`. Sans MTP (suffixes seuls), l'hôte enchaîne directement sur la fenêtre suivante.
+- Répartition des couches (0.1.21, [../MULTI_GPU.md](../MULTI_GPU.md)) : chaque étage lance son propre graphe de
+  `commit` sur son flux, avec le même `wait`, et enregistre son propre événement ; la fenêtre suivante de chaque
+  étage suit son `commit` sur ce flux. `sync_commit()` attend les `commit` de tous les étages ; `commit_event()`
+  est celui du dernier étage, sur le GPU de la tête et du drafter qui l'attend (les `commit` des étages précédents
+  ne touchent que l'état de leurs couches, que le drafter ne lit pas). La chaîne MTP en un graphe tourne sur ce
+  même GPU (le drafter y vit).
 
 ### 3. `d_res` asynchrone (`ResidencyUpload`, `src/program/round_sync.hpp`)
 
 Lecteurs de `d_res` : le graphe « token » (`session.cpp`, `moe_hit_select`) et le chemin de prefill emprunteur.
 Aucun ne tourne dans les boucles de décodage (le `Verifier` vérifie seulement que `d_res` n'est pas nul). Les
 écritures synchrones suivantes (`refill`, `lend`) arrivent après la fin de boucle, qui attend la copie.
+
+Répartition des couches : chaque étage suivant garde sa copie de `d_res` sur son GPU et fait ses échanges
+adaptatifs sur son propre flux de re-remplissage ; sa copie monte par son propre `ResidencyUpload`, derrière ses
+blobs échangés, et la fin de requête attend tous les téléversements. Seule la table de CUDA0 est réécrite de façon
+synchrone (`lend`, `refill` : le prompt n'emprunte des emplacements que sur un seul GPU), donc ces deux-là
+n'attendent que le sien. `AdaptWorker` ne change pas : la tâche change de GPU pour chaque échange (celui de la
+couche).
 
 ### 4. Thread persistant (`AdaptWorker`)
 

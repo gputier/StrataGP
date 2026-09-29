@@ -31,6 +31,10 @@ et l'appel échoue ensuite. Un garde RAII récupère un lot resté en vol sur to
 - Ancien chemin (A/B) : **`STRATA_OLD_PLE_STAGING=1`** (lecture bloquante avant le lancement, copie en tête).
   La valeur est lue : variable absente, vide ou `0` = nouveau chemin ; toute autre valeur = ancien chemin.
 - Diagnostic du chien de garde : la ligne `verify window: ...` affiche aussi `ple rows (P)`.
+- Répartition des couches sur plusieurs GPU (0.1.21, [../MULTI_GPU.md](../MULTI_GPU.md)) : seul l'étage qui porte
+  la couche 1 (celui de CUDA0, les points de coupure valant 2 ou plus) démarre les lectures, lève `P` et attend `P`
+  dans son graphe ; les étages suivants ne lisent rien. Un étage qui commencerait à la couche 1 lirait ses lignes
+  avant le lancement (l'ancien chemin), car son graphe attendrait `P` avant le premier anneau.
 
 ### (b) Linux : lectures concurrentes (`src/platform/direct_file.cpp`)
 

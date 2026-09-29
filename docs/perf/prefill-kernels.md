@@ -86,6 +86,8 @@ Toutes les variables se lisent une fois au démarrage ; `=1` active, absente ou 
   valeur qui était finie garde ses bits.
 - Mécanisme : un `__constant__` lu par `hf` (une comparaison prédiquée), écrit une fois avant le premier kernel
   concerné, par une copie synchrone suivie d'une synchronisation du GPU (visible quel que soit le flux). Désactivé : `hf` est exactement `__float2half_rn`.
+  Le `__constant__` existe une fois par GPU : avec la répartition des couches (0.1.21), il est écrit une fois sur
+  chaque carte qui lit une partie du prompt (un `std::once_flag` par GPU).
 
 ### B8 — routeur aligné sur le décodage, opt-in ; NaN comptés (#7)
 

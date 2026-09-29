@@ -4,7 +4,10 @@
 ([`docs/AUDIT-PERF.md`](AUDIT-PERF.md)), fusionnés un par un dans cet ordre : `ple-io`, `round-sync`,
 `grouped-experts`, `iq-kernels`, `window-batching`, `qsa-small`, `sampler`, `qsa-longctx`, `grids`, `cpu`,
 `server-tools`, `prefill-kernels`, `prefill-host`, `prefill-dense`, `correctness`, `research`. Chaque lot a son
-document dans [`docs/perf/`](perf/) :
+document dans [`docs/perf/`](perf/). Le moteur amont 0.1.21 (Niko1221/Strata, c1e9033..f1b1d96 : un modèle
+réparti sur deux ou trois GPU, [`docs/MULTI_GPU.md`](MULTI_GPU.md)) a ensuite été fusionné dans `perf/all` ; la
+section 5 dit ce que devient chaque lot dans ce mode.
+
 
 | Lot | Document | Issues |
 |---|---|---|
@@ -50,7 +53,7 @@ Dernière colonne : ce qui est actif sans rien passer, et l'option exacte pour r
 | #11 | [B13] expert_pool_dispatch_multi : tableaux fixes kind[128]/distinct[128]/dma_src[64] sans garde | cpu | fait | actif (gardes et `static_assert`), aucune option |
 | #12 | [B14] qsa_decode_attn : pas de garde page < 0 si le streaming KV déborde | qsa-longctx | fait | actif (correctif), aucune option |
 | #13 | [B15] bf16_from_f32 transforme NaN en -0 | correctness | fait | actif (identique hors NaN), aucune option |
-| #14 | [T1] Les tests de parité ne compilent pas : add_subdirectory(tests) sur un dossier absent | perf/base (b858f9b) | fait | `-DSTRATA_BUILD_TESTS=ON` configure sans `tests/` |
+| #14 | [T1] Les tests de parité ne compilent pas : add_subdirectory(tests) sur un dossier absent | perf/base (b858f9b), puis amont 0.1.21 (3801f86) | fait | `-DSTRATA_BUILD_TESTS=ON` configure sans `tests/` (la vérification de l'amont, sur `tests/CMakeLists.txt`, est gardée) |
 | #15 | [O1] Sortir les lectures n-gram (PLE) du chemin critique de chaque fenêtre | ple-io | partiel | actif ; `STRATA_OLD_PLE_STAGING=1`, `STRATA_PLE_IO_BACKEND=uring\|threads\|sync`, `STRATA_PLE_IO_THREADS=N` |
 | #16 | [O2] Supprimer les allers-retours hôte↔GPU du tour spéculatif | round-sync | fait | actif ; `STRATA_OLD_MTP_CHAIN=1`, `STRATA_OLD_COMMIT_SYNC=1`, `STRATA_OLD_RES_UPLOAD=1`, `STRATA_OLD_ADAPT_THREAD=1`, `STRATA_OLD_DMA_FLAG=1` |
 | #17 | [O3] Kernel groupé des experts VRAM : conflits de banques 8-way + somme hx recalculée | grouped-experts | partiel | actif ; `STRATA_OLD_GROUPED=1` ; seuil `STRATA_GROUPED_PAIR_MIN_HITS=N` (défaut 0) |
@@ -375,3 +378,46 @@ l'index de morceau de `prefill-dense` et le repli partiel de `prefill-host`).
 - Les évaluations **#51 (S3)** et **#53 (S5)** livrent les outils de mesure et l'option ; la décision (prédiction
   des experts, état BF16 par défaut) attend les mesures sur la 5090.
 - `pool_test` et `expert_parity` n'ont pas tourné ici (il faut le pack du modèle).
+
+## 5. Répartition des couches sur plusieurs GPU (moteur 0.1.21)
+
+L'amont 0.1.21 découpe les couches en plages contiguës, une par GPU (« étage ») : chaque étage a sa copie des poids
+denses, sa session, son cache d'experts pour ses couches, sa fenêtre de vérification et son chemin de prompt ; le
+dernier porte aussi la tête et le brouillon MTP. Une fenêtre de vérification fait tourner les couches `[lb, le)` de
+l'étage, puis passe son résidu à l'étage suivant par de la mémoire épinglée mappée. Réglage : `--layer-split
+K1[,K2]|auto` (et `--split-device`), seulement avec `--serve` ; `--layer-split K --split-device 0` fait tourner les
+deux étages sur la même carte en partageant tout (le contrôle au bit près de la passation, pas un mode de vitesse).
+
+**Sur un seul GPU (le défaut), rien ne change** : un seul étage `[0, 48)`, sans passation, et chaque lot se comporte
+exactement comme décrit plus haut. En mode réparti, chaque lot **fonctionne par étage** ; aucun n'est désactivé
+par la fusion. Ce que l'amont désactive lui-même sur plusieurs GPU reste désactivé (images, vecteurs de contrôle,
+streaming KV, `--expert-cache-remote`, `--mmap-experts`, prêt d'emplacements au prompt, points de reprise au milieu
+du prompt).
+
+| Lot | Sur plusieurs GPU | Détail |
+|---|---|---|
+| `ple-io` (#15) | fonctionne | Seul l'étage qui porte la couche 1 (CUDA0 : les points de coupure valent 2 ou plus) démarre les lectures n-gram, lève `P` et l'attend dans son graphe. **Corrigé à la fusion** : les autres étages ne récupèrent plus un lot qu'ils n'ont pas lancé (`ple_stage()`). Un étage qui commencerait à la couche 1 lirait avant le lancement (ancien chemin). |
+| `round-sync` (#16) | fonctionne | `commit` asynchrone par étage (son flux, son événement, même `wait`) ; `sync_commit()` attend tous les étages ; le tour MTP attend l'événement du dernier étage (même GPU que le drafter). Chaîne MTP en un graphe : sur le GPU du dernier étage. `ResidencyUpload` : un par GPU, derrière les échanges de l'étage sur son flux ; la fin de requête attend tous. `AdaptWorker` inchangé (chaque échange va dans le cache de l'étage de sa couche). Drapeau B par écriture de flux : par vérificateur, sur son flux de copie. |
+| `grouped-experts` (#17), `iq-kernels` (#4, #18) | fonctionne | Kernels sans état par GPU ; chaque étage les lance sur ses propres experts. |
+| `window-batching` (#19, #44) | fonctionne | Les lots et la combinaison en place couvrent les couches de l'étage ; l'écriture en attente (`bo`, `inject`) de la dernière couche d'un étage est ce que la passation transporte, comme sans les lots. |
+| `qsa-small` (#24, #25, #47) | fonctionne | Pas et positions QSA préparés par chaque étage ; la règle de la table RoPE (#47) s'applique à chaque session. |
+| `sampler` (#20) | fonctionne | Tampons déjà rangés par (GPU, flux) ; l'échantillonnage tourne sur le dernier étage. |
+| `qsa-longctx` (#12, #21 à #23) | fonctionne | `--idx-fp16` est un réglage du processus fixé avant la création des sessions : chaque étage a son ombre FP16. |
+| `grids` (#26) | fonctionne | **Corrigé à la fusion** : le nombre de SM et l'accès aux clusters étaient lus une fois par processus. Ils le sont maintenant une fois par GPU (`PerDevice<T>`, `launch_grid.hpp`), de même que la disponibilité des kernels GDN en cluster : une RTX 3090 (sm_86) à côté d'une RTX 5080 garde l'ancien pas GDN au lieu de recevoir un kernel en cluster qu'elle ne peut pas lancer. |
+| `cpu` (#11, #27 à #30) | fonctionne | Un seul pool CPU sert tous les étages (le `SplitDrive` de l'amont choisit le plan et le cache de l'étage pour chaque couche). |
+| `server-tools` (#31 à #35, #49, #50, #52) | fonctionne | `server.py` garde les deux : `gpu_list()`/`engine_args()` de l'amont et `recall_reasoning`. **Corrigé à la fusion** : `calibrate.py` lance maintenant le moteur comme le serveur (`engine_args`), donc une configuration à plusieurs GPU est mesurée répartie (auparavant sur sa première carte seule). `ab_oneshot.py` lance le moteur sans `--serve`, donc sur un seul GPU. |
+| `prefill-kernels` (#6, #7, #37, #38, #43) | fonctionne | **Corrigé à la fusion** : le drapeau `STRATA_PREFILL_F16_SAT` est un `__constant__`, écrit maintenant une fois par GPU. La norme GR portée par la dernière écriture (#43) s'arrête à la fin de l'étage. |
+| `prefill-host` (#36, #40, #42, #45, #46, #48) | fonctionne ; #42 sans objet | Marche groupée et indexeur par morceau sur les couches de l'étage ; points de reprise épinglés par un pool par étage (flux sur le GPU de l'étage) ; #42 ne s'applique pas (pas de prêt d'emplacements sur plusieurs GPU) ; #48 ne concerne que le cache de CUDA0. |
+| `prefill-dense` (#39, #41) | fonctionne | Le contexte MMQ de chaque chemin de prompt est créé sur son GPU. |
+| `correctness` (#2, #3, #5, #8 à #10, #13) | fonctionne | Réglages du processus ; aucun état par GPU. |
+| `research` (#51, #53) | fonctionne | `--gdn-state-bf16` est fixé avant la création des sessions (chaque étage a l'état BF16) ; `--dump-routing` passe par le `Drive` commun. |
+
+Limites propres à cette combinaison, en plus de celles de l'amont :
+- `STRATA_STATE_HASH=1` ne hache que la session de CUDA0.
+- Rien n'a tourné sur plusieurs GPU (ni sur un seul) : à valider sur une paire de cartes avec la procédure de
+  l'amont (`--layer-split K --split-device 0` doit donner les mêmes tokens que sans répartition, les défauts de
+  `perf/all` actifs puis avec les variables `OLD` de 3.4), puis le même A/B sur deux GPU.
+- Build Turing expérimental de l'amont (`-DSTRATA_EXPERIMENTAL_SM75=ON`, une RTX 20 comme étage) : le moteur de
+  `perf/all` compile pour sm_75 (vérifié ici avec `-DCMAKE_CUDA_ARCHITECTURES=75`), sans exécution. Sur sm_75, les
+  kernels en cluster de `grids` ne se lancent pas (la vérification à l'exécution répond non, pas GDN d'avant), et
+  l'attention QSA préchargée de `qsa-longctx` remplace `cp.async` par des lectures ordinaires.
