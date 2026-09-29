@@ -190,6 +190,32 @@ class CalibrateSpec(unittest.TestCase):
             del os.environ["STRATA_CALIBRATE_SPEC"]
         self.assertEqual(seen["specs"], (4, 6))
 
+    def base_args_of(self, cfg: dict) -> list[str]:
+        """The engine arguments run() hands to measure() for this config."""
+        seen = {}
+        saved = CAL.measure
+        CAL.measure = lambda args, ids, start, say, specs=(): seen.setdefault("args", list(args)) and {}
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                import strata_tokenizer as ST
+                t = Path(d)
+                toks = [ST.BYTE_TO_UNICODE[b] for b in range(256)] + ["ab", "<|im_start|>", "<|im_end|>", "<think>",
+                                                                     "</think>"]
+                (t / "vocab.json").write_text(json.dumps({s: i for i, s in enumerate(toks)}))
+                (t / "merges.txt").write_text("a b", encoding="utf-8")
+                (t / "token_type.json").write_text(json.dumps([1] * 257 + [3, 3, 4, 4]))
+                CAL.run({"tokenizer": d, "args": BASE, **cfg}, start_engine=lambda a: None, specs=())
+        finally:
+            CAL.measure = saved
+        return seen["args"]
+
+    def test_layer_split_config_is_measured_split(self):
+        # 0.1.21: a config with several GPUs runs the layer split, and the calibration measures that setup
+        self.assertEqual(self.base_args_of({}), BASE)
+        self.assertEqual(self.base_args_of({"gpu": 1}), BASE)
+        self.assertEqual(self.base_args_of({"gpu": [0, 2]}), BASE + ["--layer-split", "auto"])
+        self.assertEqual(self.base_args_of({"gpu": "0,2", "layer_split": "18"}), BASE + ["--layer-split", "18"])
+
 
 class SetupIntegration(unittest.TestCase):
     def setUp(self):

@@ -145,7 +145,14 @@ def run(cfg: dict, say=print, start_engine=None, specs=None) -> dict:
     tok = ST.Tokenizer(toks, (tpath / "merges.txt").read_text(encoding="utf-8").split("\n"),
                        json.loads((tpath / "token_type.json").read_text()))
     ids_list = [chat_ids(tok, p) for p in PROMPTS]
-    return measure(cfg["args"], ids_list, start_engine, say, specs=specs)
+    # the engine as the server starts it: with several GPUs in the config, the layer split across them (0.1.21), so
+    # the settings are measured on the setup they will run on
+    base = list(cfg["args"])
+    gpus = cfg.get("gpu")
+    if isinstance(gpus, (list, tuple)) or (isinstance(gpus, str) and "," in gpus):
+        from serve.server import engine_args
+        base = engine_args(cfg)
+    return measure(base, ids_list, start_engine, say, specs=specs)
 
 
 def measure(base_args: list[str], ids_list, start_engine, say=print, specs=()) -> dict:
