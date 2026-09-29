@@ -9,7 +9,86 @@ numéros de ligne renvoient à ce commit.*
 > - l'échantillonnage hors `--serve` (section B11).
 >
 > Couvert en partie par `setup --calibrate` (`09bff3f`) et la PR #44 : le réglage de `--pcie-frac` et de
-> `--spec-min-p` (section 7). Tout le reste de ce rapport s'applique toujours à la 0.1.20.
+> `--spec-min-p` (section 7). Tout le reste de ce rapport s'appliquait toujours à la 0.1.20 ; ce qui en a été fait
+> depuis est dans la section suivante. Le texte du rapport, lui, décrit le code de 0.1.18 et n'est pas réécrit.
+
+## État des constats (branche `perf/all`, fusionnée dans `main`)
+
+*Mis à jour après la fusion du moteur amont 0.1.21.* Chaque constat de ce rapport a été ouvert comme issue sur
+[gputier/StrataGP](https://github.com/gputier/StrataGP/issues) (#2 à #54, titre préfixé par son code), puis traité
+dans l'un des seize lots décrits dans [`docs/PERF-CHANGES.md`](PERF-CHANGES.md) (un document par lot dans
+[`docs/perf/`](perf/)). **53 issues, 52 traitées** (45 faites, 7 partielles), 1 non faite. Rien n'a encore tourné sur
+un GPU : « fait » veut dire écrit, compilé et testé sur CPU, pas mesuré sur GPU. La dernière colonne de
+[`PERF-CHANGES.md`, section 1](PERF-CHANGES.md#1-les-issues-une-par-ligne) donne pour chacun ce qui est actif par
+défaut et l'interrupteur exact ; la [section 4.3](PERF-CHANGES.md#43-issues-partielles) dit ce qui manque aux
+partiels.
+
+**Corrigé par l'amont lui-même (Niko1221/Strata), donc sans issue ni lot ici :**
+- **0.1.19** (`a49e810`) : **B1** (historique de pénalités, une ligne par token de fenêtre), **B3** (`top_k` 0 ou
+  supérieur à 64 vaut 64, toutes les lignes écrites) et l'échantillonnage hors `--serve` (section B11, deuxième
+  point). `setup --calibrate` (`09bff3f`) règle `--pcie-frac` et `--spec-min-p`, ce qui couvre la piste « re-régler
+  `--pcie-frac` » de la section 7 (S2).
+- **0.1.21** (`3801f86`) : sa propre correction de CMake pour T1 (`-DSTRATA_BUILD_TESTS=ON` sans le dossier
+  `tests/`), qui remplace celle que `perf/base` (`b858f9b`) avait faite ; c'est la version de l'amont qui est gardée.
+
+Restent sans issue, par choix : le balayage CLOCK de `kv_stream.cu` (section B11 : cas impossible aujourd'hui) et le
+non-déterminisme du glouton avec le cache adaptatif (déjà documenté par le projet).
+
+| Code | Issue | Constat | État | Lot |
+|---|---|---|---|---|
+| B2 | [#2](https://github.com/gputier/StrataGP/issues/2) | s_gemv_q8_split_kernel : return avant __syncthreads (comportement indéfini latent) | fait | `correctness` |
+| B4 | [#3](https://github.com/gputier/StrataGP/issues/3) | RoPE natif en fast-math : précision de phase aux grandes positions (non testée) | fait | `correctness` |
+| B5 | [#4](https://github.com/gputier/StrataGP/issues/4) | Deux quantificateurs Q8_1 compilés différemment (IEEE vs fast-math) | partiel | `iq-kernels` |
+| B6 | [#5](https://github.com/gputier/StrataGP/issues/5) | Softplus différent entre le GDN fusionné et le pré-traitement natif | fait | `correctness` |
+| B7 | [#6](https://github.com/gputier/StrataGP/issues/6) | Prefill : conversions FP16 sans écrêtage (risque d'inf/NaN) | fait | `prefill-kernels` |
+| B8 | [#7](https://github.com/gputier/StrataGP/issues/7) | Routeur : expf précis au prefill, fast-math au décodage ; NaN masqués | fait | `prefill-kernels` |
+| B9 | [#8](https://github.com/gputier/StrataGP/issues/8) | Tests de parité manquants sur des kernels de production | fait | `correctness` |
+| B10 | [#9](https://github.com/gputier/StrataGP/issues/9) | Étalon de qualité du prefill suspect : KL 0,33 entre morceaux de 6144 et 8192 | fait | `correctness` |
+| B11 | [#10](https://github.com/gputier/StrataGP/issues/10) | --spec sans --mtp remplit les fenêtres de token 0 | fait | `correctness` |
+| B13 | [#11](https://github.com/gputier/StrataGP/issues/11) | expert_pool_dispatch_multi : tableaux fixes kind[128]/distinct[128]/dma_src[64] sans garde | fait | `cpu` |
+| B14 | [#12](https://github.com/gputier/StrataGP/issues/12) | qsa_decode_attn : pas de garde page < 0 si le streaming KV déborde | fait | `qsa-longctx` |
+| B15 | [#13](https://github.com/gputier/StrataGP/issues/13) | bf16_from_f32 transforme NaN en -0 | fait | `correctness` |
+| T1 | [#14](https://github.com/gputier/StrataGP/issues/14) | Les tests de parité ne compilent pas : add_subdirectory(tests) sur un dossier absent | fait | amont 0.1.21 (`3801f86`), après `perf/base` (`b858f9b`) |
+| O1 | [#15](https://github.com/gputier/StrataGP/issues/15) | Sortir les lectures n-gram (PLE) du chemin critique de chaque fenêtre | partiel | `ple-io` |
+| O2 | [#16](https://github.com/gputier/StrataGP/issues/16) | Supprimer les allers-retours hôte↔GPU du tour spéculatif | fait | `round-sync` |
+| O3 | [#17](https://github.com/gputier/StrataGP/issues/17) | Kernel groupé des experts VRAM : conflits de banques 8-way + somme hx recalculée | partiel | `grouped-experts` |
+| O3b | [#18](https://github.com/gputier/StrataGP/issues/18) | native_expert_grouped / iq_mmvq : grilles IQ re-décodées pour chaque colonne | fait | `iq-kernels` |
+| O4 | [#19](https://github.com/gputier/StrataGP/issues/19) | Réduire le nombre de nœuds du graphe de fenêtre (lots, fusions, PDL) | partiel | `window-batching` |
+| O5 | [#20](https://github.com/gputier/StrataGP/issues/20) | Sampler non glouton : top-k en O(k²·V) sur un SM + fin FP64 calculée par 1024 threads | fait | `sampler` |
+| O6 | [#21](https://github.com/gputier/StrataGP/issues/21) | Contexte long : indexeur QSA en FP32 relu à chaque requête | fait | `qsa-longctx` |
+| O6b | [#22](https://github.com/gputier/StrataGP/issues/22) | block_topk_kernel : un seul bloc, lectures non coalescées, atomiques disputées | fait | `qsa-longctx` |
+| O6c | [#23](https://github.com/gputier/StrataGP/issues/23) | qsa_decode_attn : lectures V sérielles, pas de recouvrement, 66 blocs | fait | `qsa-longctx` |
+| O6d | [#24](https://github.com/gputier/StrataGP/issues/24) | Pas/position QSA recopiés depuis l'hôte à chaque couche (22 petits kernels par token) | fait | `qsa-small` |
+| O6e | [#25](https://github.com/gputier/StrataGP/issues/25) | QSA : norme, RoPE, FWHT, quantification et ajout KV en lancements séparés | fait | `qsa-small` |
+| O7 | [#26](https://github.com/gputier/StrataGP/issues/26) | Grilles calibrées pour 48 SM : sous-remplissage sur RTX 5090 (170 SM) | fait | `grids` |
+| O8 | [#27](https://github.com/gputier/StrataGP/issues/27) | Pool CPU : run_split déséquilibré (20 tâches sur 6 threads) | fait | `cpu` |
+| O8b | [#28](https://github.com/gputier/StrataGP/issues/28) | Arène d'experts Linux en pages de 4 Ko sans MADV_HUGEPAGE | fait | `cpu` |
+| O8c | [#29](https://github.com/gputier/StrataGP/issues/29) | Noyau CPU Q2_0 : prélecture des échelles et surcoût par ligne de la projection down | partiel | `cpu` |
+| O8d | [#30](https://github.com/gputier/StrataGP/issues/30) | Noyaux CPU i-quant limités par le calcul (~5 Go/s par cœur) | fait | `cpu` |
+| O9 | [#31](https://github.com/gputier/StrataGP/issues/31) | Serveur : détokenisation quadratique (MESURÉ 2,2 ms/token à 16K) | fait | `server-tools` |
+| O9b | [#32](https://github.com/gputier/StrataGP/issues/32) | Serveur : conversation entière re-tokenisée à chaque requête (BPE Python sans cache) | fait | `server-tools` |
+| O9c | [#33](https://github.com/gputier/StrataGP/issues/33) | Changer le niveau de réflexion relit toute la conversation | partiel | `server-tools` |
+| O9d | [#34](https://github.com/gputier/StrataGP/issues/34) | chat.py et clients OpenAI : la réutilisation « live » échoue (réflexion non renvoyée) | fait | `server-tools` |
+| O9e | [#35](https://github.com/gputier/StrataGP/issues/35) | Images WebP/TIFF re-normalisées à chaque tour | fait | `server-tools` |
+| P1 | [#36](https://github.com/gputier/StrataGP/issues/36) | Prefill MoE : synchronisation hôte par couche + ~6 appels CUDA par expert | fait | `prefill-host` |
+| P2 | [#37](https://github.com/gputier/StrataGP/issues/37) | Prefill gdn_conv : filtre FIR exécuté comme une récurrence série sur 8192 tokens | fait | `prefill-kernels` |
+| P3 | [#38](https://github.com/gputier/StrataGP/issues/38) | Prefill gdn_rec_kernel : 48 blocs, ~5 barrières par token | fait | `prefill-kernels` |
+| P4 | [#39](https://github.com/gputier/StrataGP/issues/39) | Prefill : projections denses en FP16 cuBLAS au lieu de MMQ int8 | fait | `prefill-dense` |
+| P5 | [#40](https://github.com/gputier/StrataGP/issues/40) | Prefill : native_qsa_indexer_append lancé une fois par token (~98 000 lancements par morceau) | fait | `prefill-host` |
+| P6 | [#41](https://github.com/gputier/StrataGP/issues/41) | Prefill : attention QSA faite par le kernel de décodage, par lots de 32 requêtes | partiel | `prefill-dense` |
+| P7 | [#42](https://github.com/gputier/StrataGP/issues/42) | Re-remplissage bloquant des emplacements prêtés après chaque prompt | fait | `prefill-host` |
+| P8 | [#43](https://github.com/gputier/StrataGP/issues/43) | Prefill : chaîne GR élément par élément (~290 Go de trafic par morceau) | fait | `prefill-kernels` |
+| E1 | [#44](https://github.com/gputier/StrataGP/issues/44) | Combinaison MoE : k lignes relues sur PCIe dont les lignes GPU nulles, 3 kernels | fait | `window-batching` |
+| E2 | [#45](https://github.com/gputier/StrataGP/issues/45) | Points de reprise de conversation : copies synchrones vers des vecteurs paginables | fait | `prefill-host` |
+| E3 | [#46](https://github.com/gputier/StrataGP/issues/46) | Chercheur de suffixe reconstruit de zéro à chaque requête | fait | `prefill-host` |
+| E4 | [#47](https://github.com/gputier/StrataGP/issues/47) | Table RoPE FP64 allouée (64 Mio à 262K) mais inutilisée en mode --native | fait | `qsa-small` |
+| E5 | [#48](https://github.com/gputier/StrataGP/issues/48) | Démarrage : verify_slot relit chaque emplacement du profil en entier | fait | `prefill-host` |
+| E6 | [#49](https://github.com/gputier/StrataGP/issues/49) | make_profile.py : les traces ne changent rien au profil livré | fait | `server-tools` |
+| S1 | [#50](https://github.com/gputier/StrataGP/issues/50) | Mesurer : fenêtre spéculative plus longue (--spec 5/6) sur RTX 5090 | fait | `server-tools` |
+| S3 | [#51](https://github.com/gputier/StrataGP/issues/51) | Évaluer : prédire les experts de la couche suivante pour lancer leurs copies en avance | fait | `research` |
+| S4 | [#52](https://github.com/gputier/StrataGP/issues/52) | Évaluer : meilleure quantification du brouillon MTP (taux d'acceptation) | fait | `server-tools` |
+| S5 | [#53](https://github.com/gputier/StrataGP/issues/53) | Évaluer : état GDN en BF16 (moitié moins de trafic) | fait | `research` |
+| S6 | [#54](https://github.com/gputier/StrataGP/issues/54) | Évaluer : prefill couche par couche (chaque expert diffusé une fois par prompt) | non fait | — |
 
 ## Ce qu'il faut retenir
 

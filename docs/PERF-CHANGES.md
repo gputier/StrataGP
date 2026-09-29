@@ -98,6 +98,7 @@ Dernière colonne : ce qui est actif sans rien passer, et l'option exacte pour r
 
 ## 2. Tous les interrupteurs
 
+La même liste, en anglais et pour l'utilisateur, est dans [`DETAILS.md`](DETAILS.md#engine-switches-stratagp).
 Sauf mention contraire, une variable est lue une fois par processus ; `=1` (toute valeur non vide autre que `0`)
 l'active ; un graphe CUDA déjà capturé garde son choix. Sous Windows (`cmd`) : `set VAR=1` puis la commande.
 
@@ -173,6 +174,9 @@ l'active ; un graphe CUDA déjà capturé garde son choix. Sous Windows (`cmd`) 
 |---|---|---|---|
 | `STRATA_MTP_CHAIN_CHECK=N` | 0 | compare la chaîne en un graphe et l'ancien chemin sur N tours (double le coût du brouillon) | round-sync |
 | `STRATA_PREFILL_TIMING=1` | absent | temps GPU du prompt par phase (dont « dense proj ») et par morceau | prefill-dense |
+| `STRATA_DBG_NAN=1` | absent | signale les premières valeurs non finies (MoE du prompt, état laissé par le prompt, tête de sortie) | prefill-kernels |
+| `STRATA_STATE_HASH=1` | absent | hash de l'état du moteur après chaque requête (A/B en mode serveur ; sous la répartition, session de CUDA0 seulement) | prefill-host, round-sync |
+| `STRATA_TOKENIZER=<dossier>` | absent | tokenizer pour les tests de `serve/test_server.py` qui en demandent un (sinon `STRATA_GGUF_PY`) | server-tools |
 | `--dump-routing FICHIER` | absent | trace du routage, fenêtres de vérification comprises (tokens validés seulement) | research |
 | `--recall-reasoning` / `"recall_reasoning": true` / `STRATA_RECALL_REASONING=1` | absent | le serveur réinjecte la réflexion qu'un client n'a pas renvoyée | server-tools |
 | `chat.py --drop-thinking` | absent | `chat.py` ne renvoie plus la réflexion (ancien comportement) | server-tools |
