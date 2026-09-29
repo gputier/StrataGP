@@ -17,8 +17,9 @@ numéros de ligne renvoient à ce commit.*
 *Mis à jour après la fusion du moteur amont 0.1.21.* Chaque constat de ce rapport a été ouvert comme issue sur
 [gputier/StrataGP](https://github.com/gputier/StrataGP/issues) (#2 à #54, titre préfixé par son code), puis traité
 dans l'un des seize lots décrits dans [`docs/PERF-CHANGES.md`](PERF-CHANGES.md) (un document par lot dans
-[`docs/perf/`](perf/)). **53 issues, 52 traitées** (45 faites, 7 partielles), 1 non faite. Rien n'a encore tourné sur
-un GPU : « fait » veut dire écrit, compilé et testé sur CPU, pas mesuré sur GPU. La dernière colonne de
+[`docs/perf/`](perf/)). **53 issues, 52 traitées** (45 faites, 7 partielles), 1 non faite. « Fait » veut dire écrit,
+compilé et testé sur CPU ; la première exécution sur une RTX 5090, le 29/09/2026, est dans
+[`PERF-CHANGES.md`, section 6](PERF-CHANGES.md#6-première-exécution-sur-gpu-rtx-5090-29092026). La dernière colonne de
 [`PERF-CHANGES.md`, section 1](PERF-CHANGES.md#1-les-issues-une-par-ligne) donne pour chacun ce qui est actif par
 défaut et l'interrupteur exact ; la [section 4.3](PERF-CHANGES.md#43-issues-partielles) dit ce qui manque aux
 partiels.

@@ -62,24 +62,28 @@ both. A change that **alters the numbers**, even slightly (lower precision, anot
 and has to be turned on (`--idx-fp16`, `--prefill-dense-mmq`, `--gdn-state-bf16` and a few variables). All the
 switches are listed in [docs/DETAILS.md](docs/DETAILS.md#engine-switches-stratagp).
 
-**Not yet validated on a GPU - please read.** The machine these changes were made on has no graphics card. All the
-GPU code compiles (CUDA 13.0) and the CPU and Python tests pass, but **none of these GPU changes has run on a
-graphics card yet**, on one GPU or on several (the layer split with the 16 packages is designed to work card by card,
-[docs/PERF-CHANGES.md, section 5](docs/PERF-CHANGES.md#5-répartition-des-couches-sur-plusieurs-gpu-moteur-0121), but
-is equally unmeasured). So the gains below are **estimates**, not measurements:
+**First GPU run: one RTX 5090, Windows, 29 September 2026.** The changes were written on a machine without a
+graphics card; they have now run on one RTX 5090 (Ryzen 9 9950X3D, 128 GB, IQ3_S, 262K context, greedy, 256 tokens,
+upstream `f1b1d96` built with the same compiler as the reference). Several GPUs have still not been tried. Measured,
+mean of 3 runs:
 
-| What | Expected gain | Status |
-| --- | --- | --- |
-| Writing answers, RTX 5090 | roughly **+20-40%** | estimate from the audit, to be confirmed |
-| Reading your prompt | roughly **+10-20%** | estimate from the audit, to be confirmed |
-| CPU expert kernel (Q2_0, prefetch) | **+25% to +88%** on the kernel alone | measured on an Intel VM only |
-| CPU i-quant kernels (IQ2/IQ3) | **+14% to +130%** on the kernel alone (one 3-thread case slower) | measured on an Intel VM only |
+| What | Upstream | StrataGP | Gain |
+| --- | ---: | ---: | ---: |
+| Writing answers (3 prompts: 32, 2.5K, 23K tokens) | 115 / 132 / 140 tok/s | 122 / 151 / 155 tok/s | **+5% to +15%** |
+| Reading your prompt, 2.5K tokens | 1,397 tok/s | 1,982 tok/s | **+42%** |
+| Reading your prompt, 23K tokens | 2,074 tok/s | 3,090 tok/s | **+49%** |
 
-The CPU numbers are for the kernel by itself; on a card that holds most experts in VRAM they weigh little in the
-total. The procedure to validate everything on an RTX 5090 (parity tests, then an A/B that must give the same tokens
-with and without the `STRATA_OLD_*` switches, then each opt-in one by one) is in
-[docs/PERF-CHANGES.md, section 3](docs/PERF-CHANGES.md#3-validation-sur-la-rtx-5090). Until that is done, if something
-misbehaves, the `STRATA_OLD_*` switches bring back upstream's code path.
+The audit had estimated +20-40% for writing and +10-20% for reading; it is the other way round. The CPU kernel
+numbers (+25% to +88% for Q2_0, +14% to +137% for IQ2/IQ3) were measured on an Intel VM, for the kernel alone.
+
+With the expert cache held at the same size in both engines, two of the three prompts give exactly upstream's
+tokens; the third diverges at its 229th token, with or without the `STRATA_OLD_*` switches. The run also found and
+fixed a crash of the prompt path when it has its own buffers (the multi-GPU case). Details and what is left:
+[docs/PERF-CHANGES.md, section 6](docs/PERF-CHANGES.md#6-première-exécution-sur-gpu-rtx-5090-29092026).
+
+**The ready-made engine is upstream's.** `START-HERE.bat` downloads Niko1221's release build, which has none of
+these changes; only the server and tools of StrataGP apply. To run StrataGP's engine, compile it:
+`START-HERE.bat --setup --build`.
 
 
 ## How fast is it?

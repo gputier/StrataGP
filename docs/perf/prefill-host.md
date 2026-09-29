@@ -219,7 +219,8 @@ diff <(grep '^output' new.txt) <(grep '^output' old.txt) && echo "tokens identiq
 #   STRATA_OLD_IDX_APPEND=1 seul (#40), STRATA_OLD_MOE_GROUP=1 seul (#36), STRATA_PREFILL_COALESCE=0 (copies)
 
 # la tenue de l'anneau de la marche par groupe (issue_runs / flush / événements) n'a pas de test unitaire : elle
-# n'est couverte que par cette comparaison, À FAIRE AVANT LA FUSION.  Copies fusionnées ou non, et un anneau
+# n'est couverte que par cette comparaison, pas encore faite (la fusion est faite ; le 29/09/2026 l'A/B de bout en
+# bout sur RTX 5090 a trouvé les copies 2D sur tampons propres, PERF-CHANGES section 6.5).  Copies fusionnées ou non, et un anneau
 # plus petit que le nombre d'experts diffusés d'une couche (~480 à 8 192 tokens), séries à cheval sur deux lots
 # (une variable vide n'est pas « absente » : `env ${ring:+...}` ne la pose que si elle a une valeur) :
 for ring in "" 16 40; do for co in 1 0; do

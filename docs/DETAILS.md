@@ -496,14 +496,15 @@ the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
 
 StrataGP's performance and precision changes ([README](../README.md#what-stratagp-adds),
 [PERF-CHANGES.md](PERF-CHANGES.md)) follow one rule: a change that gives bit-identical results is **on by default** and
-has a switch that brings back upstream's code; a change that alters the numbers is **off by default** (opt-in). None
-of them has run on a GPU yet: see the validation procedure in
-[PERF-CHANGES.md, section 3](PERF-CHANGES.md#3-validation-sur-la-rtx-5090) before trusting the defaults, and use the
-`STRATA_OLD_*` switches below if something misbehaves.
+has a switch that brings back upstream's code; a change that alters the numbers is **off by default** (opt-in). They
+have run on one RTX 5090 so far (results in
+[PERF-CHANGES.md, section 6](PERF-CHANGES.md#6-première-exécution-sur-gpu-rtx-5090-29092026)), not yet on several
+GPUs; use the `STRATA_OLD_*` switches below if something misbehaves.
 
 **How to set them.** Engine flags go in the `"args"` list of `strata-<model>.json` (the engine's command line), then
 restart. Environment variables are passed on to the engine the server starts and are read once when it starts; `=1`
-(any non-empty value other than `0`) turns them on. Windows (`cmd`): `set STRATA_OLD_WINDOW=1`, then
+turns them on; to turn one off, remove it (`=0` is not enough everywhere: several are read by presence alone, so
+`STRATA_OLD_MOE_GROUP=0` turns the old path on). Windows (`cmd`): `set STRATA_OLD_WINDOW=1`, then
 `START-HERE.bat` in the same window; Linux: `STRATA_OLD_WINDOW=1 ./setup.sh`. A CUDA graph that is already captured
 keeps its choice.
 
@@ -525,7 +526,7 @@ The layer split flags (`--layer-split K1[,K2]|auto`, `--split-device`, setup's `
 described in [MULTI_GPU.md](MULTI_GPU.md). Every StrataGP change is designed to work card by card under the split,
 and the switches below apply to every card; what each package does there is in
 [PERF-CHANGES.md, section 5](PERF-CHANGES.md#5-répartition-des-couches-sur-plusieurs-gpu-moteur-0121) (not run on
-GPUs either). Under the split, `--calibrate` leaves the PCIe share to the engine's per-card probe
+several GPUs yet). Under the split, `--calibrate` leaves the PCIe share to the engine's per-card probe
 ([above](#windows)).
 
 ### Back to upstream's code (the defaults are bit-identical)

@@ -29,11 +29,11 @@ rapide) : c'est ce que télécharge le lien du README.
 | `correctness` | [perf/correctness.md](perf/correctness.md) | #2, #3, #5, #8, #9, #10, #13 |
 | `research` | [perf/research.md](perf/research.md) | #51, #53 |
 
-**Rien n'a tourné sur un GPU.** La machine de développement n'en a pas : tout le code GPU est compilé (CUDA 13.0,
-sm_120) mais aucun kernel n'a été exécuté. Les tests CPU et Python passent (voir la fin). Règle suivie par tous les
-lots : ce qui est identique au bit près par construction est **actif par défaut** avec une variable
-`STRATA_OLD_*` (ou équivalente) pour l'A/B ; ce qui change des valeurs est **désactivé par défaut** (opt-in). La
-procédure de la section 3 est donc à faire sur la RTX 5090 avant de se fier aux défauts.
+**Première exécution sur GPU le 29/09/2026**, sur une seule RTX 5090 sous Windows : résultats, correctifs et reste
+à faire en [section 6](#6-première-exécution-sur-gpu-rtx-5090-29092026). Le code a été écrit sur une machine sans
+GPU. Règle suivie par tous les lots : ce qui est identique au bit près par construction est **actif par défaut**
+avec une variable `STRATA_OLD_*` (ou équivalente) pour l'A/B ; ce qui change des valeurs est **désactivé par
+défaut** (opt-in). Plusieurs GPU n'ont pas encore été essayés.
 
 ## 1. Les issues, une par ligne
 
@@ -99,8 +99,9 @@ Dernière colonne : ce qui est actif sans rien passer, et l'option exacte pour r
 ## 2. Tous les interrupteurs
 
 La même liste, en anglais et pour l'utilisateur, est dans [`DETAILS.md`](DETAILS.md#engine-switches-stratagp).
-Sauf mention contraire, une variable est lue une fois par processus ; `=1` (toute valeur non vide autre que `0`)
-l'active ; un graphe CUDA déjà capturé garde son choix. Sous Windows (`cmd`) : `set VAR=1` puis la commande.
+Sauf mention contraire, une variable est lue une fois par processus ; `=1` l'active ; un graphe CUDA déjà capturé
+garde son choix. Pour désactiver, retirer la variable : `=0` ne suffit pas partout, plusieurs sont lues par simple
+présence (`STRATA_OLD_MOE_GROUP=0` active l'ancien chemin), d'autres n'acceptent que `1`. Sous Windows (`cmd`) : `set VAR=1` puis la commande.
 
 ### 2.1 Retour à l'ancien chemin (A/B des défauts identiques au bit près)
 
@@ -317,9 +318,9 @@ son contrôle de précision. Ne pas en activer deux à la fois.
 
 ### 4.1 Général
 
-- **Aucune exécution GPU.** Toutes les affirmations « identique au bit près » reposent sur la construction du code,
-  l'examen du PTX/SASS de CUDA 13.0 et des émulations sur CPU. Un autre `nvcc` peut contracter une expression
-  différemment : la parité GPU (3.3) et l'A/B (3.4) sont le vrai contrôle ; chaque défaut garde son interrupteur.
+- **Écrit sans GPU.** Les affirmations « identique au bit près » reposaient sur la construction du code, l'examen du
+  PTX/SASS de CUDA 13.0 et des émulations sur CPU ; la parité GPU (3.3) et l'A/B (3.4) ont tourné depuis sur une
+  RTX 5090 avec CUDA 13.4 (section 6), sans couvrir un autre `nvcc`. Chaque défaut garde son interrupteur.
 - Gains : tous **ESTIMÉ** ou **HYPOTHÈSE** (chiffres dans chaque document de lot), sauf les mesures CPU de `cpu` et
   `server-tools`.
 - `ple-io` : io_uring par appels système bruts, testé seulement sur Linux 6.18/ext4 (repli automatique sur le pool
@@ -396,7 +397,7 @@ deux étages sur la même carte en partageant tout (le contrôle au bit près de
 **Sur un seul GPU (le défaut), rien ne change** : un seul étage `[0, 48)`, sans passation, et chaque lot se comporte
 exactement comme décrit plus haut. En mode réparti, chaque lot est **conçu pour fonctionner par étage** ; aucun
 n'est désactivé par la fusion. Le tableau décrit la conception et la lecture du code, **pas des mesures** : rien n'a
-encore tourné sur un GPU (voir les limites plus bas). Ce que l'amont désactive lui-même sur plusieurs GPU reste désactivé (images, vecteurs de contrôle,
+encore tourné sur plusieurs GPU (voir les limites plus bas). Ce que l'amont désactive lui-même sur plusieurs GPU reste désactivé (images, vecteurs de contrôle,
 streaming KV, `--expert-cache-remote`, `--mmap-experts`, prêt d'emplacements au prompt, points de reprise au milieu
 du prompt).
 
@@ -420,10 +421,73 @@ du prompt).
 
 Limites propres à cette combinaison, en plus de celles de l'amont :
 - `STRATA_STATE_HASH=1` ne hache que la session de CUDA0.
-- Rien n'a tourné sur plusieurs GPU (ni sur un seul) : à valider sur une paire de cartes avec la procédure de
+- Rien n'a tourné sur plusieurs GPU ([#57](https://github.com/gputier/StrataGP/issues/57)) : à valider sur une paire de cartes avec la procédure de
   l'amont (`--layer-split K --split-device 0` doit donner les mêmes tokens que sans répartition, les défauts de
   `perf/all` actifs puis avec les variables `OLD` de 3.4), puis le même A/B sur deux GPU.
 - Build Turing expérimental de l'amont (`-DSTRATA_EXPERIMENTAL_SM75=ON`, une RTX 20 comme étage) : le moteur de
   `perf/all` compile pour sm_75 (vérifié ici avec `-DCMAKE_CUDA_ARCHITECTURES=75`), sans exécution. Sur sm_75, les
   kernels en cluster de `grids` ne se lancent pas (la vérification à l'exécution répond non, pas GDN d'avant), et
   l'attention QSA préchargée de `qsa-longctx` remplace `cp.async` par des lectures ordinaires.
+
+## 6. Première exécution sur GPU (RTX 5090, 29/09/2026)
+
+Machine : RTX 5090 (170 SM), Ryzen 9 9950X3D, 128 Go, Windows 11, pilote 616.92. Build Windows : MSVC 2022 Build
+Tools et CUDA 13.4, `-DCMAKE_CUDA_ARCHITECTURES=120`, llama.cpp 3cf0325. Référence : l'amont `f1b1d96` compilé de la
+même façon, sans ses tests (sa configuration avec `-DSTRATA_BUILD_TESTS=ON` échoue, `bench/micro/*` n'est pas publié).
+Modèle IQ3_S, fenêtre 262 144, `--kv int8 --kv-resident 32768`, glouton, 256 tokens, `--adapt-every 100000`.
+
+### 6.1 Build
+
+`s2_grouped_parity.cpp` ne compilait pas sous MSVC (`windows.h` atteint par `dequant.hpp` et ses macros `min`/`max`) :
+`NOMINMAX`, comme le reste du code (89e0738).
+
+### 6.2 Tests de parité
+
+53 tests ctest sur 60 passent au premier passage ; `grids_parity` annonce `clusters yes` sur 170 SM. Deux échecs
+venaient des tests eux-mêmes : `qsa_prep_parity` et `moe_group_parity` préparaient leurs tampons par `cudaMemset` et
+des copies sur le flux par défaut, puis lançaient les kernels sur un flux `cudaStreamNonBlocking`, qui n'attend pas
+ce flux. Avec une synchronisation après la préparation (4139d09), les deux passent trois fois sur trois. Les cinq
+autres échecs sont d'environnement : `expert_parity` et `pool_test` lisent `pack/full/experts.bin`, `ple_parity` le
+shard 2 du modèle Q2_0 (seul IQ3_S est installé), et `routing_locality_test` et `logits_kl_test` échouent à importer
+leur module Python sous ce ctest.
+
+### 6.3 Vitesse
+
+Moyenne de 3 passages, `--expert-cache auto --prefill auto` (configuration de production) :
+
+| Prompt | Décodage amont | Décodage StrataGP | Prefill amont | Prefill StrataGP |
+|---|---:|---:|---:|---:|
+| 32 tokens | 115,4 tok/s | 121,5 tok/s | - | - |
+| 2 520 tokens | 132,2 tok/s | 151,4 tok/s | 1 397 tok/s | 1 982 tok/s |
+| 23 019 tokens | 140,1 tok/s | 155,0 tok/s | 2 074 tok/s | 3 090 tok/s |
+
+StrataGP avec toutes les variables `OLD` de 3.4 retombe sur les vitesses de l'amont (114 à 134 tok/s, 1 399 et
+2 039 tok/s). Les suites de tokens comparées divergent tard (6.4), donc le décodage compare des textes voisins.
+
+### 6.4 Identité des sorties
+
+En `--expert-cache auto`, aucune variante ne sort les tokens de l'amont : la taille du cache suit la VRAM libre, qui
+diffère (12 138 emplacements pour l'amont, 12 163 pour StrataGP, 12 129 avec les variables `OLD`), ce qui change la
+part des experts calculée sur le processeur. Avec un pack natif et un profil, `--expert-cache N` n'est qu'un plafond borné par la VRAM
+libre ; `--expert-cache 8000 --prefill 2048` donne le même cache partout (10 452 emplacements). Dans ce cas :
+- 32 et 23 019 tokens : les 256 tokens sont identiques à l'amont, défauts actifs comme variables `OLD` ;
+- 2 520 tokens : StrataGP diverge au 229e token, avec et sans les variables `OLD` (les deux sorties sont identiques
+  entre elles). Un changement que les interrupteurs ne couvrent pas modifie donc un calcul. Non localisé : un pack
+  natif exige `--spec`, et `--dump-logits` n'écrit rien en mode spéculatif.
+
+### 6.5 Défaut trouvé et corrigé : copies 2D du prompt sur des tampons propres
+
+Avec `--no-prefill-borrow`, le prompt plantait dès deux morceaux : `prefill gr_norm_scale: invalid argument` (erreur
+en attente d'un appel précédent). Cause : la marche groupée (#36) regroupe les copies d'experts consécutifs en un
+`cudaMemcpy2DAsync` quand les emplacements de l'anneau sont régulièrement espacés. Sans emprunt, chaque emplacement
+est un `cudaMalloc` séparé, que le pilote a placés à 4 Mio d'écart exact : la copie 2D débordait d'une allocation sur
+la suivante. Correctif (2941022) : le regroupement n'est permis que si l'anneau est découpé dans une seule région.
+Ce cas touche la répartition sur plusieurs GPU, qui impose `--no-prefill-borrow`.
+
+### 6.6 Suivi
+
+- L'écart de 6.4 sur le prompt de 2 520 tokens : [#55](https://github.com/gputier/StrataGP/issues/55).
+- Les autres tests de parité qui lancent sur un flux non bloquant après des `cudaMemset` :
+  [#56](https://github.com/gputier/StrataGP/issues/56).
+- Les options qui changent les valeurs (3.5), le mode serveur et plusieurs GPU :
+  [#57](https://github.com/gputier/StrataGP/issues/57).
