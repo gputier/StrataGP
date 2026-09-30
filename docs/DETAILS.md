@@ -592,10 +592,8 @@ several GPUs yet). Under the split, `--calibrate` leaves the PCIe share to the e
 | `STRATA_IQ512_ONE=1` | unset | One-token IQ experts on the AVX-512 kernel instead of `vec_dot` | cpu |
 | `STRATA_PREFILL_F16_SAT=1` | unset | FP16 values in the prompt path clamped to ±65504 (no inf) | prefill-kernels |
 | `STRATA_PREFILL_ROUTE_DECODE=1` | unset | The prompt's router computed like the decode router | prefill-kernels |
-| `STRATA_ASYNC_REFILL=1` | unset | Lent expert slots refilled in the background after a prompt (the CPU computes those experts meanwhile) | prefill-host |
 | `--prefill-dense-mmq` / `STRATA_PREFILL_DENSE_MMQ=1` | unset | See the flags above | prefill-dense |
 | `STRATA_ROPE_F64=1` | unset | Native RoPE angle computed in FP64 at decode | correctness |
-| `STRATA_SPEC_T1=1` | unset | `--spec` without `--mtp`: one-token windows instead of windows padded with token 0 | correctness |
 | `--gdn-state-bf16` | unset | See the flags above | research |
 
 ### Measurement and checks

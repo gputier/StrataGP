@@ -24,7 +24,7 @@ rapide) : c'est ce que télécharge le lien du README.
 | `cpu` | [perf/cpu.md](perf/cpu.md) | #11, #27, #28, #29, #30 |
 | `server-tools` | [perf/server-tools.md](perf/server-tools.md) | #31 à #35, #49, #50, #52 |
 | `prefill-kernels` | [perf/prefill-kernels.md](perf/prefill-kernels.md) | #6, #7, #37, #38, #43 |
-| `prefill-host` | [perf/prefill-host.md](perf/prefill-host.md) | #36, #40, #42, #45, #46, #48 |
+| `prefill-host` | [perf/prefill-host.md](perf/prefill-host.md) | #36, #40, #45, #46, #48 |
 | `prefill-dense` | [perf/prefill-dense.md](perf/prefill-dense.md) | #39, #41 |
 | `correctness` | [perf/correctness.md](perf/correctness.md) | #2, #3, #5, #8, #9, #10, #13 |
 | `research` | [perf/research.md](perf/research.md) | #51, #53 |
@@ -49,7 +49,7 @@ Dernière colonne : ce qui est actif sans rien passer, et l'option exacte pour r
 | #7 | [B8] Routeur : expf précis au prefill, fast-math au décodage ; NaN masqués | prefill-kernels | fait | **désactivé** : `STRATA_PREFILL_ROUTE_DECODE=1` ; comptage NaN avec `STRATA_DBG_NAN=1` |
 | #8 | [B9] Tests de parité manquants sur des kernels de production | correctness | fait | tests ctest (voir section 3) |
 | #9 | [B10] Étalon de qualité du prefill suspect : KL 0,33 entre morceaux de 6144 et 8192 | correctness | fait | outil `tools/prefill_chunk_check.py` |
-| #10 | [B11] --spec sans --mtp remplit les fenêtres de token 0 | correctness | fait | **désactivé** : `STRATA_SPEC_T1=1` (fenêtres d'un token sans brouillon) |
+| #10 | [B11] --spec sans --mtp remplit les fenêtres de token 0 | correctness | fait | actif : sans brouillon, la fenêtre est d'un token (décodage x1,6 à x1,9 sur RTX 5090 ; tokens différents de l'ancien remplissage sur 2 prompts sur 3) |
 | #11 | [B13] expert_pool_dispatch_multi : tableaux fixes kind[128]/distinct[128]/dma_src[64] sans garde | cpu | fait | actif (gardes et `static_assert`), aucune option |
 | #12 | [B14] qsa_decode_attn : pas de garde page < 0 si le streaming KV déborde | qsa-longctx | fait | actif (correctif), aucune option |
 | #13 | [B15] bf16_from_f32 transforme NaN en -0 | correctness | fait | actif (identique hors NaN), aucune option |
@@ -81,7 +81,7 @@ Dernière colonne : ce qui est actif sans rien passer, et l'option exacte pour r
 | #39 | [P4] Prefill : projections denses en FP16 cuBLAS au lieu de MMQ int8 | prefill-dense | fait | **désactivé** : `--prefill-dense-mmq` ou `STRATA_PREFILL_DENSE_MMQ=1` |
 | #40 | [P5] Prefill : native_qsa_indexer_append lancé une fois par token (~98 000 lancements par morceau) | prefill-host | fait | actif ; `STRATA_OLD_IDX_APPEND=1` |
 | #41 | [P6] Prefill : attention QSA faite par le kernel de décodage, par lots de 32 requêtes | prefill-dense | partiel | mesure seulement : `STRATA_PREFILL_TIMING=1` |
-| #42 | [P7] Re-remplissage bloquant des emplacements prêtés après chaque prompt | prefill-host | fait | **désactivé** : `STRATA_ASYNC_REFILL=1` |
+| #42 | [P7] Re-remplissage bloquant des emplacements prêtés après chaque prompt | prefill-host | retiré | le re-remplissage groupé en une attente de l'amont reste le chemin unique : le re-remplissage asynchrone ne gagnait rien (0 à 1,3 % sur le premier token, décodage neutre à négatif) et sortait d'autres tokens (mesuré sur RTX 5090 le 30/09/2026) |
 | #43 | [P8] Prefill : chaîne GR élément par élément (~290 Go de trafic par morceau) | prefill-kernels | fait | actif ; `STRATA_OLD_PREFILL_GR=1` |
 | #44 | [E1] Combinaison MoE : k lignes relues sur PCIe dont les lignes GPU nulles, 3 kernels | window-batching | fait | actif ; `STRATA_OLD_WINDOW_COMBINE=1`, `STRATA_OLD_TOKEN_COMBINE=1` ; opt-in `STRATA_YMISS_WC=1` |
 | #45 | [E2] Points de reprise de conversation : copies synchrones vers des vecteurs paginables | prefill-host | fait | actif ; `STRATA_OLD_CKPT=1` |
@@ -162,10 +162,8 @@ présence (`STRATA_OLD_MOE_GROUP=0` active l'ancien chemin), d'autres n'accepten
 | `STRATA_IQ512_ONE=1` | absent | experts IQ à un token sur le noyau AVX-512 au lieu de `vec_dot` | cpu |
 | `STRATA_PREFILL_F16_SAT=1` | absent | images FP16 du prompt écrêtées à ±65 504 | prefill-kernels |
 | `STRATA_PREFILL_ROUTE_DECODE=1` | absent | routeur du prompt = celui du décodage | prefill-kernels |
-| `STRATA_ASYNC_REFILL=1` | absent | re-remplissage asynchrone des emplacements prêtés (experts sur CPU en attendant) | prefill-host |
 | `--prefill-dense-mmq` / `STRATA_PREFILL_DENSE_MMQ=1` | absent | projections denses du prompt en MMQ int8 | prefill-dense |
 | `STRATA_ROPE_F64=1` | absent | angle RoPE natif en FP64 au décodage (la préparation QSA fusionnée cède alors la place aux lancements séparés) | correctness |
-| `STRATA_SPEC_T1=1` | absent | `--spec` sans brouillon : fenêtres d'un token | correctness |
 | `--gdn-state-bf16` | absent | état récurrent GDN stocké en BF16 (exige le pas GDN natif fusionné) | research |
 
 ### 2.3 Mesure, contrôle et outils
@@ -303,12 +301,10 @@ son contrôle de précision. Ne pas en activer deux à la fois.
 | `--prefill-dense-mmq` | `prefill_dense_mmq_parity` (sous memcheck) ; KL forcé sur les logits du prompt ; `STRATA_PREFILL_TIMING=1` pour « dense proj » | KL négligeable et prefill plus rapide |
 | `STRATA_PREFILL_F16_SAT=1` | seules les anciennes valeurs ±inf changent : `STRATA_DBG_NAN=1` ne doit plus rien signaler | toujours sûr ; à passer par défaut après vérification |
 | `STRATA_PREFILL_ROUTE_DECODE=1` | `tools/prefill_chunk_check.py`, KL prompt | KL plus bas entre prefill et décodage |
-| `STRATA_ASYNC_REFILL=1` | TTFT en mode serveur ; tokens peuvent différer (experts sur CPU le temps des copies) | TTFT meilleur, qualité inchangée (KL) |
 | `STRATA_IQ_FASTDIV=1` | `iq_multi_parity` ; KL | écart de #4 résorbé sans perte |
 | `STRATA_CPU_INT_CORR=1`, `STRATA_IQ512_ONE=1` | `pool_test`, KL | gain CPU mesuré (`pool_test --bench`) sans perte |
 | `STRATA_YMISS_WC=1` | tokens identiques (valeurs inchangées) | débit meilleur |
 | `STRATA_ROPE_F64=1` | `rope_parity` ; KL forcé et aiguilles à 128K (voir [perf/correctness.md](perf/correctness.md)) | meilleure précision aux grandes positions |
-| `STRATA_SPEC_T1=1` (sans `--mtp`) | tokens identiques attendus (T = 1 contre T = 4) | tokens identiques et plus rapide |
 | `--gdn-state-bf16` | `gdn_state_bf16_parity` ; `tools/logits_kl.py` sur 4K à 32K tokens ; gain au-delà du bruit | KL négligeable **et** gain mesurable (attendu ≤ 1 %) |
 | `calibrate.py --spec 4,5,6` | - (mesure) | la fenêtre la plus rapide est écrite dans la config |
 | `mtp_pack.py --q2-search wide` | `s2_grouped_parity` (échelles négatives) ; taux d'acceptation par `tools/ab_oneshot.py --variant` | acceptation meilleure |
@@ -348,9 +344,9 @@ Cinq interactions entre lots, dont trois que la fusion git ne signalait pas du t
 4. **`qsa-longctx` × `prefill-host`** : l'ajout de l'indexeur par morceau (#40) n'écrivait pas l'ombre FP16 de
    `--idx-fp16` (#21) ; il l'écrit maintenant comme le kernel par cellule (nouveaux cas dans
    `qsa_indexer_chunk_parity`).
-5. **`round-sync` × `prefill-host`** : avec `STRATA_ASYNC_REFILL=1`, un téléversement asynchrone de `d_res` (#16)
-   pouvait encore être en vol quand le prêt ou le re-remplissage des emplacements réécrit `d_res` de façon
-   synchrone ; les deux attendent maintenant ce téléversement.
+5. **`round-sync` × `prefill-host`** : un téléversement asynchrone de `d_res` (#16) pouvait encore être en vol
+   quand le prêt ou le re-remplissage des emplacements réécrit `d_res` de façon synchrone ; les deux attendent
+   maintenant ce téléversement.
 
 Et, sans changement de code : `window-batching` et `qsa-longctx` touchent tous deux la porte QSA de la fenêtre (la
 porte repliée dans la fusion avec `STRATA_QSA_MERGE_GATE=1` saute la boucle de porte groupée) ; `ple-io` (drapeau P
@@ -413,7 +409,7 @@ du prompt).
 | `cpu` (#11, #27 à #30) | conçu pour | Un seul pool CPU sert tous les étages (le `SplitDrive` de l'amont choisit le plan et le cache de l'étage pour chaque couche). |
 | `server-tools` (#31 à #35, #49, #50, #52) | conçu pour | `server.py` garde les deux : `gpu_list()`/`engine_args()` de l'amont et `recall_reasoning`. **Corrigé à la fusion** : `calibrate.py` lance maintenant le moteur comme le serveur (`engine_args`), donc une configuration à plusieurs GPU est mesurée répartie (auparavant sur sa première carte seule). Sous la répartition, la part PCIe (`--pcie-frac`) **n'est pas mesurée** : une part passée par requête différente de celle du moteur est appliquée à tous les étages, alors que le moteur servi donne à chaque étage après CUDA0 la part sondée sur son propre lien ; aucune valeur mesurée par requête ne correspondrait donc à ce qui tourne. Seuls `--spec-min-p`, `--spec` (sur demande) et `--pool-workers` sont réglés, et `--pcie-frac` reste le choix du moteur (le rapport indique « not measured: layer split »). `ab_oneshot.py` lance le moteur sans `--serve`, donc sur un seul GPU. |
 | `prefill-kernels` (#6, #7, #37, #38, #43) | conçu pour | **Corrigé à la fusion** : le drapeau `STRATA_PREFILL_F16_SAT` est un `__constant__`, écrit maintenant une fois par GPU. La norme GR portée par la dernière écriture (#43) s'arrête à la fin de l'étage. |
-| `prefill-host` (#36, #40, #42, #45, #46, #48) | conçu pour ; #42 sans objet | Marche groupée et indexeur par morceau sur les couches de l'étage ; points de reprise épinglés par un pool par étage (flux sur le GPU de l'étage) ; #42 ne s'applique pas (pas de prêt d'emplacements sur plusieurs GPU) ; #48 ne concerne que le cache de CUDA0. |
+| `prefill-host` (#36, #40, #45, #46, #48) | conçu pour | Marche groupée et indexeur par morceau sur les couches de l'étage ; points de reprise épinglés par un pool par étage (flux sur le GPU de l'étage) ; #48 ne concerne que le cache de CUDA0. |
 | `prefill-dense` (#39, #41) | conçu pour | Le contexte MMQ de chaque chemin de prompt est créé sur son GPU. |
 | `correctness` (#2, #3, #5, #8 à #10, #13) | conçu pour | Réglages du processus ; aucun état par GPU. |
 | `research` (#51, #53) | conçu pour | `--gdn-state-bf16` est fixé avant la création des sessions (chaque étage a l'état BF16) ; `--dump-routing` passe par le `Drive` commun. |

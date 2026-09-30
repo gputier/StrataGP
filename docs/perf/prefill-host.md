@@ -4,7 +4,8 @@
 défaut des copies 2D de la marche groupée (#36) qu'elle a trouvé, sont dans
 [PERF-CHANGES.md, section 6](../PERF-CHANGES.md#6-première-exécution-sur-gpu-rtx-5090-29092026).*
 
-Issues #36 (P1), #40 (P5), #42 (P7), #45 (E2), #46 (E3), #48 (E5) de l'audit (`docs/AUDIT-PERF.md`).
+Issues #36 (P1), #40 (P5), #45 (E2), #46 (E3), #48 (E5) de l'audit (`docs/AUDIT-PERF.md`). L'issue #42 (P7, re-remplissage
+asynchrone des emplacements prêtés) a été retirée : voir [PERF-CHANGES.md](../PERF-CHANGES.md).
 
 Branche `perf/prefill-host`, partie de `perf/base` (b858f9b, moteur 0.1.20). **Aucune mesure GPU n'a été faite** : la
 machine de développement n'a pas de GPU. Tout ce qui touche au GPU a été compilé (sm_120, CUDA 13.0, sans
@@ -21,7 +22,6 @@ développement, pas de la machine cible.
 | #46 E3 | Chercheur de suffixe : effacement paresseux par époque, extension quand la requête prolonge l'historique | **oui** | `STRATA_OLD_SFX_RESET=1` | oui (mêmes propositions) | `suffix_drafter_test` (CPU, **OK ici**) |
 | #45 E2 | Points de reprise : pool de tampons épinglés réutilisés + copies asynchrones sur un flux dédié | **oui** | `STRATA_OLD_CKPT=1` | oui (mêmes octets) | A/B serveur (voir plus bas) |
 | #48 E5 | Remplissage du profil au démarrage mis en file sur un flux (une seule attente) ; relecture du premier **et du dernier** emplacement | **oui** | `STRATA_OLD_PROFILE_FILL=1` | oui (mêmes octets) | la relecture elle-même, au démarrage |
-| #42 P7 | Re-remplissage **asynchrone** des emplacements prêtés au prefill (mécanisme `pending` + événement du cache adaptatif) | **non (opt-in)** | `STRATA_ASYNC_REFILL=1` | **non** (voir #42) | A/B TTFT |
 
 ## #40 (P5) : l'indexeur QSA ajouté par morceau
 
@@ -85,7 +85,7 @@ phase `qsa indexer` de `STRATA_PREFILL_TIMING=1`.
 4. `Prefill::run` synchronise aussi le flux de copie avant de rendre la main, **sur chaque retour** (garde de
    portée : succès, erreur, et `cancelled` quand un STOP arrive entre deux morceaux) : la copie d'un expert non routé n'était
    jamais attendue et atterrissait dans les emplacements empruntés que l'appelant re-remplit ensuite (course
-   théorique déjà présente, nécessaire pour #42).
+   théorique déjà présente).
 
 Appels d'API CUDA par couche MoE (ESTIMÉ, 8 192 tokens, ~480 experts diffusés) : ~3 000 → ~400 (par groupe : une
 attente, un rassemblement, un événement, 2 `memset`, les lancements MMQ ; côté copie : ~1 copie + 1 attente + 1
@@ -165,22 +165,12 @@ commit du dépôt). Le vrai coût du démarrage est le remplissage lui-même : *
 **Gain (HYPOTHÈSE) :** 5 à 15 % du temps de remplissage (l'écart entre deux copies bloquantes), soit ~0,05 à 0,3 s sur
 la 5090. La vérification par échantillonnage/hash demandée n'a pas de sens ici : il n'y a rien à échantillonner.
 
-## #42 (P7) : re-remplissage asynchrone des emplacements prêtés (opt-in)
+## #42 (P7) : re-remplissage asynchrone des emplacements prêtés (retiré)
 
-Avec `STRATA_ASYNC_REFILL=1` :
-
-- **serveur** : `refill()` met les copies en file sur le flux de re-remplissage, enregistre `adapt_ev` et pousse les
-  emplacements dans `pending` ; `apply_pending(false)` (déjà appelé avant chaque fenêtre de décodage, et maintenant
-  aussi avant chaque fenêtre de lecture du prompt) les ré-admet quand les copies ont atterri. Un nouvel emprunt
-  (`lend`) attend d'abord ces copies (`apply_pending(true)`), et `adapt()` ne tourne pas tant que `pending` n'est pas
-  vide ;
-- **ligne de commande** (pack natif, suivi de la boucle spéculative) : les emplacements prêtés sont re-remplis de la
-  même façon au début de la boucle spéculative.
-
-En attendant, le CPU calcule ces experts. **Pourquoi opt-in :** un expert calculé par le CPU arrondit différemment
-de celui calculé par le GPU (`bench/results/2026-09-27-cache-parity`), et le moment où les copies atterrissent
-dépend du minutage : les premières fenêtres ne sont plus reproductibles au bit près. **Gain (ESTIMÉ, audit) :** 0,2 à
-0,5 s de délai avant le premier token par requête.
+Mesuré sur RTX 5090 le 30/09/2026 (IQ3_S, `--mtp --spec 4`, glouton, 256 tokens, prompts de 31, 2 520 et 23 019
+tokens, 3 passages, bras entrelacés) : le re-remplissage groupé en une attente de l'amont attend ses copies 14 à
+102 ms ; l'asynchrone ne gagne que 0 à 38 ms (au plus 1,3 %) sur le premier token, perd 4 à 7 % de décodage sur un
+prompt et sort d'autres tokens dans les 6 cellules. Le chemin groupé de l'amont reste le seul.
 
 ## Tests faits ici (CPU seulement)
 
@@ -246,11 +236,10 @@ for p in p1 p2 p3; do for r in 1 2 3; do
   STRATA_OLD_IDX_APPEND=1 STRATA_OLD_MOE_GROUP=1 STRATA_OLD_PROFILE_FILL=1 \
     ./build/strata $OPTS --tokens-file prompts/$p.ids > ab/old_${p}_$r.txt 2>&1
   ./build/strata $OPTS --tokens-file prompts/$p.ids > ab/new_${p}_$r.txt 2>&1
-  STRATA_ASYNC_REFILL=1 ./build/strata $OPTS --tokens-file prompts/$p.ids > ab/async_${p}_$r.txt 2>&1
 done; done
 # débit de prefill et délai avant le premier token ; durée du remplissage du profil ; re-remplissage
 grep -h "generate: prefill\|pre-filled\|lent slots" ab/*.txt
-# les tokens : identiques entre old et new ; async peut différer légèrement (#42)
+# les tokens : identiques entre old et new
 for p in p1 p2 p3; do diff <(grep '^output' ab/old_${p}_1.txt) <(grep '^output' ab/new_${p}_1.txt) && echo "$p ok"; done
 ```
 
@@ -264,11 +253,11 @@ STRATA_OLD_IDX_APPEND=1 STRATA_OLD_MOE_GROUP=1 STRATA_PREFILL_TIMING=1 ./build/s
 
 À comparer : `qsa indexer`, `host grouping`, `gather`, `wait copy`, et le total.
 
-### Serveur (#45, #46, #42)
+### Serveur (#45, #46)
 
 Lancer le serveur comme d'habitude (`python3 serve/server.py --engine strata --config <config.json>`), une fois avec
-`STRATA_OLD_CKPT=1 STRATA_OLD_SFX_RESET=1` dans l'environnement du moteur, une fois sans, une fois avec
-`STRATA_ASYNC_REFILL=1` ; envoyer la même conversation de 3 tours (premier message long, > 16K tokens). Comparer par
+`STRATA_OLD_CKPT=1 STRATA_OLD_SFX_RESET=1` dans l'environnement du moteur, une fois sans ; envoyer la même
+conversation de 3 tours (premier message long, > 16K tokens). Comparer par
 requête le `prompt_ms` de la ligne `DONE` (ou le délai avant le premier token vu par le client) et, avec
 `STRATA_TRACE=1`, les lignes `refill start` / `prompt done`. Les réponses doivent être identiques entre les deux
 premiers lancements. `STRATA_CKPT_REREAD=1` reste le contrôle des points de reprise (relecture au lieu de
@@ -279,11 +268,11 @@ restauration, même réponse attendue avec `--adapt-swaps 0`).
 - #40 × `qsa-longctx` (#21) : l'ajout par morceau écrit aussi l'ombre FP16 des lignes regroupées et de la clé de
   secours quand `--idx-fp16` est actif, comme le kernel par cellule ; `qsa_indexer_chunk_parity` le vérifie (cas
   « fp16 shadow »).
-- #42 × `round-sync` (#16) : le prêt et le re-remplissage des emplacements attendent le téléversement asynchrone de
+- `round-sync` (#16) : le prêt et le re-remplissage des emplacements attendent le téléversement asynchrone de
   `d_res` encore en vol avant de le réécrire.
 - #45 × `research` (#53) : voir [research.md](research.md). Détail : [../PERF-CHANGES.md](../PERF-CHANGES.md).
 - Répartition des couches (0.1.21, [../MULTI_GPU.md](../MULTI_GPU.md)) : la marche groupée (#36) et l'ajout de
   l'indexeur par morceau (#40) ne parcourent que les couches de l'étage ; les points de reprise épinglés (#45)
   sauvent et restaurent la session de chaque étage par un pool par étage, dont le flux est sur le GPU de l'étage ;
-  #42 ne s'applique pas (sur plusieurs GPU, le prompt ne prête pas d'emplacements) ; #48 ne concerne que le cache de
+  sur plusieurs GPU, le prompt ne prête pas d'emplacements ; #48 ne concerne que le cache de
   CUDA0 (les étages suivants remplissent le leur comme le fait 0.1.21).

@@ -81,7 +81,7 @@ non-déterminisme du glouton avec le cache adaptatif (déjà documenté par le p
 | P4 | [#39](https://github.com/gputier/StrataGP/issues/39) | Prefill : projections denses en FP16 cuBLAS au lieu de MMQ int8 | fait | `prefill-dense` |
 | P5 | [#40](https://github.com/gputier/StrataGP/issues/40) | Prefill : native_qsa_indexer_append lancé une fois par token (~98 000 lancements par morceau) | fait | `prefill-host` |
 | P6 | [#41](https://github.com/gputier/StrataGP/issues/41) | Prefill : attention QSA faite par le kernel de décodage, par lots de 32 requêtes | partiel | `prefill-dense` |
-| P7 | [#42](https://github.com/gputier/StrataGP/issues/42) | Re-remplissage bloquant des emplacements prêtés après chaque prompt | fait | `prefill-host` |
+| P7 | [#42](https://github.com/gputier/StrataGP/issues/42) | Re-remplissage bloquant des emplacements prêtés après chaque prompt | retiré : la version asynchrone ne gagnait rien (mesure du 30/09 sur la 5090) | `prefill-host` |
 | P8 | [#43](https://github.com/gputier/StrataGP/issues/43) | Prefill : chaîne GR élément par élément (~290 Go de trafic par morceau) | fait | `prefill-kernels` |
 | E1 | [#44](https://github.com/gputier/StrataGP/issues/44) | Combinaison MoE : k lignes relues sur PCIe dont les lignes GPU nulles, 3 kernels | fait | `window-batching` |
 | E2 | [#45](https://github.com/gputier/StrataGP/issues/45) | Points de reprise de conversation : copies synchrones vers des vecteurs paginables | fait | `prefill-host` |

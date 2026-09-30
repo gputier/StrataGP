@@ -15,7 +15,7 @@ quand c'était possible, vérifié par une simulation hôte), pas d'une mesure. 
 |---|---|---|---|---|
 | #2 | B2 | `s_gemv_q8_split_kernel` : la barrière avant le `return` des warps sans ligne | **oui** (identique au bit) | aucun (même kernel) |
 | #13 | B15 | `bf16_from_f32` et `f2bf` (dequant_bf16) : un NaN reste un NaN, comme ggml | **oui** (identique hors NaN) | aucun |
-| #10 | B11 | `--spec` sans `--mtp` ni `--spec-oracle` : fenêtres de 1 token, plus de brouillons 0 | **non** (opt-in tant que l'A/B GPU n'a pas confirmé la sortie identique) | `STRATA_SPEC_T1=1` |
+| #10 | B11 | `--spec` sans `--mtp` ni `--spec-oracle` : fenêtres de 1 token, plus de brouillons 0 | **oui** (décodage x1,6 à x1,9 sur RTX 5090 ; 2 prompts sur 3 sortent d'autres tokens que l'ancien remplissage) | aucun |
 | #3 | B4 | `rope_parity` : RoPE natif de 0 à 262 144 contre FP64 ; angle FP64 en option | test ; option **non** | `STRATA_ROPE_F64=1` |
 | #5 | B6 | softplus natif = llama.cpp, vérifié et documenté ; pas de changement de calcul | - | - |
 | #8 | B9 | 5 tests étendus, 4 nouveaux tests GPU, 1 test CPU | - | - |
@@ -56,10 +56,14 @@ de vérification. Maintenant la fenêtre sans brouillon est le dernier token seu
 (`--suffix-draft`) peut toujours l'élargir (la `DraftPolicy` compare alors T = 1 et la fenêtre de recherche). Un
 brouillon rejeté n'émet jamais rien : la sortie ne reste identique que si le résultat d'une ligne de vérification ne
 dépend pas de T au bit près (T = 1 et T = 4 passent par des kernels multi-token et un batching CPU différents). Rien
-ne l'assure dans le code et rien ne l'a vérifié sur GPU : le changement est donc **opt-in**, à passer par défaut
-seulement après l'A/B ci-dessous (tokens identiques). Une ligne sur stderr indique le mode.
+ne l'assure dans le code. Mesuré le 30/09/2026 sur RTX 5090 (IQ3_S, `--spec 4` sans `--mtp`, glouton, 256 tokens,
+config fixe, 3 passages) : les tokens sont identiques à l'ancien remplissage sur p2 (2 520 tokens) et diffèrent sur
+p1 (première divergence au token 94) et p3 (token 42), de façon stable d'un passage à l'autre. Le décodage gagne
+x1,87 (p1), x1,64 (p2) et x1,82 (p3), pour le même nombre de tokens par tour. Ce prix est accepté : c'est le
+**comportement par défaut**, sans interrupteur ; la configuration de production (avec `--mtp`) n'est pas touchée.
+Une ligne sur stderr indique le mode.
 
-- Nouveau comportement : **`STRATA_SPEC_T1=1`** (par défaut : fenêtres complétées de token 0, comme avant).
+- Comportement : fenêtres d'un token sans brouillon, par défaut.
 - Le mode serveur n'est pas concerné (`--serve` exige `--mtp`), ni la configuration de `setup.py` (elle passe `--mtp`).
 - Gain **ESTIMÉ** pour cette configuration (pack natif sans `--mtp`, `--spec 4`) : une fenêtre de 4 coûte ~2,05× une
   fenêtre de 1 (`kShape` de `draft_policy.cpp`, mesuré sur RTX 5070 avec les experts manqués sur CPU) pour le même
@@ -216,14 +220,18 @@ grep -H "tok/s\|tokens per round" ab/*.txt
 
 ### A/B #10 (`--spec` sans `--mtp`)
 
+L'ancien comportement (fenêtres complétées de token 0) n'existe plus dans l'arbre : pour le comparer, construire un
+binaire d'avant ce changement (par exemple `50b5ee4`). Les tokens sont attendus identiques sur p2 et différents sur p1
+et p3 (mesure ci-dessus).
+
 ```bash
 OPTS_NOMTP="<OPTS sans --mtp> --greedy --max-new 256 --adapt-every 100000"
 for p in p1 p2 p3; do for r in 1 2 3; do
-  STRATA_SPEC_T1=1 ./build/strata $OPTS_NOMTP --tokens-file prompts/$p.txt > ab/nomtp_new_${p}_$r.txt 2>&1
-  ./build/strata $OPTS_NOMTP --tokens-file prompts/$p.txt > ab/nomtp_old_${p}_$r.txt 2>&1
+  ./build/strata $OPTS_NOMTP --tokens-file prompts/$p.txt > ab/nomtp_new_${p}_$r.txt 2>&1
+  <binaire d'avant> $OPTS_NOMTP --tokens-file prompts/$p.txt > ab/nomtp_old_${p}_$r.txt 2>&1
 done; done
-grep -H "^output" ab/nomtp_*.txt   # tokens identiques entre old et new : condition pour le passer par défaut
-grep -H "decode\|speculation" ab/nomtp_*.txt   # new : "rounds of", tok/s nettement plus haut
+grep -H "^output" ab/nomtp_*.txt   # tokens : voir la mesure ci-dessus
+grep -H "decode\|speculation" ab/nomtp_*.txt   # "rounds of", tok/s
 ```
 
 ### #3 : effet de l'angle FP64 à 128K

@@ -14,9 +14,9 @@
 // ResidencyUpload: the device residency table after a swap, from a pinned copy with cudaMemcpyAsync on the refill
 // stream (behind the swapped blobs), instead of a synchronous cudaMemcpy from pageable memory.  No verify window
 // reads the device table (the dispatch plans from the host table), so the decode loop only waits for the upload at
-// its end (`sync`).  The prompt path does read d_res, and with STRATA_ASYNC_REFILL=1 an upload can be issued
-// between its windows: whoever writes d_res synchronously (the serve loop's lend() and refill()) calls `sync`
-// first, so an older table cannot land last.  `put(..., wait = true)` is the old synchronous contract.
+// its end (`sync`).  The prompt path does read d_res: whoever writes d_res synchronously (the serve loop's lend()
+// and refill()) calls `sync` first, so an older table cannot land last.  `put(..., wait = true)` is the old
+// synchronous contract.
 // STRATA_OLD_RES_UPLOAD=1 keeps cudaMemcpy.
 #pragma once
 
