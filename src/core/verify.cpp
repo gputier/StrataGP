@@ -164,7 +164,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
     if (hits.d_res == nullptr || hits.cache_base == nullptr || hits.blob <= 0) {
         err = "verify: needs the profile-filled VRAM expert tier (--expert-profile and --expert-cache); with "
-              "--expert-cache auto, no VRAM was left for it: lower --max-context, use --kv k8v4 or images on the CPU";
+              "--expert-cache auto, the tier may be missing because no VRAM was left for it (lower --max-context, "
+              "use --kv q4_0 or --kv int8, or run images on the CPU) or because no expert profile was given";
         return false;
     }
     std::string why;

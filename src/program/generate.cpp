@@ -2175,7 +2175,7 @@ int main(int argc, char** argv) {
                      (double) free_b / 1073741824.0, o.vram_reserve_mib, (long long) (mtp_bind >> 20), o.expert_cache);
         if (o.expert_cache == 0)   // the verify window cannot start without it (#174): say what makes room
             std::fprintf(stderr, "strata generate: no VRAM is left for the expert cache: lower --max-context, use "
-                                 "--kv k8v4, run images on the CPU, or close other programs that use the GPU\n");
+                                 "--kv q4_0 or --kv int8, run images on the CPU, or close other programs that use the GPU\n");
     }
     // plan v0.3 P6: a native pack's blobs differ per layer, so with a profile its slots are sized per pair: the
     // same VRAM holds ~30% more IQ3_XXS experts than slots of the largest blob would
