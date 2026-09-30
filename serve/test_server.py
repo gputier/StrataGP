@@ -203,16 +203,26 @@ class StatusNeedsTheKey(unittest.TestCase):
         svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         svc.api_key = "k3y"
         httpd = serve(svc, port=0)
-        base = f"http://127.0.0.1:{httpd.server_address[1]}/status"
+        root = f"http://127.0.0.1:{httpd.server_address[1]}"
+        base = root + "/status"
+        auth = {"Authorization": "Bearer k3y"}
         try:
             with self.assertRaises(urllib.error.HTTPError) as e:
                 urllib.request.urlopen(base, timeout=10)
             self.assertEqual(e.exception.code, 401)
             e.exception.close()
-            req = urllib.request.Request(base, headers={"Authorization": "Bearer k3y"})
-            with urllib.request.urlopen(req, timeout=10) as r:
+            # a whole request first: the answer's end is kept while it is written and must be gone once it is done
+            body = json.dumps({"model": "m", "max_tokens": 20, "messages": [{"role": "user", "content": "hi"}]})
+            with urllib.request.urlopen(urllib.request.Request(
+                    root + "/v1/chat/completions", data=body.encode(),
+                    headers={**auth, "Content-Type": "application/json"}), timeout=30) as r:
                 self.assertEqual(r.status, 200)
-                self.assertNotIn("tail", json.loads(r.read()))
+                self.assertEqual(json.loads(r.read())["choices"][0]["finish_reason"], "stop")
+            with urllib.request.urlopen(urllib.request.Request(base, headers=auth), timeout=10) as r:
+                self.assertEqual(r.status, 200)
+                status = json.loads(r.read())
+            self.assertFalse(status["busy"])
+            self.assertNotIn("tail", status)
         finally:
             httpd.shutdown()
             httpd.server_close()
