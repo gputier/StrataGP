@@ -66,11 +66,11 @@ phase `qsa indexer` de `STRATA_PREFILL_TIMING=1`.
    partagé ; l'hôte attend l'événement (plus `cudaStreamSynchronize`) pendant que le GPU calcule l'expert partagé.
    Les bornes des groupes montent depuis un tampon épinglé (une source paginable peut bloquer l'hôte jusqu'à ce que
    le flux atteigne la copie).
-3. **Marche par groupe** (morceaux ≥ 2 048 tokens en `stream_all`, toutes les couches en MMQ — sinon l'ancienne
+3. **Marche par groupe** (morceaux ≥ 2 048 tokens en `stream_all`, toutes les couches en MMQ, sinon l'ancienne
    marche par expert reste utilisée) :
    - un groupe de 16 experts routés attend **une fois** la copie de sa dernière entrée (le flux de copie est en
      ordre), est rassemblé en **un seul lancement** (`gather_native_batch` / `gather_strata_q2_batch`, octet pour
-     octet les rassemblements par expert — vérifié par `moe_group_parity`), et rend ses emplacements de l'anneau (et
+     octet les rassemblements par expert, vérifié par `moe_group_parity`), et rend ses emplacements de l'anneau (et
      ceux des experts non routés d'avant) avec **un seul événement** ;
    - jusqu'à 16 experts consécutifs d'une couche, contigus dans l'arène épinglée, arrivent en **une copie 2D**
      (`cudaMemcpy2DAsync`, pas de destination = pas de l'anneau) quand les emplacements de l'anneau sont également
@@ -92,7 +92,7 @@ attente, un rassemblement, un événement, 2 `memset`, les lancements MMQ ; côt
 événement par série de 16).
 
 **Mesuré ici (CPU du conteneur)** : le tri hôte supprimé coûtait 0,18 ms par couche, soit 8,7 ms par morceau de
-8 192 (48 couches) — faible ; l'essentiel attendu vient des appels d'API par expert et de l'attente non recouverte.
+8 192 (48 couches), faible ; l'essentiel attendu vient des appels d'API par expert et de l'attente non recouverte.
 
 **Gain (HYPOTHÈSE, audit) :** 5 à 10 % du débit de prefill, davantage sur la 5090 (le GPU y va plus vite que l'hôte).
 À lire dans `STRATA_PREFILL_TIMING=1` : phases `host grouping` (désormais : le GPU qui attend l'hôte après l'expert
@@ -118,7 +118,7 @@ partagé ; le regroupement GPU est compté dans `router+shared`), `gather`, `wai
   continue, réponse comprise), seuls les nouveaux tokens sont ajoutés ; sinon `reset()` + tout ajouter.
 - L'index ne dépend que des tokens ajoutés depuis le dernier `reset`, donc les propositions sont celles d'un
   chercheur reconstruit. `suffix_drafter_test` le vérifie contre des chercheurs neufs (historique étendu, reconstruit,
-  après 1 000 `reset`, et une petite table remplie à chaque époque — ce dernier cas échoue si les cases périmées
+  après 1 000 `reset`, et une petite table remplie à chaque époque, ce dernier cas échoue si les cases périmées
   restent occupées : vérifié en mutant le code).
 - `STRATA_OLD_SFX_RESET=1` reconstruit l'historique à partir de tout le prompt à chaque requête.
 

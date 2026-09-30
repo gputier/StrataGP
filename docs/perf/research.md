@@ -17,11 +17,11 @@ routage (#51). S6 (prefill par couche entière) n'est pas traité ici.
 | # | Issue | Quoi | Par défaut | Commande / option |
 |---|---|---|---|---|
 | 1 | #53 | État récurrent GDN stocké en BF16, arithmétique FP32 | **désactivé** (change les valeurs) | `--gdn-state-bf16` |
-| 2 | #53 | Checkpoints de conversation compacts quand l'état est en BF16 (61 Mo au lieu de 118 par emplacement) | seulement avec l'option 1 | — |
+| 2 | #53 | Checkpoints de conversation compacts quand l'état est en BF16 (61 Mo au lieu de 118 par emplacement) | seulement avec l'option 1 | - |
 | 3 | #53 | Test `gdn_state_bf16_parity` : exactitude par construction + dérive sur 4 096 tokens | ctest | `--selftest`, `--cpu-drift`, `--tokens N` |
-| 4 | #53 | `tools/logits_kl.py` : KL et accord top-1, position par position, entre deux `--dump-logits` | outil | — |
-| 5 | #51 | `tools/routing_locality.py` : réutilisation entre tokens et prédiction de la couche suivante | outil | — |
-| 6 | #51 | `--dump-routing` écrit aussi les tokens validés des fenêtres de vérification (avant : chemin « token » seulement) | actif seulement avec `--dump-routing` | — |
+| 4 | #53 | `tools/logits_kl.py` : KL et accord top-1, position par position, entre deux `--dump-logits` | outil | - |
+| 5 | #51 | `tools/routing_locality.py` : réutilisation entre tokens et prédiction de la couche suivante | outil | - |
+| 6 | #51 | `--dump-routing` écrit aussi les tokens validés des fenêtres de vérification (avant : chemin « token » seulement) | actif seulement avec `--dump-routing` | - |
 
 Sans `--gdn-state-bf16`, le moteur calcule exactement comme avant : les deux kernels touchés sont maintenant des
 templates sur le type de stockage de l'état, et leur instanciation FP32 produit **le même PTX** que les kernels
@@ -50,7 +50,7 @@ récupérée (~54 Mo en tout, sans intérêt ici).
 | Prefill (`gdn_recurrence`) | `prefill.cpp` | élargi dans la tranche FP32 inutilisée de la session (`SessionState::gdn_wide`, laissée libre par `gdn_point_at` : aucune VRAM en plus), récurrence FP32 inchangée, réarrondi **une fois par morceau** |
 | Pas GDN non fusionnés (`native_gdn_step`, `gdn_step`) | `layer.cpp` | refusés (message d'erreur) : ils liraient les bits BF16 comme du FP32 |
 | Checkpoints de conversation (`--serve`) | `generate.cpp` | seules les parties vivantes sont copiées (`cudaMemcpy2D`) : 61,0 Mo au lieu de 117,7 Mo par emplacement (ESTIMÉ, calcul exact des tailles) |
-| Hash d'état (`STRATA_STATE_HASH`, `STRATA_STATE_HASH_GDN`) | — | inchangé (octets de la tranche) |
+| Hash d'état (`STRATA_STATE_HASH`, `STRATA_STATE_HASH_GDN`) | - | inchangé (octets de la tranche) |
 
 `strata` refuse l'option sans le pas GDN fusionné natif (`--native` ou `--native-gdn`, sans `--no-fused-gdn`).
 L'interrupteur est global au processus et posé au démarrage, avant toute capture de graphe (comme

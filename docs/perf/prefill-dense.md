@@ -11,7 +11,7 @@ exécuté. Les gains sont **ESTIMÉ** (calcul) ou **HYPOTHÈSE** (à confirmer a
 |---|---|---|
 | Projections denses natives en MMQ int8 (#39) | **désactivé** (change l'arrondi) | `--prefill-dense-mmq` ou `STRATA_PREFILL_DENSE_MMQ=1` |
 | Phase « dense proj » et lignes par morceau dans `STRATA_PREFILL_TIMING` (#41) | actif dès que la variable est posée | `STRATA_PREFILL_TIMING=1` (mesure seulement) |
-| En-tête de `gemm.hpp` : la GEMM des poids quantifiés est en FP16, pas en BF16 | — | — |
+| En-tête de `gemm.hpp` : la GEMM des poids quantifiés est en FP16, pas en BF16 | - | - |
 
 Sans `--prefill-dense-mmq`, le calcul est **identique au bit près** à `perf/base` : `Gemm::native_mmq` refuse
 l'appel tant qu'aucun contexte MMQ ne lui a été donné, et `native_proj` retombe sur le même `Gemm::native`.

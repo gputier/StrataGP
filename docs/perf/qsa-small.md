@@ -75,8 +75,8 @@ lisant le SASS (`cuobjdump -sass`, CUDA 13.0, sm_120) des anciens et des nouveau
 - norme canonique (`rms_norm_weighted`, fichier précis) : chaîne FFMA par voie avec pas de 32, arbre `shfl_down`,
   division IEEE et `rsqrtf` (avec la mise à l'échelle des dénormaux) par la voie 0, puis `(x × w) × inv` ;
 - norme native (`native_qsa_rms_norm_weighted`, fichier compilé en `--use_fast_math`) : carré en FFMA.FTZ sur +0,
-  deux papillons XOR sur 256 threads, puis `FFMA.FTZ(somme, RCP(n), eps)` — c'est ainsi que ptxas abaisse la division
-  approchée suivie de l'ajout d'epsilon — et `MUFU.RSQ`, puis `(scale × x) × gamma` en FMUL.FTZ ;
+  deux papillons XOR sur 256 threads, puis `FFMA.FTZ(somme, RCP(n), eps)` (c'est ainsi que ptxas abaisse la division
+  approchée suivie de l'ajout d'epsilon), et `MUFU.RSQ`, puis `(scale × x) × gamma` en FMUL.FTZ ;
 - RoPE sur table (`rope_neox_apply`) : `oa = fma(a, c, −(b·s))`, `ob = fma(b, c, a·s)` ;
 - RoPE native (`native_rope_apply`) : `theta = pos × ex2(lg2(theta_scale) × paire)`, `sin`/`cos` approchés
   (`FMUL.RZ` par 1/2π puis `MUFU.SIN/COS`), `oa = fma(c, a, −(s·b))`, `ob = fma(s, a, c·b)`, tout en FTZ ;
@@ -114,7 +114,7 @@ Il vérifie aussi `copy_i32x2_from_mapped` (point 1).
 
 ## Gains attendus
 
-- **(1) ESTIMÉ** : 23 nœuds de graphe de moins par token, à ~1–2 µs pièce : **25 à 50 µs par token** (audit : 30 à
+- **(1) ESTIMÉ** : 23 nœuds de graphe de moins par token, à ~1 à 2 µs pièce : **25 à 50 µs par token** (audit : 30 à
   60 µs).
 - **(2) ESTIMÉ** : 6 nœuds de moins par couche QSA (9 en Q4_0), 72 (108) par token, dont 12 nœuds de copie `memcpy2D` :
   **70 à 150 µs par token** (audit), un peu plus en Q4_0. **HYPOTHÈSE** : davantage sous Windows, où un nœud de copie

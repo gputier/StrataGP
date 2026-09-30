@@ -65,7 +65,7 @@ kernel. Défaut **activé**, et `STRATA_OLD_TOPK=1` rend l'ancien kernel (lu une
 
 **Gain (HYPOTHÈSE) :** 3 à 5× sur ce kernel à 128K, soit 0,1 à 0,5 ms par token (audit). Les parcours série supprimés
 coûtaient à eux seuls de l'ordre de 10 à 20 µs par appel dès que le contexte dépasse 2 051 cellules. Si c'est
-confirmé, le gain existe donc aussi à 4K–32K (12 couches QSA par token, plus les fenêtres de vérification).
+confirmé, le gain existe donc aussi à 4K à 32K (12 couches QSA par token, plus les fenêtres de vérification).
 
 ## #23 (O6c) : `qsa_decode_attn`
 

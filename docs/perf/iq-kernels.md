@@ -45,7 +45,7 @@ m fois.
 
 Chaque produit scalaire est coupé en deux, comme les traits multi-colonnes de `native_mmvq.cu` :
 
-- `Split<T>::load(poids, kbx, iqs)` : tout ce qui ne dépend que du poids — les 8 mots de grille signés (ou les
+- `Split<T>::load(poids, kbx, iqs)` : tout ce qui ne dépend que du poids : les 8 mots de grille signés (ou les
   paires `int2` de la table IQ4, les codes Q2_0), les échelles entières, l'échelle fp16 convertie en float, et pour
   IQ1_M les quatre `delta` ;
 - `Split<T>::apply(w, activation, iqs)` : les lectures d'activation, la même chaîne de `dp4a` dans le même ordre, la

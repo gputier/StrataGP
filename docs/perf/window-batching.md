@@ -23,7 +23,7 @@ sélectionnable par variable d'environnement pour l'A/B. Rien de ce paquet ne ch
 | 4 | #19 expert partagé | n × conversion BF16, SwiGLU puis quantification Q8_1, n × (GEMV de porte + sigmoïde `<<<1,1>>>`), mise à l'échelle | conversion BF16 seulement si la porte BF16 est utilisée (1 lancement), SwiGLU+Q8_1 fusionnés, 1 GEMV de porte pour n tokens, sigmoïde et échelle **repliées dans la combinaison** | activé | `STRATA_OLD_WINDOW_SHARED=1` |
 | 5 | #44 (E1) combinaison | copie de **toutes** les k lignes depuis `y_miss` mappé (PCIe), `moe_hit_add`, n × combinaison | 1 kernel : lignes CPU lues directement dans `y_miss` (seulement celles qui ne sont pas dans la liste des hits), lignes GPU lues dans `hit_out`, porte partagée appliquée, somme | activé | `STRATA_OLD_WINDOW_COMBINE=1` |
 | 6 | #44 (E1) graphe « un token » | copie + `moe_hit_add` + combinaison | le même kernel, n = 1 | activé | `STRATA_OLD_TOKEN_COMBINE=1` |
-| 7 | #19 `layer.cpp:398` | `f32_to_bf16_bulk` inconditionnel dans `moe_shared` | sauté quand la porte native est active (personne ne lit la sortie) | activé | — (travail mort) |
+| 7 | #19 `layer.cpp:398` | `f32_to_bf16_bulk` inconditionnel dans `moe_shared` | sauté quand la porte native est active (personne ne lit la sortie) | activé | - (travail mort) |
 | 8 | #44 HYPOTHÈSE | `y_miss` en mémoire épinglée ordinaire | `cudaHostAllocWriteCombined` (le CPU ne fait qu'y écrire) | **opt-in** | `STRATA_YMISS_WC=1` pour l'activer |
 
 `STRATA_OLD_WINDOW=1` rétablit d'un coup 1 à 5 (la fenêtre entière comme en 0.1.20). Les variables sont lues une
@@ -58,7 +58,7 @@ Les modèles livrés (K = 10, fenêtre ≤ 8 tokens) prennent toujours le nouvea
   - une ligne CPU est lue dans `y_miss` (`__ldcv`, float4) : mêmes octets que la copie ;
   - la porte partagée, quand elle est repliée ici : `sigmoïde(dot)` avec la séquence non-FTZ de
     `native_scalar_sigmoid_kernel`, puis `out × g` arrondi seul (`mul.rn` non-FTZ, comme `scale_rows_kernel`) ;
-  - la combinaison : premier produit, FMA dans l'ordre des experts, ajout du terme partagé — en intrinsèques à
+  - la combinaison : premier produit, FMA dans l'ordre des experts, ajout du terme partagé, en intrinsèques à
     arrondi unique explicites (`__fmul_rn`, `__fmaf_rn`, `__fadd_rn` en FTZ comme le reste de `native_moe.cu`),
     ce qui est exactement l'arithmétique de `combine` pour k ≥ 2 (k = 10 ici ; k = 1 est refusé par ce kernel
     parce que l'ancien pouvait y contracter produit et ajout en une FMA).
@@ -71,7 +71,7 @@ Les modèles livrés (K = 10, fenêtre ≤ 8 tokens) prennent toujours le nouvea
   FWHT et la porte de sortie sont par ligne ou par élément : un seul appel avec n × NH lignes calcule les mêmes
   valeurs. La norme et la RoPE de **k** ne sont pas groupées : `pos_` n'a pas le pas NKV qu'il leur faudrait.
 
-Registres (ptxas -v, sm_120), aucun spill : `combine_window` 78–79, `moe_combine_window_kernel` 80,
+Registres (ptxas -v, sm_120), aucun spill : `combine_window` 78 à 79, `moe_combine_window_kernel` 80,
 `bf16_f32_mmvf_multi_kernel` 46 (contre 37 pour le kernel à une colonne), `route_multi` 59 (54),
 `native_swiglu_quantize_q8_1_kernel` 16, `scalar_gate_rows_kernel` 22, `sigmoid_scale_rows_kernel` 10.
 

@@ -15,7 +15,7 @@ pour sm_86, pour vérifier la garde des clusters) et les tests CPU ont été lan
 | 1 | `fetch_blobs`, `gather_rows` : `48 * 8` blocs codés en dur | `8 × multiProcessorCount` du GPU courant, lu une fois par GPU (`launch_grid.hpp`). Sur une carte à 48 SM, lancement identique. | **activé** | `STRATA_OLD_GRIDS=1` |
 | 2 | `gdn_ab_kernel` (et `gdn_ab_multi_kernel` du verify) : 96 lignes sur **12 blocs** (un warp par ligne) | **Un bloc de 4 warps par ligne** (96 blocs) : les 128 threads chargent la ligne en mémoire partagée d'un coup, puis la même chaîne d'`fmaf` qu'avant. | **activé** | `STRATA_OLD_GDN_AB=1` |
 | 3 | Pas GDN (`fused_gdn_step_norm`, `gdn_step_norm_multi`) : **48 blocs** (un par tête de valeur) | Les 128 colonnes d'une tête réparties sur un **cluster de 4 blocs** (192 blocs), somme RMS échangée en mémoire partagée distribuée. sm_90 et plus, vérifié à l'exécution. | **activé** (si le GPU accepte les clusters) | `STRATA_OLD_GDN_STEP=1` |
-| 4 | `qsa_decode_attn` (66 blocs), `gr_down` (41 blocs), prefill `gdn_rec_kernel` (48 blocs), autres | Revus, **non modifiés** (voir « Ce qui reste »). | — | — |
+| 4 | `qsa_decode_attn` (66 blocs), `gr_down` (41 blocs), prefill `gdn_rec_kernel` (48 blocs), autres | Revus, **non modifiés** (voir « Ce qui reste »). | - | - |
 
 Les trois changements sont **identiques au bit près par construction** (mêmes valeurs, mêmes opérations, même
 ordre ; seuls le nombre de blocs et le warp ou le bloc qui porte une chaîne changent). Ils sont donc actifs par

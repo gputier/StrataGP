@@ -19,7 +19,7 @@ confirmer sur la machine cible. Aucun chiffre n'a été mesuré sur GPU : ce con
 | #29 O8c (b) | lignes down : correction Q2_0 exacte en entier (`vpdpbusd` amorcé avec `-sum`) | désactivé | `STRATA_CPU_INT_CORR=1` | **change les derniers bits** |
 | #30 O8d | noyaux i-quant AVX-512 : grilles par `gather`, signes par `vpermi2b`, activations Q8_K recopiées alignées sur 64 o et hors aliasing 4K | **activé** | `STRATA_OLD_IQ512=1` (tout l'ancien), `STRATA_IQ512_NOPACK=1` (gather sans la copie) | identique au bit près |
 | #30 O8d | experts IQ à un seul token sur le noyau AVX-512 au lieu du `vec_dot` de ggml-cpu | désactivé | `STRATA_IQ512_ONE=1` | **change les derniers bits** |
-| #11 B13 | `static_assert(MAXT × 10 ≤ 128)`, refus à l'exécution d'un `k` trop grand, `static_assert(GMAX ≥ kVerifyMaxT)` | — | — | aucun changement de calcul |
+| #11 B13 | `static_assert(MAXT × 10 ≤ 128)`, refus à l'exécution d'un `k` trop grand, `static_assert(GMAX ≥ kVerifyMaxT)` | - | - | aucun changement de calcul |
 
 Tous les changements activés par défaut sont identiques au bit près par construction (mêmes octets, mêmes opérations
 dans le même ordre ; seuls le découpage en tâches, la mémoire et les instructions de chargement changent). Les tests

@@ -68,7 +68,7 @@ Registres (ptxas, sm_120, 0 spill) : étape 1 : 80 registres, 128 threads, 2,5 K
 `sampler_parity` garde ses 15 fixtures (référence hôte, égalité exacte) et en ajoute deux, comparées à un
 **miroir de la sémantique du noyau** (−inf et NaN jamais gardés, id 0 quand il ne reste rien) :
 
-- **16 — la liste top-k position par position, avec beaucoup d'égalités.** Chaque ligne contient un +inf : toute
+- **16 : la liste top-k position par position, avec beaucoup d'égalités.** Chaque ligne contient un +inf : toute
   l'arithmétique de la fin devient NaN, aucune coupe ni tirage n'aboutit et la chaîne rend la *dernière* entrée
   gardée, `sel_ids[k − 1]`. Lancer top_k = 1..64 (et 0, 100, −3 → 64) lit donc la liste entière, ensemble et
   ordre. Lignes : 20 logits à 6,25 et 300 à 6,0 répartis sur tous les blocs, warps et voies ; des zéros signés (−0 aux
@@ -76,12 +76,12 @@ Registres (ptxas, sm_120, 0 spill) : étape 1 : 80 registres, 128 threads, 2,5 K
   qui posent des jetons pénalisés exactement sur les valeurs d'autres jetons (fenêtre sur les bords de blocs et de
   warps, doublons, ids hors vocabulaire). Vocabulaires 248 320 (dernier bloc partiel), 100 003, 262 144 (le plus
   large réparti), 262 145 (repli un bloc) et 1 000.
-- **17 — tirages sous égalités.** Logits au demi-pas (des dizaines de jetons par valeur près du sommet), top_k
+- **17 : tirages sous égalités.** Logits au demi-pas (des dizaines de jetons par valeur près du sommet), top_k
   1/20/64, top_p 0,9/1, min_p 0/0,05, température 2,5, pénalités avec et sans (la moitié de chaque fenêtre sur la
   tête de la ligne), 17 lignes (la mémoire de travail est d'abord taillée pour 16 : elle est agrandie), sur le flux
   par défaut et sur un flux créé. Observabilité exigée : des tirages doivent tomber sur un jeton à égalité avec un
   autre jeton gardé.
-- **18 — les replis automatiques du chemin par défaut.** Un flux créé, capturé en mode `ThreadLocal` :
+- **18 : les replis automatiques du chemin par défaut.** Un flux créé, capturé en mode `ThreadLocal` :
   `sample_tokens` (top_k 20, top_p 0,9, pénalités, V = 248 320, 3 lignes) doit passer par le noyau d'un bloc (masque
   de pénalités en mémoire partagée dynamique) dans le graphe ; le graphe rejoué deux fois doit donner les tirages du
   miroir, puis le même flux hors capture (chemin réparti, mémoire de travail allouée après la capture) aussi. Puis

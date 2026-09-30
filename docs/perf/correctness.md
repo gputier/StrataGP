@@ -17,9 +17,9 @@ quand c'était possible, vérifié par une simulation hôte), pas d'une mesure. 
 | #13 | B15 | `bf16_from_f32` et `f2bf` (dequant_bf16) : un NaN reste un NaN, comme ggml | **oui** (identique hors NaN) | aucun |
 | #10 | B11 | `--spec` sans `--mtp` ni `--spec-oracle` : fenêtres de 1 token, plus de brouillons 0 | **non** (opt-in tant que l'A/B GPU n'a pas confirmé la sortie identique) | `STRATA_SPEC_T1=1` |
 | #3 | B4 | `rope_parity` : RoPE natif de 0 à 262 144 contre FP64 ; angle FP64 en option | test ; option **non** | `STRATA_ROPE_F64=1` |
-| #5 | B6 | softplus natif = llama.cpp, vérifié et documenté ; pas de changement de calcul | — | — |
-| #8 | B9 | 5 tests étendus, 4 nouveaux tests GPU, 1 test CPU | — | — |
-| #9 | B10 | `tools/prefill_chunk_check.py` : même prompt, plusieurs tailles de morceau | — | — |
+| #5 | B6 | softplus natif = llama.cpp, vérifié et documenté ; pas de changement de calcul | - | - |
+| #8 | B9 | 5 tests étendus, 4 nouveaux tests GPU, 1 test CPU | - | - |
+| #9 | B10 | `tools/prefill_chunk_check.py` : même prompt, plusieurs tailles de morceau | - | - |
 
 ## Ce qui change, par issue
 
@@ -120,7 +120,7 @@ Tous enregistrés dans ctest, tous compilés ; aucun n'a pu tourner ici (sauf le
 
 | test | ce qu'il affirme |
 |---|---|
-| `gdn_fused_parity` (nouveau) | `gdn_step`, `native_gdn_step` et `fused_gdn_step_norm` sur **256 pas** contre un état FP64, deux régimes de portes (mixte ; mémoire longue, décroissance 0,98–0,9995), dérive imprimée aux pas 1/16/64/256, tolérance 5e-6 + 2e-7 × pas (une simulation hôte de l'ordre fusionné donne ~2e-7 de dérive, 1,3e-5 si chaque décroissance est biaisée de 2 ulp dans le même sens) ; les trois softplus (#5) ; `fused_gdn_ab` contre FP64 sur tous les régimes de v ; `fused_gdn_conv_l2` ; `native_gdn_conv_silu`, `native_gdn_l2_norm`, `native_gdn_beta_gate`, `native_gdn_out_norm` |
+| `gdn_fused_parity` (nouveau) | `gdn_step`, `native_gdn_step` et `fused_gdn_step_norm` sur **256 pas** contre un état FP64, deux régimes de portes (mixte ; mémoire longue, décroissance 0,98 à 0,9995), dérive imprimée aux pas 1/16/64/256, tolérance 5e-6 + 2e-7 × pas (une simulation hôte de l'ordre fusionné donne ~2e-7 de dérive, 1,3e-5 si chaque décroissance est biaisée de 2 ulp dans le même sens) ; les trois softplus (#5) ; `fused_gdn_ab` contre FP64 sur tous les régimes de v ; `fused_gdn_conv_l2` ; `native_gdn_conv_silu`, `native_gdn_l2_norm`, `native_gdn_beta_gate`, `native_gdn_out_norm` |
 | `fused_gr_parity` (nouveau) | `fused_gr_read` contre une transcription FP64 du contrat (rs, lo, inject, mixed, R mis à jour), avec/sans écriture repliée et lignes d'injection ; `fused_gr_read_multi` **bit à bit** égal à `fused_gr_read` de chaque token pour T = 1..8 (promesse de l'en-tête dont dépend l'exactitude des fenêtres) |
 | `qsa_decode_parity` (nouveau) | `qsa_block_scores` contre FP64 ; `qsa_block_topk` **exact** (ids) sur les scores du GPU et sur des scores pleins d'égalités (+0/−0), identité sous la largeur (la référence a été vérifiée ici contre un portage hôte du radix select) ; `qsa_decode_attn` FP16, INT8 et Q4_0 via une table de pages permutée, 1/65/2051 cellules, contre une attention FP64, et la forme lot bit à bit égale à la forme par requête |
 | `bf16_bits_test` (nouveau, CPU) | #13 sur les 2^32 motifs (exécuté ici : OK) |

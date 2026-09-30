@@ -118,7 +118,7 @@ suite. Ce mode est donc un peu plus lent que le vrai code d'avant #16 en `--pcie
 - **ESTIMÉ (audit)** : 1 à 2,5 ms par tour pour l'ensemble O2, soit 6 à 15 % sur une 5090, davantage sous Windows
   (WDDM : 0,3 à 0,4 ms par lancement/synchronisation).
 - **HYPOTHÈSE** par point : (1) avec `--spec 4` (3 brouillons), jusqu'à 3 lancements et 2 synchronisations de moins
-  par tour quand la chaîne va au bout, 0 de moins (et pas de plus) quand elle s'arrête au premier brouillon —
+  par tour quand la chaîne va au bout, 0 de moins (et pas de plus) quand elle s'arrête au premier brouillon :
   c'est l'essentiel ; (2) une synchronisation de moins par tour ; (3) ~10 à 50 µs tous les 4 tours ; (4) ~20 à
   50 µs tous les 4 tours ; (5) seulement en `--pcie-mode dma`, des dizaines de µs par couche avec copies.
 - Le banc `mtp_chain_parity --bench` prépare les données une fois, puis ne chronomètre que lancements et

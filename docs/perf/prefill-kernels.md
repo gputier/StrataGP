@@ -25,13 +25,13 @@ Ce qui a été vérifié sans GPU :
 | P8 | #43 | chaîne GR : échelle RMS par ligne au lieu de `xn` en FP32, `xn` recalculé dans `gr_mix`, `gr_write(h)` fusionné avec `gr_norm(h+1)` ; le tampon `xn` passe de T×40 Ko à T×16 o | **activé** | `STRATA_OLD_PREFILL_GR=1` (rétablit aussi le tampon FP32) | identique au bit |
 | B7 | #6 | les images FP16 du prompt saturent à ±65 504 au lieu de passer à ±inf | désactivé | `STRATA_PREFILL_F16_SAT=1` | change seulement les anciens ±inf |
 | B8 | #7 | le routeur du prompt prend celui du décodage (`native_router` en fast-math avec `--native-router`, sinon `router_top10`) | désactivé | `STRATA_PREFILL_ROUTE_DECODE=1` | peut changer la sélection près d'une égalité |
-| B8 | #7 | `STRATA_DBG_NAN=1` compte aussi les lignes du routeur dont un logit est non fini | (mode debug) | — | aucun effet hors debug |
+| B8 | #7 | `STRATA_DBG_NAN=1` compte aussi les lignes du routeur dont un logit est non fini | (mode debug) | - | aucun effet hors debug |
 
 Les trois réécritures (P2, P3, P8) gardent chaque opération flottante et son ordre : elles sont donc actives par
 défaut, l'ancien chemin restant sélectionnable pour l'A/B. B7 et B8 modifient des résultats : désactivés par défaut.
 Toutes les variables se lisent une fois au démarrage ; `=1` active, absente ou `=0` n'active pas.
 
-### P2 — `gdn_conv` (#37), `src/prefill/kernels.cu`
+### P2 : `gdn_conv` (#37), `src/prefill/kernels.cu`
 
 - `gdn_conv_tile_kernel` : bloc = (une tête de 128 canaux, 16 tokens), grille 80 × ⌈T/16⌉ (40 960 blocs à T = 8 192
   au lieu de 80). Chaque thread charge une fois les 19 entrées `t0-3 … t0+15` (l'historique pour t < 0), calcule les
@@ -44,7 +44,7 @@ Toutes les variables se lisent une fois au démarrage ; `=1` active, absente ou 
 - Trafic : h n'est plus relu ni réécrit par le kernel L2 séparé (40 % de h), et les entrées sont lues 19/16 fois.
 - Registres : 48, 0 spill.
 
-### P3 — `gdn_recurrence` (#38), `src/prefill/kernels.cu`
+### P3 : `gdn_recurrence` (#38), `src/prefill/kernels.cu`
 
 - `gdn_rec_split_kernel`, grille (48 têtes, 4 quarts de 32 colonnes), 128 threads. Un warp tient 8 colonnes × les
   mêmes 4 groupes de 32 lignes que l'ancien (lane = 4 × colonne + groupe) : `kv` et `o` sont les quatre mêmes sommes
@@ -52,7 +52,7 @@ Toutes les variables se lisent une fois au démarrage ; `=1` active, absente ou 
   lieu de la mémoire partagée.
 - q|k d'un token passent par la mémoire partagée, trois tampons (le token t+1 est écrit avant la barrière du token
   t) : **une barrière par token** (l'ancien en avait six), et la chaîne `kv(t+1)` (état mis à jour contre `k(t+1)`)
-  tourne en même temps que la chaîne `o(t)` — les mêmes opérations dans le même ordre, faites un token plus tôt.
+  tourne en même temps que la chaîne `o(t)` : les mêmes opérations dans le même ordre, faites un token plus tôt.
   Pas de conflit de banc (groupes au pas de 36 flottants, lectures `LDS.128`).
 - Les entrées (q, k, v, gate, beta) sont chargées **deux tokens à l'avance**, et leurs lignes de cache demandées
   **huit tokens à l'avance** (`prefetch.global.L2`) : à 8 192 tokens, h fait 335 Mo, bien plus que le L2 ; l'ancien
@@ -66,11 +66,11 @@ Toutes les variables se lisent une fois au démarrage ; `=1` active, absente ou 
   `ss*(1/128)+eps` en `FFMA` comme l'ancien.
 - Registres : 72, 0 spill ; 3,4 Ko de mémoire partagée. Norme : 22 registres.
 
-### P8 — la chaîne GR (#43), `src/prefill/kernels.cu`, `src/prefill/prefill.cpp`
+### P8 : la chaîne GR (#43), `src/prefill/kernels.cu`, `src/prefill/prefill.cpp`
 
 - `gr_norm_scale` : l'arithmétique de `gr_norm` (même boucle, même `block_sum` à 256 threads) ; écrit l'image BF16
   et l'échelle `rs` de chaque ligne (token, flux), sans l'image FP32.
-- `gr_mix_scale` : recalcule `xn = (R * rs) * w` — le produit que `gr_norm` stockait, bit pour bit — puis le même
+- `gr_mix_scale` : recalcule `xn = (R * rs) * w` (le produit que `gr_norm` stockait, bit pour bit), puis le même
   `fmaf(xn, sigmoid(g), s)` sur les 4 flux.
 - `gr_write_norm` : la mise à jour de `gr_write` (`fmaf(bo, 2·sigmoid(inj/4), R)`), gardée en registres, écrite,
   puis normalisée avec le poids de la moitié suivante, avec la même correspondance thread → élément que `gr_norm`
@@ -81,7 +81,7 @@ Toutes les variables se lisent une fois au démarrage ; `=1` active, absente ou 
   `bytes_needed` (le prompt emprunte donc moins d'emplacements du cache d'experts).
 - Économie : l'écriture FP32 de `xn` (40 Ko par token et par moitié) et une lecture de R (40 Ko) sur ~290 Ko.
 
-### B7 — FP16 saturé, opt-in (#6)
+### B7 : FP16 saturé, opt-in (#6)
 
 - `hf()` (toutes les images FP16 de `kernels.cu` : SwiGLU des experts et de l'expert partagé, `y_h`, `attn_h`,
   `mixed_h`, K/V FP16 et échelles INT8, `to_f16`) : avec `STRATA_PREFILL_F16_SAT=1`, une valeur finie au-delà de la
@@ -92,7 +92,7 @@ Toutes les variables se lisent une fois au démarrage ; `=1` active, absente ou 
   Le `__constant__` existe une fois par GPU : avec la répartition des couches (0.1.21), il est écrit une fois sur
   chaque carte qui lit une partie du prompt (un `std::once_flag` par GPU).
 
-### B8 — routeur aligné sur le décodage, opt-in ; NaN comptés (#7)
+### B8 : routeur aligné sur le décodage, opt-in ; NaN comptés (#7)
 
 - `STRATA_PREFILL_ROUTE_DECODE=1` : `route` appelle `route_decode`, qui fait le choix du décodage
   (`core/layer.cpp`) : `route_native` avec `--native-router` (activé par `--native`) et 512 experts, sinon

@@ -20,10 +20,10 @@ RTX 5090. Aucun chiffre de ce document n'a été mesuré sur GPU.
 |---|---|---|---|---|
 | #31 O9 | Détokeniseur incrémental (décodeur UTF-8 incrémental) | **actif** (identique delta par delta) | `STRATA_OLD_DETOK=1` | 4,9 ms → ~1 µs par token à 16K (MESURÉ ici) |
 | #32 O9b | Cache des pièces BPE + encodage incrémental des prompts | **actif** (ids identiques par construction) | `STRATA_OLD_PROMPT_ENCODE=1` ; contrôle : `STRATA_CHECK_PROMPT_IDS=1` | 482 ms → 3,7 ms au tour suivant, à 101K tokens (MESURÉ ici) |
-| #33 O9c | Avertissement quand le niveau de réflexion change en cours de conversation | **actif** (message seulement, prompt inchangé) | — | aucun (documentation) |
+| #33 O9c | Avertissement quand le niveau de réflexion change en cours de conversation | **actif** (message seulement, prompt inchangé) | - | aucun (documentation) |
 | #34 O9d | `chat.py` renvoie `reasoning_content` | **actif** dans `chat.py` | `python chat.py --drop-thinking` | 0,2 à 2 s par tour (ESTIMÉ) |
 | #34 O9d | Le serveur réinjecte la réflexion omise par un client | **désactivé** | `--recall-reasoning`, `"recall_reasoning": true` dans la config, ou `STRATA_RECALL_REASONING=1` | 0,2 à 2 s par tour (ESTIMÉ) |
-| #35 O9e | Cache d'images indexé par les octets bruts ; lien dur pour une image seule | **actif** (mêmes embeddings) | — | 50 à 500 ms par image WebP/TIFF et par tour (ESTIMÉ) |
+| #35 O9e | Cache d'images indexé par les octets bruts ; lien dur pour une image seule | **actif** (mêmes embeddings) | - | 50 à 500 ms par image WebP/TIFF et par tour (ESTIMÉ) |
 | #49 E6 | `make_profile.py` mélange traces et classement de base | **actif** dans l'outil (`--trace-weight 0.5`) | `--trace-weight 0` (sortie identique à l'octet près à l'ancienne) | meilleur taux de hits initial (HYPOTHÈSE) |
 | #50 S1 | `calibrate.py` mesure `--spec` sur demande | **désactivé** | `--spec 4,5,6` ou `STRATA_CALIBRATE_SPEC=4,5,6` | à mesurer |
 | #52 S4 | `mtp_pack.py` : recherche d'échelle élargie ou exacte, échelles négatives | **désactivé** (`grid`, octets identiques) | `--q2-search wide` ou `--q2-search exact` | erreur RMS 0,411 → 0,351 (MESURÉ ici) ; acceptation : HYPOTHÈSE |
