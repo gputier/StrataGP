@@ -76,6 +76,8 @@ struct Rig {
         ck(cudaMalloc(&scratch, 256), "scratch");
         ck(cudaMalloc(&row, 16), "row");
         ck(cudaMemset(row, 0, 16), "row zero");
+        // cudaMemset runs on the legacy stream, which the non-blocking `s` does not wait for
+        ck(cudaDeviceSynchronize(), "setup");
         auto head = [&](unsigned long long h) {
             // the round's work: it leaves p0 in probs[*row], here the bits of pos_dst[0], copied at every launch
             if (cudaMemsetAsync(scratch, 0, 256, s) != cudaSuccess) return false;

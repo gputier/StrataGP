@@ -140,6 +140,8 @@ void run_case(const char* name, int64_t max_cells, int64_t cells, const std::vec
     }
     a.fill(junk);
     b.fill(junk);
+    // every upload above runs on the legacy stream, which the non-blocking `cs` does not wait for
+    ck(cudaDeviceSynchronize(), "setup");
     const float eps = 1e-6f, base = (float) k::qsa_freq_base();
     int64_t c0 = 0, chunks = 0;
     bool ok = true;
