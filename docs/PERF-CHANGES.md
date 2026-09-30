@@ -93,7 +93,7 @@ Dernière colonne : ce qui est actif sans rien passer, et l'option exacte pour r
 | #51 | [S3] Évaluer : prédire les experts de la couche suivante pour lancer leurs copies en avance | research | fait | outil `tools/routing_locality.py` ; `--dump-routing` trace aussi les fenêtres |
 | #52 | [S4] Évaluer : meilleure quantification du brouillon MTP (taux d'acceptation) | server-tools | fait | **désactivé** : `mtp_pack.py --q2-search wide\|exact` ; A/B `tools/ab_oneshot.py --variant` |
 | #53 | [S5] Évaluer : état GDN en BF16 (moitié moins de trafic) | research | fait | **désactivé** : `--gdn-state-bf16` |
-| #54 | [S6] Évaluer : prefill couche par couche (chaque expert diffusé une fois par prompt) | — | non traité | — |
+| #54 | [S6] Évaluer : prefill couche par couche (chaque expert diffusé une fois par prompt) | - | non traité | - |
 
 ## 2. Tous les interrupteurs
 
@@ -183,8 +183,8 @@ présence (`STRATA_OLD_MOE_GROUP=0` active l'ancien chemin), d'autres n'accepten
 | `make_profile.py --trace-weight W` | 0,5 | poids des traces dans le classement ; 0 = ancienne sortie | server-tools |
 | `calibrate.py --spec 4,5,6` / `STRATA_CALIBRATE_SPEC=4,5,6` | absent | mesure aussi la taille de fenêtre | server-tools |
 | `mtp_pack.py --q2-search grid\|wide\|exact` | `grid` | recherche d'échelle Q2_0 du brouillon MTP (échelles négatives avec `wide`/`exact`) | server-tools |
-| `tools/ab_oneshot.py`, `tools/bench_turns.py` | — | A/B entrelacés du moteur ; conversation multi-tours contre un serveur | server-tools |
-| `tools/logits_kl.py`, `tools/routing_locality.py`, `tools/prefill_chunk_check.py` | — | KL entre deux `--dump-logits` ; localité du routage ; comparaison de tailles de morceau | research, correctness |
+| `tools/ab_oneshot.py`, `tools/bench_turns.py` | - | A/B entrelacés du moteur ; conversation multi-tours contre un serveur | server-tools |
+| `tools/logits_kl.py`, `tools/routing_locality.py`, `tools/prefill_chunk_check.py` | - | KL entre deux `--dump-logits` ; localité du routage ; comparaison de tailles de morceau | research, correctness |
 
 ## 3. Validation sur la RTX 5090
 
@@ -310,7 +310,7 @@ son contrôle de précision. Ne pas en activer deux à la fois.
 | `STRATA_ROPE_F64=1` | `rope_parity` ; KL forcé et aiguilles à 128K (voir [perf/correctness.md](perf/correctness.md)) | meilleure précision aux grandes positions |
 | `STRATA_SPEC_T1=1` (sans `--mtp`) | tokens identiques attendus (T = 1 contre T = 4) | tokens identiques et plus rapide |
 | `--gdn-state-bf16` | `gdn_state_bf16_parity` ; `tools/logits_kl.py` sur 4K à 32K tokens ; gain au-delà du bruit | KL négligeable **et** gain mesurable (attendu ≤ 1 %) |
-| `calibrate.py --spec 4,5,6` | — (mesure) | la fenêtre la plus rapide est écrite dans la config |
+| `calibrate.py --spec 4,5,6` | - (mesure) | la fenêtre la plus rapide est écrite dans la config |
 | `mtp_pack.py --q2-search wide` | `s2_grouped_parity` (échelles négatives) ; taux d'acceptation par `tools/ab_oneshot.py --variant` | acceptation meilleure |
 
 ## 4. Limites connues et reste à faire
@@ -494,4 +494,8 @@ Ce cas touche la répartition sur plusieurs GPU, qui impose `--no-prefill-borrow
   [#57](https://github.com/gputier/StrataGP/issues/57).
 - Le retour à l'amont : l'amont 0.1.24 a refait une partie des lots (C-2, C-3, D-2, D-4, F-1, PR #109,
   top-k QSA sur tensor cores) ; les correctifs et les lots encore nouveaux lui sont proposés dans
-  [Niko1221/Strata#149](https://github.com/Niko1221/Strata/issues/149).
+  [Niko1221/Strata#149](https://github.com/Niko1221/Strata/issues/149). Réponse du 29/09/2026 : les six
+  correctifs sont dans [Niko1221/Strata#154](https://github.com/Niko1221/Strata/pull/154), rebasée sur 0.1.26
+  le 30/09/2026 (branche `fix/correctness`), qui attend sa porte d'identité à l'octet. Ensuite, une PR par lot
+  sur 0.1.26, dans cet ordre : sampler top-k, noyau Q2_0 groupé, décodage de grille IQ. L'indexeur et la
+  conv GDN tiled sont écartés, l'amont les a faits de son côté.
