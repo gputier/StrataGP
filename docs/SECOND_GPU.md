@@ -1,4 +1,4 @@
-# CUDA1–3 expert experiment
+# CUDA1 to CUDA3 expert experiment
 
 CUDA0 keeps the dense layers, KV/state, MTP and its existing expert cache. Up to
 three independent expert caches fill CUDA1, CUDA2 and CUDA3 in that order. Each
@@ -68,7 +68,7 @@ slots without recompiling, edit the values after `--expert-cache-device1`,
 
 Compare identical requests at one, two and four GPUs, preferably with several
 repeats. VRAM use alone does not show useful offload: compare the per-request
-CUDA1–3 counts and tokens per second. More GPU contexts and synchronization
+CUDA1 to CUDA3 counts and tokens per second. More GPU contexts and synchronization
 may lower the speed. Prompt prefill still uses CUDA0; secondary GPUs serve
 decode, including MTP verification. No peer-to-peer access is required.
 
