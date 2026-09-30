@@ -1685,7 +1685,7 @@ def main() -> int:
     ap.add_argument("--fit-max-tokens", action="store_true",
                     help="clamp max_tokens to the remaining context instead of rejecting the request "
                          "(default: reject with 400, like llama.cpp; also \"fit_max_tokens\": true in the config)")
-    ap.add_argument("--api-key", default=os.environ.get("STRATA_API_KEY", ""),
+    ap.add_argument("--api-key", default=None,
                     help="require this key on /v1/*, /status, /metrics, /settings and /mcp (Authorization: Bearer ... or "
                          "x-api-key); also $STRATA_API_KEY")
     ap.add_argument("--mcp-config", help="a JSON file with MCP servers in Claude Desktop's format ({\"mcpServers\": "
@@ -1696,14 +1696,17 @@ def main() -> int:
                          "live sequence instead of reading the last answer again (changes those clients' prompts; also "
                          "\"recall_reasoning\": true in the config or STRATA_RECALL_REASONING=1)")
     a = ap.parse_args()
-    if ("STRATA_API_KEY" in os.environ and not os.environ["STRATA_API_KEY"].strip()) or any(
-            (x == "--api-key" and i + 1 < len(sys.argv) and not sys.argv[i + 1].strip()) or x.strip() == "--api-key="
-            for i, x in enumerate(sys.argv)):
-        # #213: an empty key would switch authentication off without a word; refused before the minutes of loading
-        print("[strata] an API key was given but it is empty: set a key, or leave --api-key / STRATA_API_KEY out",
-              file=sys.stderr)
-        return 2
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
+    # #213: an empty key would switch authentication off without a word; refused before the minutes of loading.
+    # Checked on the effective values: the command line wins over $STRATA_API_KEY (so an empty variable does not
+    # matter when a key is given), and the config's key counts too.
+    if a.api_key is None:
+        a.api_key = os.environ.get("STRATA_API_KEY")
+    if (a.api_key is not None and not a.api_key.strip()) or (
+            "api_key" in cfg and not (isinstance(cfg["api_key"], str) and cfg["api_key"].strip())):
+        print("[strata] an API key was given but it is empty: set a key, or leave --api-key / STRATA_API_KEY / "
+              "\"api_key\" in the config out", file=sys.stderr)
+        return 2
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
@@ -1755,7 +1758,7 @@ def main() -> int:
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
-    svc.api_key = a.api_key or cfg.get("api_key", "")
+    svc.api_key = a.api_key or cfg.get("api_key") or ""
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     if a.recall_reasoning or cfg.get("recall_reasoning") is True or os.environ.get("STRATA_RECALL_REASONING") == "1":
         svc.recall = ReasoningRecall()                  # issue #34

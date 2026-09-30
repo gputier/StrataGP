@@ -947,5 +947,65 @@ class VisionCache(unittest.TestCase):
         self.assertEqual(v.proc.encodes, 1)
 
 
+class _Reached(Exception):
+    """raised by the patched serve(): main() got past the API key check."""
+
+
+class EmptyApiKey(unittest.TestCase):
+    """#213: a key that is present but empty is refused before the engine loads; the effective value counts."""
+
+    def run_main(self, argv, env=None, cfg=None):
+        """-> (return code, the API key the service got, or None when main() stopped before serving)."""
+        import io
+        import tempfile
+        from unittest import mock
+        import serve.server as S
+        args = ["server.py", "--engine", "mock", "--port", "0", *argv]
+        seen = {}
+
+        def fake_serve(svc, host=None, port=None):
+            seen["key"] = svc.api_key
+            raise _Reached
+
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.dict(os.environ, env or {}, clear=False), \
+                mock.patch.object(S, "serve", fake_serve), mock.patch.object(sys, "argv", args), \
+                mock.patch.object(sys, "stderr", new=io.StringIO()):
+            if env is None or "STRATA_API_KEY" not in env:
+                os.environ.pop("STRATA_API_KEY", None)
+            if cfg is not None:
+                p = Path(d) / "cfg.json"
+                p.write_text(json.dumps(cfg), encoding="utf-8")
+                args += ["--config", str(p)]
+            try:
+                return S.main(), seen.get("key")
+            except _Reached:
+                return 0, seen["key"]
+
+    def test_abbreviated_empty_flag_refused(self):
+        self.assertEqual(self.run_main(["--api="]), (2, None))
+        self.assertEqual(self.run_main(["--api", ""]), (2, None))
+        self.assertEqual(self.run_main(["--api-key", "  "]), (2, None))
+
+    def test_empty_env_alone_refused(self):
+        self.assertEqual(self.run_main([], env={"STRATA_API_KEY": ""}), (2, None))
+
+    def test_empty_env_with_key_on_the_command_line_accepted(self):
+        self.assertEqual(self.run_main(["--api-key", "abc"], env={"STRATA_API_KEY": ""}), (0, "abc"))
+
+    def test_env_key_accepted(self):
+        self.assertEqual(self.run_main([], env={"STRATA_API_KEY": "fromenv"}), (0, "fromenv"))
+
+    def test_empty_key_in_config_refused(self):
+        self.assertEqual(self.run_main([], cfg={"api_key": ""}), (2, None))
+        self.assertEqual(self.run_main([], cfg={"api_key": "   "}), (2, None))
+
+    def test_no_key_at_all_still_starts(self):
+        self.assertEqual(self.run_main([]), (0, ""))
+
+    def test_config_key_used(self):
+        self.assertEqual(self.run_main([], cfg={"api_key": "cfgkey"}), (0, "cfgkey"))
+
+
 if __name__ == "__main__":
     unittest.main()

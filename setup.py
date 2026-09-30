@@ -1209,6 +1209,9 @@ def main() -> int:
                     help="tune the engine's settings for this PC (about 5-10 minutes), then start the model")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
+    if a.api_key is not None and not a.api_key.strip():
+        # an empty key written to the config would switch the server's authentication off
+        ap.error("--api-key is empty: give a key, or leave --api-key out")
     say("StrataGP - Qwen3.8-Flash-Next on a normal PC (NVIDIA GPU + system RAM + CPU)")
     data, elsewhere = data_folder(a.data_dir)          # the model files: in the data folder, found from any copy
     roots = [data, *elsewhere]
