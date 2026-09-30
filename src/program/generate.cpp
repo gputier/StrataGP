@@ -1875,6 +1875,14 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d: the session state failed\n", st.dev);
             return 1;
         }
+        // The main session is zeroed above and `--serve` zeroes every stage's with it (`resume == 0`): a stage's
+        // `sbuf_s` is `cudaMalloc`'d too, so without this its GDN/QSA/PLE state starts from whatever the allocator
+        // last held.
+        strata::core::session_zero(st.ss, g, nullptr, (void*) st.stream);
+        if (cudaStreamSynchronize(st.stream) != cudaSuccess) {
+            std::fprintf(stderr, "strata generate: layer split, CUDA%d: zeroing the session state failed\n", st.dev);
+            return 1;
+        }
         const strata::core::WeightRef* wo_s = st.wt.find("output.weight");
         if (wo_s == nullptr ||
             (last && !o.native_head_gguf.empty() && !st.head.load(o.native_head_gguf, g.n_embd, wo_s->ne1, err))) {
@@ -2153,8 +2161,9 @@ int main(int argc, char** argv) {
         // (with borrowing - the default with a profile - the prompt path lends cache slots instead)
         const bool borrow = !o.no_prefill_borrow && !o.expert_profile.empty();
         const int64_t prefill_mib = (o.prefill_chunk > 0 && !borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
-        // the draft layer's head and logits are allocated when it binds, after this: 0.1.27's CJK subset made them
-        // ~110-180 MiB larger, and out of the reserve they left 16 GB cards below the stall line (#199)
+        // the draft layer's logits and its head over the token subset (rt/draft_vocab.bin, 40,525 tokens in
+        // data/draft_vocab.bin) are allocated when it binds, after this: `bind_bytes` returns what `bind` will
+        // take, so the cache does not fill the VRAM they need (#199)
         const int64_t mtp_bind = (!o.mtp.empty() && native_head.loaded())
                                      ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) : 0;
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind;
