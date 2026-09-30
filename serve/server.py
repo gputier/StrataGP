@@ -25,6 +25,7 @@ import codecs
 import collections
 import base64
 import hashlib
+import hmac
 import json
 import os
 import queue
@@ -48,6 +49,7 @@ from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
+VISION_START = "<|vision_start|>"
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 
 
@@ -208,6 +210,11 @@ class StrataEngine:
             if "issue #29" in line:
                 return ("The engine stopped itself because it had stopped making progress - a hang it caught. Its log "
                         "line: " + line.strip() + " - please report it at github.com/gputier/StrataGP/issues.")
+        rc = self.proc.poll()
+        last = next((x.strip() for x in reversed(tail.splitlines()) if x.strip().startswith(("strata", "ERR"))), "")
+        if rc is not None and rc >= 0 and last:          # it ended by itself: its own last words say why (#215)
+            return (f"The engine exited (code {rc}). Its last log line: {last} - if that does not explain it, please "
+                    "report it at github.com/gputier/StrataGP/issues with the log.")
         return ("The usual cause is running out of RAM: Linux then ends the biggest program (check: sudo dmesg | "
                 "grep -i -E 'killed process|out of memory'); Windows slows down instead. Close other programs or use a "
                 "smaller model (Q2_0 / IQ2_XS).")
@@ -300,8 +307,9 @@ class StrataEngine:
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
         self.progress = None
-        head = f"GENI {int(max_new)}{self.projection_key(sampling or {})} {embeddings}" if embeddings else \
-            f"GEN {int(max_new)}{self.sampling_keys(sampling or {}) if not embeddings else ''}"
+        # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
+        head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
+            f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
         try:
             self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
             self.proc.stdin.flush()
@@ -645,7 +653,7 @@ class Service:
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.fifo = threading.Lock()
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
-        self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
+        self.api_key = ""                              # when set, /v1/*, /status, /metrics, /settings, /mcp need it
         self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
         # since the server started (the Monitor's totals, issue #35)
@@ -791,6 +799,7 @@ class Service:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
             pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
+            start = self.tok.encode(VISION_START, parse_special=True)[0]
             # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
@@ -811,11 +820,17 @@ class Service:
                     with open(combined, "wb") as f:
                         for path, _ in encoded:
                             f.write(path.read_bytes())
+            # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
+            # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
+            # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
+            literal = self.tok.encode(IMAGE_PAD, parse_special=False)
             out, k = [], 0
-            for t in ids:                               # one <|image_pad|> per image -> one per image token
-                if t == pad and k < len(encoded):
+            for j, t in enumerate(ids):
+                if t == pad and j > 0 and ids[j - 1] == start and k < len(encoded):
                     out += [pad] * encoded[k][1]
                     k += 1
+                elif t == pad:
+                    out += literal
                 else:
                     out.append(t)
             if k != len(encoded):
@@ -976,6 +991,8 @@ class Service:
                     if os.environ.get("STRATA_DEBUG") and raw_ids:
                         print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
                 self.status["busy"] = False
+                self.status.pop("tail", None)            # #212: the answer's end is not kept once it is done
+                self.status.pop("tool", None)
         tail = parser.finish()
         if recall is not None:
             self._said(said, tail)
@@ -1289,7 +1306,7 @@ def make_handler(svc: Service):
                 return True
             auth = self.headers.get("Authorization", "")
             given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
-            if given == svc.api_key:
+            if hmac.compare_digest(given.encode(), svc.api_key.encode()):   # #213: constant-time
                 return True
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
             return False
@@ -1354,6 +1371,8 @@ def make_handler(svc: Service):
                 self._json(200, {"status": "ok", "max_context": svc.engine.max_context, "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key)})
             elif path == "/status":
+                if not self._authorized():                  # #212: it shows the end of the last answer
+                    return
                 with svc.status_lock:
                     s = dict(svc.status)
                 now = time.time()
@@ -1667,7 +1686,8 @@ def main() -> int:
                     help="clamp max_tokens to the remaining context instead of rejecting the request "
                          "(default: reject with 400, like llama.cpp; also \"fit_max_tokens\": true in the config)")
     ap.add_argument("--api-key", default=os.environ.get("STRATA_API_KEY", ""),
-                    help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); also $STRATA_API_KEY")
+                    help="require this key on /v1/*, /status, /metrics, /settings and /mcp (Authorization: Bearer ... or "
+                         "x-api-key); also $STRATA_API_KEY")
     ap.add_argument("--mcp-config", help="a JSON file with MCP servers in Claude Desktop's format ({\"mcpServers\": "
                                          "{...}}); the web app's chat can use their tools (also \"mcp_servers\" in "
                                          "the config)")
@@ -1676,6 +1696,13 @@ def main() -> int:
                          "live sequence instead of reading the last answer again (changes those clients' prompts; also "
                          "\"recall_reasoning\": true in the config or STRATA_RECALL_REASONING=1)")
     a = ap.parse_args()
+    if ("STRATA_API_KEY" in os.environ and not os.environ["STRATA_API_KEY"].strip()) or any(
+            (x == "--api-key" and i + 1 < len(sys.argv) and not sys.argv[i + 1].strip()) or x.strip() == "--api-key="
+            for i, x in enumerate(sys.argv)):
+        # #213: an empty key would switch authentication off without a word; refused before the minutes of loading
+        print("[strata] an API key was given but it is empty: set a key, or leave --api-key / STRATA_API_KEY out",
+              file=sys.stderr)
+        return 2
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu

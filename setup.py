@@ -36,6 +36,7 @@ import os
 import platform
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -57,11 +58,13 @@ PREBUILT_ASSET = "strata-windows-x64.zip" if WIN else "strata-linux-x64.zip"
 # the CUDA libraries the ready-made engine loads (the same CUDA 13.0 it is built with), from NVIDIA's pip packages
 CUDA_WHEELS = ["nvidia-cublas==13.0.2.14", "nvidia-cuda-runtime==13.0.96"]
 MIN_DRIVER = 580                       # CUDA 13.0
-MIN_ENGINE = (0, 1, 21)                # v0.1.21: multi-GPU layer split (--gpus); v0.1.20: system-prompt checkpoint, PCIe probe, hit rate; v0.1.19: penalties
+MIN_ENGINE = (0, 1, 28)                # v0.1.28: the expert cache reserves the draft head, a cancelled request no longer fails the next; v0.1.27: RTX 20 (sm_75) in the ready-made engine, the HIP build without CUDA headers; v0.1.26: the draft layer's prompt pass in batches; v0.1.25: faster prompts (grouping off the copy engine, fused hyper-connection kernels), AMD HIP backend, --kv k8v4; v0.1.24: long prompts faster (QSA select on tensor cores); v0.1.23: image requests honor sampling, 8 GB cards start, batched verify window; v0.1.22: faster prompts (tensor-core attention), multi-GPU across images/steering/KV streaming; v0.1.21: multi-GPU layer split (--gpus); v0.1.20: system-prompt checkpoint, PCIe probe, hit rate; v0.1.19: penalties
 PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "cmake", "ninja", "pillow", "psutil"]
 
 MODELS = {
-    "Q2_0": {"about": "2-bit, the fastest", "download_gb": 66.4, "ram_gb": 48, "arena_gb": 34.0},
+    # the original model only for now: Swift 1.5's Q2_0 files split one layer's experts across the two shards, which
+    # the pack tool (tools/iq_pack.py) cannot prepare yet (#171)
+    "Q2_0": {"about": "2-bit, the fastest", "download_gb": 66.4, "ram_gb": 48, "arena_gb": 34.0, "families": ("qwen",)},
     "IQ2_XS": {"about": "2-bit i-quant, a little better quality, close in speed", "download_gb": 68.0, "ram_gb": 48,
                "arena_gb": 35.5},
     "IQ3_XXS": {"about": "3-bit i-quant, better quality, slower (more CPU work per token)", "download_gb": 75.8,
@@ -220,7 +223,7 @@ def cpu_info():
     name, avx2, avx512 = platform.processor() or "unknown CPU", False, False
     if WIN:
         pf = ctypes.windll.kernel32.IsProcessorFeaturePresent
-        avx2 = bool(pf(40))                       # PF_AVX2_INSTRUCTIONS_AVAILABLE
+        avx2 = bool(pf(40)) or _cpuid_avx2()      # PF_AVX2_INSTRUCTIONS_AVAILABLE, else the CPU itself (#159)
         n = out(["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_Processor).Name"]).strip()
         name = n or name
         avx512 = bool(pf(41)) and _cpuid_avx512_full()
@@ -254,6 +257,47 @@ def _cpuid_avx512_full() -> bool:
         need_ebx = (1 << 16) | (1 << 30) | (1 << 31)                   # F, BW, VL
         need_ecx = (1 << 1) | (1 << 11)                                # VBMI, VNNI
         return (ebx & need_ebx) == need_ebx and (ecx & need_ecx) == need_ecx
+    except Exception:
+        return False
+
+
+def _run_stub(code: bytes, *args) -> None:
+    """Runs a few bytes of x64 machine code (Windows calling convention: the arguments in rcx, rdx)."""
+    k32 = ctypes.windll.kernel32
+    k32.VirtualAlloc.restype = ctypes.c_void_p
+    k32.VirtualFree.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32)
+    buf = k32.VirtualAlloc(None, len(code), 0x3000, 0x40)
+    if not buf:
+        raise OSError("VirtualAlloc failed")
+    try:
+        ctypes.memmove(buf, code, len(code))
+        ctypes.CFUNCTYPE(None, *[ctypes.c_void_p] * len(args))(buf)(*args)
+    finally:
+        k32.VirtualFree(buf, 0, 0x8000)
+
+
+def _cpuid_avx2() -> bool:
+    """AVX2 asked from the CPU (CPUID leaf 7 EBX bit 5), with the OS saving the YMM registers (OSXSAVE + XCR0):
+    Windows' IsProcessorFeaturePresent(PF_AVX2) says no on some PCs whose CPU has it (a Ryzen 9 3950X, #159)."""
+    try:
+        def cpuid(leaf):
+            regs = (ctypes.c_uint32 * 4)()
+            _run_stub(bytes([0x53, 0x49, 0x89, 0xC8, 0x89, 0xD0, 0x31, 0xC9, 0x0F, 0xA2,      # push rbx; r8=rcx; eax=edx; ecx=0; cpuid
+                             0x41, 0x89, 0x00, 0x41, 0x89, 0x58, 0x04, 0x41, 0x89, 0x48, 0x08,  # [r8]=eax, [r8+4]=ebx, [r8+8]=ecx
+                             0x41, 0x89, 0x50, 0x0C, 0x5B, 0xC3]),                             # [r8+12]=edx; pop rbx
+                      ctypes.addressof(regs), leaf)
+            return list(regs)
+        if cpuid(0)[0] < 7:
+            return False
+        ecx1 = cpuid(1)[2]
+        if not (ecx1 >> 27) & 1 or not (ecx1 >> 28) & 1:             # OSXSAVE, AVX
+            return False
+        xcr0 = (ctypes.c_uint32 * 2)()
+        _run_stub(bytes([0x49, 0x89, 0xC8, 0x31, 0xC9, 0x0F, 0x01, 0xD0,                        # r8=rcx; ecx=0; xgetbv
+                         0x41, 0x89, 0x00, 0x41, 0x89, 0x50, 0x04, 0xC3]), ctypes.addressof(xcr0))
+        if xcr0[0] & 6 != 6:                                           # the OS saves XMM and YMM
+            return False
+        return bool((cpuid(7)[1] >> 5) & 1)
     except Exception:
         return False
 
@@ -316,7 +360,9 @@ def find_vcvars():
     vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio/Installer/vswhere.exe"
     if not vswhere.exists():
         return None
-    p = out([str(vswhere), "-latest", "-products", "*", "-requires",
+    # CUDA 13 accepts Visual Studio 2019 and 2022 only: a newer one (2026 = version 18) installed next to them
+    # must not be picked ("unsupported Microsoft Visual Studio version"); with only a newer one there is none
+    p = out([str(vswhere), "-latest", "-products", "*", "-version", "[16.0,18.0)", "-requires",
              "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"]).strip()
     v = Path(p) / "VC/Auxiliary/Build/vcvars64.bat" if p else None
     return v if v and v.exists() else None
@@ -400,10 +446,44 @@ def download(url, dst: Path, what=None):
             warn(f"download interrupted ({e}); retrying in 10 s ...")
             time.sleep(10)
     if total and part.stat().st_size != total:
-        fail(f"could not finish downloading {dst.name}", "check your internet connection and run it again")
+        fail(f"could not finish downloading {dst.name}: {part.stat().st_size:,} bytes on disk, the server says {total:,}",
+             "check your internet connection and run it again (the download resumes where it stopped)")
     part.replace(dst)
     mark(dst)
     ok(f"{what or dst.name} downloaded")
+
+
+def whole_shard(s: Path) -> bool:
+    """A shard as long as its own tensor directory says (check_shards' test, without stopping setup)."""
+    sys.path.insert(0, str(ROOT / "tools"))
+    from gguf_reader import GGUFFile
+    try:
+        g = GGUFFile(s)
+        return s.stat().st_size >= g.data_start + max((t.offset + (t.expected_bytes() or 0) for t in g.tensors),
+                                                     default=0)
+    except (OSError, ValueError, struct.error):
+        return False
+
+
+def check_shards(shards):
+    """Every shard present and whole, or setup stops naming the file and the numbers.  Whole means as long as
+    its own tensor directory says (the header is read, the data is not): a truncated copy (--gguf-dir, a .part
+    renamed by hand, a download finished by an older setup) otherwise passes as a model file and the engine
+    fails much later, at the first tensor that runs past the end."""
+    sys.path.insert(0, str(ROOT / "tools"))
+    from gguf_reader import GGUFFile
+    for s in shards:
+        if not s.exists():
+            fail(f"missing {s}")
+        try:
+            g = GGUFFile(s)
+        except (ValueError, struct.error) as e:
+            fail(f"{s.name} is not a whole GGUF shard ({e})", "delete it and run setup again")
+        need = g.data_start + max((t.offset + (t.expected_bytes() or 0) for t in g.tensors), default=0)
+        have = s.stat().st_size
+        if have < need:
+            fail(f"{s.name} is short: {have:,} of {need:,} bytes ({need - have:,} missing)",
+                 "delete it and run setup again (or copy the whole file into --gguf-dir)")
 
 
 def get_llama_cpp():
@@ -416,7 +496,9 @@ def get_llama_cpp():
     tmp = ROOT / "third_party" / "_unpack"
     shutil.rmtree(tmp, ignore_errors=True)
     with zipfile.ZipFile(z) as f:
-        f.extractall(tmp)
+        # llama.cpp's own web UI (tools/ui) is not used, and its deep paths passed Windows' 260-character limit in a
+        # folder like Downloads\Strata-main\Strata-main (#206)
+        f.extractall(tmp, [m for m in f.namelist() if "/tools/ui/" not in m])
     top = next(tmp.iterdir())
     shutil.rmtree(llama, ignore_errors=True)
     # PR #63: on Windows a rename can fail with PermissionError while an antivirus scanner still holds a file of the
@@ -589,7 +671,8 @@ def update_installed_engine(url_base) -> None:
 def install_build_tools(gpu, yes):
     """The compiler and the CUDA toolkit, installed for the user (asks once).  Returns (nvcc, vcvars)."""
     nvcc, cuda_v = find_nvcc()
-    need_cuda = (12, 8) if int(gpu["arch"]) >= 120 else (12, 0)
+    # RTX 50 (sm_120): CUDA 13.0 - an engine built with 12.8 crashed in the prompt path on Linux (#220)
+    need_cuda = (13, 0) if int(gpu["arch"]) >= 120 else (12, 0)
     vcvars = find_vcvars() if WIN else None
     have_cc = vcvars is not None if WIN else shutil.which("g++") is not None
     missing = []
@@ -854,7 +937,18 @@ def data_folder(requested: str | None) -> tuple:
         warn(f"cannot use {dest} for the model files ({e}): keeping them in {ROOT}")
         dest = ROOT
     elsewhere = []
-    for folder in [ROOT, *other_installs(settings)]:
+    # #198: the data folder remembered before (a --data-dir to a new place) is a source too, and so is a Strata-data
+    # folder nested in any of them (an install that kept its models one level down)
+    sources = [ROOT, *other_installs(settings)]
+    if settings.get("data_dir") and Path(settings["data_dir"]) != dest:
+        sources.append(Path(settings["data_dir"]))
+    sources += [f / "Strata-data" for f in list(sources) if (f / "Strata-data") != dest]
+    seen = set()
+    for folder in sources:
+        key = os.path.normcase(str(folder))
+        if key in seen:
+            continue
+        seen.add(key)
         if folder == dest or not has_data(folder):
             continue
         if not same_drive(folder, dest):
@@ -1023,11 +1117,18 @@ def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
     return cfg
 
 
-def start(cfg_path: Path, port: int | None, gpu: int | None = None, open_browser=True) -> int:
+def start(cfg_path: Path, port: int | None, gpu: int | None = None, open_browser=True, keep=None) -> int:
+    """keep: settings given on this start that the model keeps from now on (--host, --api-key)."""
     cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
     missing = [p for p in [cfg["exe"], *[a for a in cfg["args"] if a.endswith(".gguf")]] if not Path(p).exists()]
     if missing:
         fail(f"{cfg_path.name} refers to missing files: {missing[0]}", "run it again with --setup to repair")
+    keep = {k: v for k, v in (keep or {}).items() if v is not None}
+    if keep and any(cfg.get(k) != v for k, v in keep.items()):   # #179: a --host/--api-key on a start was ignored
+        cfg.update(keep)
+        cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+        ok("saved for this model: " + ", ".join("api key" if k == "api_key" else f"{k.replace('_', ' ')} {v}"
+                                                for k, v in keep.items()))
     cfg_path.touch()                                     # the most recently used model
     cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
            "--port", str(port or cfg.get("port", 8080))]
@@ -1150,19 +1251,22 @@ def main() -> int:
                 say(f"  {i}) {json.loads(c.read_text(encoding='utf-8-sig')).get('model_name', c.stem)}")
             pick_cfg = have[int(ask("Tune which one?", [str(i) for i in range(1, len(have) + 1)], "1", a.yes)) - 1]
         calibrate_config(pick_cfg)
-        return 0 if a.no_start else start(pick_cfg, a.port, a.gpu)
+        return 0 if a.no_start else start(pick_cfg, a.port, a.gpu,
+                                          keep={"host": a.host, "api_key": a.api_key})
     if have and not (a.setup or a.model or a.family or a.check or a.no_start):
         if not a.build:
             update_installed_engine(a.prebuilt)
         if len(have) == 1:
-            return start(have[0], a.port, a.gpu)
+            return start(have[0], a.port, a.gpu,
+                         keep={"host": a.host, "api_key": a.api_key})
         say()
         for i, c in enumerate(have, 1):
             say(f"  {i}) {json.loads(c.read_text(encoding='utf-8-sig')).get('model_name', c.stem)}")
         say(f"  {len(have) + 1}) install another model / change settings")
         pick = int(ask("Which one?", [str(i) for i in range(1, len(have) + 2)], "1", a.yes))
         if pick <= len(have):
-            return start(have[pick - 1], a.port, a.gpu)
+            return start(have[pick - 1], a.port, a.gpu,
+                         keep={"host": a.host, "api_key": a.api_key})
 
     # ---- 1. the PC
     step(1, "checking your PC")
@@ -1235,8 +1339,17 @@ def main() -> int:
     rec = str(names.index("IQ3_XXS") + 1) if ram >= 60 and "IQ3_XXS" in names else "1"
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
     if ram < MODELS[model]["ram_gb"] - 4:
-        fail(f"{model} needs about {MODELS[model]['ram_gb']} GB of RAM; this PC has {ram:.0f} GB",
-             "choose Q2_0 or IQ2_XS, or add RAM")
+        # #125: a warning and a question, not a stop: the user may accept paging (asked, "no" by default, so an
+        # unattended --yes install still stops here)
+        need_gb, arena = MODELS[model]["ram_gb"], MODELS[model]["arena_gb"]
+        warn(f"{model} needs about {need_gb} GB of RAM and this PC has {ram:.0f} GB: its experts alone are "
+             f"{arena:.0f} GB and must stay in RAM, so Windows/Linux will page part of them from disk. Expect it "
+             "to be much slower, and it may not start at all.")
+        say("       A smaller size (Q2_0 or IQ2_XS) fits; more RAM fixes it.")
+        if ask("  Install it anyway?", ["y", "n"], "n", a.yes) != "y":
+            fail(f"{model} needs about {need_gb} GB of RAM; this PC has {ram:.0f} GB",
+                 "choose Q2_0 or IQ2_XS, or add RAM")
+        warn(f"installing {model} with {ram:.0f} GB of RAM, as you chose")
     ok(f"size: {model}")
     tag = fam["tag"] + model                           # names of the pack, config and start script
     rec_ctx = 32768 if gpu["vram_gb"] < 14 else 65536 if gpu["vram_gb"] < 20 else 131072
@@ -1249,9 +1362,14 @@ def main() -> int:
         for i, c in enumerate(CONTEXTS, 1):
             say(f"  {i}) {c // 1024}K tokens" + ("   (recommended for your GPU)" if c == rec_ctx else ""))
         ctx = CONTEXTS[int(ask("Context?", [str(i) for i in range(1, 6)], str(CONTEXTS.index(rec_ctx) + 1), a.yes)) - 1]
-    if model in ("IQ3_XXS", "IQ3_S") and ram < 90 and ctx > 131072:
-        warn(f"{model} with a 262K context needs more than 64 GB of RAM ({MODELS[model]['arena_gb']:.0f} GB of experts "
-             "+ the context): using 128K")
+    # The experts' arena plus the context's KV (in RAM from 64K up: ~13.7 KB/token at 8 bits) must fit, with room
+    # for everything else. Counted, not a fixed 90 GB: 24 GB of room keeps the rule for 64 GB PCs as it was (128K
+    # for both 3-bit models), while a box with ~84 GB keeps the 262K it asked for (measured: a Colab A100-40G runs
+    # IQ3_S at 262K with images in 56 of its 83.5 GiB).
+    need_gb = MODELS[model].get("arena_gb", 0) + ctx * 13 * 1056 / 1e9 + 24
+    if model in ("IQ3_XXS", "IQ3_S") and ram < need_gb and ctx > 131072:
+        warn(f"{model} with a {ctx // 1024}K context needs about {need_gb:.0f} GB of RAM "
+             f"({MODELS[model]['arena_gb']:.0f} GB of experts + the context + room for the rest): using 128K")
         ctx = 131072
     ok(f"context: {ctx} tokens")
     # the KV cache (the model's memory of the conversation): 8-bit, or 4-bit after a Hadamard rotation (PR #21)
@@ -1301,6 +1419,12 @@ def main() -> int:
                 models_dir, shards = cand[0].parent, cand
                 ok(f"model files found in {models_dir}")
                 break
+    for s in shards:                                   # #173: a whole file copied in by hand has no finish mark
+        if s.exists() and not done(s) and whole_shard(s):
+            try:
+                mark(s, "whole (checked against its own tensor directory)")
+            except OSError as e:                       # a read-only folder (--gguf-dir on a share): the file is still whole
+                warn(f"{s.name} is whole but its finish mark cannot be written ({e})")
     have_model = all(s.exists() and (done(s) or a.gguf_dir) for s in shards)
     need = (0 if a.gguf_dir or have_model else MODELS[model]["download_gb"]) + 8 + \
         (40 if model == "Q2_0" and avx512 and family == "qwen" else 0) + (1 if vision != "none" else 0)
@@ -1345,9 +1469,7 @@ def main() -> int:
                 except OSError:
                     pass
             download(fam["hf"].format(q=model) + s.name, s)
-    for s in shards:
-        if not s.exists():
-            fail(f"missing {s}")
+    check_shards(shards)
     ok("model files present")
     mmproj = Path(a.models_dir) / fam["mmproj"]
     if not mmproj.exists():

@@ -1702,6 +1702,21 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: session_init failed\n");
         return 1;
     }
+    // **A GENERATE RUN ON A NATIVE PACK NEVER ZEROED THE SESSION STATE.**  The canonical path zeroes it from
+    // `put_input` at position 0 (`session_zero`, with the embedding as `R`), but a native pack breaks out of that
+    // loop before the first `put_input` - it runs verify windows instead - and neither the batched prompt path
+    // nor the verifier zeroes anything.  `sbuf` is `cudaMalloc`'d, so the GDN recurrence, the QSA KV/indexer
+    // state, the PLE history and `R` all started from whatever the allocator last held: finite on a fresh
+    // allocation and overflow/NaN after reuse, which surfaced as the whole layer stack saturating and every
+    // prompt decoding to the same token.  `--serve` zeroes exactly this state when `resume == 0`; generate mode
+    // always starts from an empty sequence, so it must too.
+    // (#167) Every pack, not only a native one: a canonical pack whose prompt goes through the batched prompt path
+    // (--prefill) starts at position 0 without a put_input, so it never zeroed the state either.
+    strata::core::session_zero(ss, g, nullptr, main_cs);
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        std::fprintf(stderr, "strata generate: zeroing the session state failed\n");
+        return 1;
+    }
     if (g.n_qsa_layers() > 0 && ss.qsa_states[0].kv_mode == 1)
         std::fprintf(stderr, "strata generate: KV streaming: %lld of %lld cells per QSA layer in VRAM, the K/V in "
                              "%.2f GiB of pinned RAM\n", (long long) (ss.qsa_states[0].n_slots * 4),
@@ -1858,6 +1873,14 @@ int main(int argc, char** argv) {
             cudaStreamCreateWithFlags(&st.adapt_stream, cudaStreamNonBlocking) != cudaSuccess ||
             cudaEventCreateWithFlags(&st.adapt_ev, cudaEventDisableTiming) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d: the session state failed\n", st.dev);
+            return 1;
+        }
+        // The main session is zeroed above and `--serve` zeroes every stage's with it (`resume == 0`): a stage's
+        // `sbuf_s` is `cudaMalloc`'d too, so without this its GDN/QSA/PLE state starts from whatever the allocator
+        // last held.
+        strata::core::session_zero(st.ss, g, nullptr, (void*) st.stream);
+        if (cudaStreamSynchronize(st.stream) != cudaSuccess) {
+            std::fprintf(stderr, "strata generate: layer split, CUDA%d: zeroing the session state failed\n", st.dev);
             return 1;
         }
         const strata::core::WeightRef* wo_s = st.wt.find("output.weight");
@@ -2138,12 +2161,21 @@ int main(int argc, char** argv) {
         // (with borrowing - the default with a profile - the prompt path lends cache slots instead)
         const bool borrow = !o.no_prefill_borrow && !o.expert_profile.empty();
         const int64_t prefill_mib = (o.prefill_chunk > 0 && !borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
-        const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib) << 20;
+        // the draft layer's logits and its head over the token subset (rt/draft_vocab.bin, 40,525 tokens in
+        // data/draft_vocab.bin) are allocated when it binds, after this: `bind_bytes` returns what `bind` will
+        // take, so the cache does not fill the VRAM they need (#199)
+        const int64_t mtp_bind = (!o.mtp.empty() && native_head.loaded())
+                                     ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) : 0;
+        const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind;
         int64_t slots = ((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
-        std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved -> %d slots\n",
-                     (double) free_b / 1073741824.0, o.vram_reserve_mib, o.expert_cache);
+        std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved (+%lld MiB for the "
+                             "draft head) -> %d slots\n",
+                     (double) free_b / 1073741824.0, o.vram_reserve_mib, (long long) (mtp_bind >> 20), o.expert_cache);
+        if (o.expert_cache == 0)   // the verify window cannot start without it (#174): say what makes room
+            std::fprintf(stderr, "strata generate: no VRAM is left for the expert cache: lower --max-context, use "
+                                 "--kv k8v4, run images on the CPU, or close other programs that use the GPU\n");
     }
     // plan v0.3 P6: a native pack's blobs differ per layer, so with a profile its slots are sized per pair: the
     // same VRAM holds ~30% more IQ3_XXS experts than slots of the largest blob would
@@ -3213,6 +3245,8 @@ int main(int argc, char** argv) {
             } else if (o.prefill_auto) {
                 o.prefill_chunk = 1024;   // nothing lendable: small buffers of its own
             }
+        } else if (o.prefill_auto && d_res == nullptr) {
+            o.prefill_chunk = 1024;       // #85: no expert cache at all (a full 8 GB card): small buffers of its own
         }
         if (borrow != nullptr)
             std::fprintf(stderr, "strata serve: the prompt path borrows %lld cache slots (%.2f GiB)\n",
@@ -3232,6 +3266,10 @@ int main(int argc, char** argv) {
         if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
         if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes)) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+            if (err.find("fit") != std::string::npos)   // #85: say what frees VRAM
+                std::fprintf(stderr, "strata serve: the GPU has too little free VRAM for the prompt path: turn images "
+                                     "off (setup: --vision no), close other programs using the GPU, use a shorter "
+                                     "context, or read prompts in smaller chunks (--prefill 512)\n");
             return 1;
         }
         mem_mark("the head and the prompt path");
@@ -3669,6 +3707,7 @@ int main(int argc, char** argv) {
                 ~BusyScope() { strata::core::progress().busy.store(false); strata::core::progress_at("idle"); }
             } busy_scope;
             stop_req.store(false);   // a STOP that arrived between requests is stale
+            err.clear();
             const bool geni = line.rfind("GENI ", 0) == 0;
             if (!geni && line.rfind("GEN ", 0) != 0) {
                 std::printf("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>\n");
@@ -3688,7 +3727,8 @@ int main(int argc, char** argv) {
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
-            if (endp != nullptr) {   // GENI takes only cvec=; its file path is the first token without an =
+            if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
+                                     // embedding file path is the first token without an =
                 for (;;) {
                     while (*endp == ' ') ++endp;
                     const char* start = endp;
@@ -3700,7 +3740,6 @@ int main(int argc, char** argv) {
                     const std::string key = tok.substr(0, eq);
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
                     if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
-                    else if (geni) {}   // image requests decode greedily
                     else if (key == "temperature") req_temperature = fv;
                     else if (key == "top_p") req_top_p = fv;
                     else if (key == "top_k") req_top_k = std::atoi(tok.c_str() + eq + 1);
@@ -3941,6 +3980,7 @@ int main(int argc, char** argv) {
             };
             // tokens [a, b) through the windows: commit all of them, then give the draft layer their residuals
             auto read_windows = [&](int64_t a, int64_t b, std::string& e) -> bool {
+                strata::core::progress_at("reading the prompt (verify windows), from token", a);   // #217: not "batched"
                 // every token is committed and the picks are discarded: no head sampling (see set_head_sampling)
                 struct NoHeadSampling {
                     strata::core::Verifier& v;
@@ -4082,6 +4122,7 @@ int main(int argc, char** argv) {
             int64_t at = read_from;
             for (const int64_t to : {reread_to, root_at, turn_at, n - 1}) {
                 if (to <= at) continue;
+                err.clear();
                 const bool win = windows_ok(at, to);
                 if (win && !refill(err)) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
@@ -4103,6 +4144,13 @@ int main(int argc, char** argv) {
                     if (!stop_req.load()) {
                         std::fprintf(stderr, "strata serve: %s\n", err.c_str());
                         std::printf("ERR %s\n", err.c_str());
+                        // #224: a CUDA fault (an illegal address) poisons the context for the whole process, and
+                        // unwinding the destructors on it could hang until the 60 s watchdog: leave at once
+                        if (cudaPeekAtLastError() != cudaSuccess) {
+                            std::fflush(stdout);
+                            std::fflush(stderr);
+                            std::_Exit(1);
+                        }
                         return 1;
                     }
                     cancelled = true;   // stopped while reading the prompt: refill the lent slots below, then DONE cancel

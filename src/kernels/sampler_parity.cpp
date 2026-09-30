@@ -265,7 +265,7 @@ int sampled_cut(const std::vector<float>& l, const std::vector<int>& hist, const
     return cut;
 }
 
-// ---- the kernel's own semantics, for the fixtures of issue #20 ----
+// ---- the kernel's own semantics, for the fixtures ----
 //
 // `sampled_reference` picks the first unpicked logit even when it is -inf or NaN; the kernels never pick either, and
 // a round that finds nothing stores id 0 with a -inf logit (and later rounds treat id 0 as taken, as `sampler_kernel`
@@ -441,7 +441,7 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "usage: sampler_parity [--selftest] [--bench]\n"); return 2; }
     }
     {
-        // the sampled path under test (issue #20); ctest runs this binary once per path
+        // the sampled path under test; ctest runs this binary once per path
         auto on = [](const char* n) { const char* e = std::getenv(n); return e && *e && std::strcmp(e, "0") != 0; };
         std::printf("  sampled path: %s\n", on("STRATA_OLD_SAMPLER")         ? "sampler_kernel (STRATA_OLD_SAMPLER)"
                                             : on("STRATA_SAMPLER_ONE_BLOCK") ? "one block (STRATA_SAMPLER_ONE_BLOCK)"
@@ -1025,7 +1025,7 @@ int main(int argc, char** argv) {
         cudaFree(input); cudaFree(output);
     }
 
-    // ---- fixture 16: THE WHOLE top_k LIST, POSITION BY POSITION, UNDER TIES (issue #20).  A pick shows the list
+    // ---- fixture 16: THE WHOLE top_k LIST, POSITION BY POSITION, UNDER TIES.  A pick shows the list
     // through one draw; this reads the list itself.  Every row holds a +inf logit, so the tail's arithmetic is NaN
     // (inf - inf), no cut fires and no draw lands: the chain returns its LAST kept entry, sel_ids[k - 1].  Launching
     // top_k = 1..64 then reads the list one position at a time - its set and its order.  The rows make the order
@@ -1119,7 +1119,7 @@ int main(int argc, char** argv) {
         bad += wrong + (sentinels == 0);
     }
 
-    // ---- fixture 17: SAMPLED DRAWS UNDER TIES (issue #20).  The realistic chain - finite logits on half steps,
+    // ---- fixture 17: SAMPLED DRAWS UNDER TIES.  The realistic chain - finite logits on half steps,
     // so dozens of tokens share each value near the top - through every stage: top_k 1 / 20 / 64, top_p 0.9 / 1,
     // min_p 0 / 0.05, a hot temperature that spreads the draws over the whole list, penalties off and on (half of
     // each window on the row's head, so they reorder it).  17 rows (the split's scratch is first sized for 16: this
@@ -1197,7 +1197,7 @@ int main(int argc, char** argv) {
         bad += wrong + (tied == 0);
     }
 
-    // ---- fixture 18: THE DEFAULT PATH'S AUTOMATIC FALLBACKS (issue #20).  (a) A stream under graph capture
+    // ---- fixture 18: THE DEFAULT PATH'S AUTOMATIC FALLBACKS.  (a) A stream under graph capture
     // (ThreadLocal mode) gets the one-block kernel, penalty bitmap in dynamic shared memory, inside the graph: the
     // capture must succeed and the replayed graph (twice) must pick the mirror's tokens; the same stream uncaptured
     // then takes the split path (its scratch is first allocated after the capture) and picks the same.  (b) More

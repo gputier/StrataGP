@@ -1,6 +1,6 @@
 // src/kernels/bf16_bits_test.cpp - `bf16_bits.hpp` against ggml's rule, over EVERY f32 bit pattern (CPU only).
 //
-// #13: the rounding add `i + 0x7FFF + bit16` carries out of the mantissa for a NaN, so 0x7FFFFFFF came back as
+// the rounding add `i + 0x7FFF + bit16` carries out of the mantissa for a NaN, so 0x7FFFFFFF came back as
 // -0 and 0x7F800001 as +inf - an upstream NaN was masked instead of propagated.  `ggml_compute_fp32_to_bf16`
 // (ggml-impl.h at the pinned llama.cpp) tests the NaN first and returns `(i >> 16) | 64`.  Three checks, all
 // exhaustive (2^32 inputs, a few seconds):
@@ -25,7 +25,7 @@ uint16_t ggml_bf16(uint32_t u) {
     return (uint16_t) ((u + (0x7fffu + ((u >> 16) & 1u))) >> 16);
 }
 
-/// The rule before #13, kept only to prove the change is confined to NaN inputs.
+/// The rule before this fix, kept only to prove the change is confined to NaN inputs.
 uint16_t previous_bf16(uint32_t u) {
     u = (u + ((u >> 16) & 1u) + 0x7FFFu) & 0xFFFF0000u;
     return (uint16_t) (u >> 16);

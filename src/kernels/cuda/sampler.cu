@@ -11,7 +11,7 @@
 // does that against an independently computed distribution.
 //
 // `sampler_greedy_kernel` is the plain argmax, one block per token over the vocabulary.  The sampled chain has
-// three implementations that pick the same token, bit for bit (issue #20):
+// three implementations that pick the same token, bit for bit:
 //   - the SPLIT top_k (default): `sampler_split_part_kernel` cuts each row into 4,096-logit blocks over the whole
 //     GPU, each keeps its own top_k, and `sampler_split_merge_kernel` merges those lists and runs the tail;
 //   - `sampler_one_block_kernel` (`STRATA_SAMPLER_ONE_BLOCK=1`, and the fallback when the split cannot run): one
@@ -179,7 +179,7 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
 /// order - is unchanged; `top_p`'s cut reads that order in double arithmetic as before; temperature and the
 /// Philox draw apply after the cut.  `sampler_parity` pins all of it against the host reference.
 ///
-/// **KEPT AS THE REFERENCE, BEHIND `STRATA_OLD_SAMPLER=1` (issue #20).**  Two costs remain in it: the `taken`
+/// **KEPT AS THE REFERENCE, BEHIND `STRATA_OLD_SAMPLER=1`.**  Two costs remain in it: the `taken`
 /// sweep is O(k) per logit per round, O(k^2 x n_vocab) per row (47 M shared-memory compares at k = 20, 500 M at
 /// 64), and the double-precision tail runs on all 1,024 threads where one warp suffices - GeForce issues FP64 at
 /// 1/64 of FP32.  The kernels after this one remove both and select the same list in the same order.
@@ -315,7 +315,7 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
     if (threadIdx.x == 0) out[t] = pick;
 }
 
-// ---- issue #20: the same list, in the same order, without the `taken` sweep ----
+// ---- the same list, in the same order, without the `taken` sweep ----
 //
 // THE SELECTION ORDER.  `sampler_kernel`'s rounds rank a candidate (value, id) before (value', id') when value >
 // value', or value == value' and id < id' - each thread's ascending scan keeps the first maximum it meets (strict
@@ -661,7 +661,7 @@ sampler_split_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_vo
     sampled_tail_warp(sel_ids, sel_logit, k, p, t, out, ex);
 }
 
-// Which sampled path runs, read once (issue #20): `STRATA_OLD_SAMPLER=1` is `sampler_kernel` (engine 0.1.20),
+// Which sampled path runs, read once: `STRATA_OLD_SAMPLER=1` is `sampler_kernel` (engine 0.1.20),
 // `STRATA_SAMPLER_ONE_BLOCK=1` the one-block kernel; by default the split top_k wherever it applies.
 enum class SampledPath { Split, OneBlock, Old };
 

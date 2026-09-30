@@ -280,7 +280,7 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 }
 
 namespace {
-// B13 (#11): the verify window's per-entry tables in `expert_pool_dispatch_multi` (`kind`, `distinct`, `first_of`)
+// the verify window's per-entry tables in `expert_pool_dispatch_multi` (`kind`, `distinct`, `first_of`)
 // are fixed arrays of this many entries: MAXT tokens of the model's 10 routed experts must fit, and a larger k is
 // refused at run time rather than written past them.
 constexpr int64_t kMaxWindowEntries = 128;

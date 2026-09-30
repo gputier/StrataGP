@@ -29,7 +29,7 @@ namespace strata::kernels {
 
 /// Round-to-nearest-even f32 -> bf16, returned as raw bits in the LOW half of the uint16.
 ///
-/// **A NaN IS PASSED THROUGH, QUIETED, AS `ggml_compute_fp32_to_bf16` DOES (#13).**  The rounding add alone
+/// **A NaN IS PASSED THROUGH, QUIETED, AS `ggml_compute_fp32_to_bf16` DOES.**  The rounding add alone
 /// carries out of the mantissa for a NaN: 0x7FFFFFFF became 0x8000 (-0) and 0x7F800001 became 0x7F80 (+inf), so
 /// a NaN upstream was masked instead of propagated.  The test is on the magnitude bits, the result keeps the
 /// sign and the top mantissa bits and sets the quiet bit (64 = bit 6 of the bf16).  Every non-NaN input,

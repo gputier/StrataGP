@@ -261,6 +261,9 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 | Everything the Monitor tab shows (engine, live state, last requests, hardware) | `GET /metrics` |
 | The MCP servers, their state and tools ([below](#tools-from-mcp-servers)) | `GET /mcp` |
 
+With an API key set, everything above needs it (`Authorization: Bearer <key>` or `x-api-key`) except `GET /health`
+and the page's own files.
+
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
   "model": "strata", "messages": [{"role": "user", "content": "Write a haiku about GPUs."}], "max_tokens": 512 }'

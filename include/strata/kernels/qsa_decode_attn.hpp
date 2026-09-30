@@ -39,7 +39,7 @@ struct QsaAttnPools {
 ///   kQsaAttnChunk32  the prefetching kernel over 32 cells per block: twice the blocks, but a different split of the
 ///                    softmax, so NOT bitwise equal - opt-in (STRATA_QSA_CHUNK=32)
 /// A cell whose page did not resolve (page table < 0: KV streaming overflow, `kv_stream.hpp` ctl[3]) is masked with
-/// weight 0 in every variant instead of being read from before the pool (B14, #12).
+/// weight 0 in every variant instead of being read from before the pool.
 enum QsaAttnVariant : int { kQsaAttnPrefetch = 0, kQsaAttnOld = 1, kQsaAttnChunk32 = 2 };
 ///   STRATA_QSA_ATTN_BATCH_OLD=1  the previous kernel for n_q > 1 only (batched prefill, verify), bitwise neutral:
 ///                    the prefetching kernel's 48 KB of shared memory allow 2 blocks per SM, to A/B on prefill

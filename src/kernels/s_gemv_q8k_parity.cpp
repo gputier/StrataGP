@@ -72,7 +72,7 @@ struct Case {
     bool has_offset;
 };
 
-/// #2: THE RAGGED LAST BLOCK.  The split kernels give each warp one row and a block eight warps, so with
+/// THE RAGGED LAST BLOCK.  The split kernels give each warp one row and a block eight warps, so with
 /// `n_out % 8 != 0` the last block holds warps that have no row.  Those warps used to return BEFORE the
 /// codebook barrier - undefined behaviour that every real shape (a multiple of 8) avoided.  Here `n_out` is
 /// deliberately ragged, every row is checked against the host reference over the same bytes, and a guard
@@ -331,7 +331,7 @@ int main(int argc, char** argv) {
         cudaFree(d_xf); cudaFree(d_xq); cudaFree(d_codes); cudaFree(d_scales); cudaFree(d_offs); cudaFree(d_y);
     }
 
-    // ---- 4. #2: output widths that are NOT a multiple of the eight rows per block
+    // ---- 4. output widths that are NOT a multiple of the eight rows per block
     std::printf("\n");
     for (const Case& cs : cases)
         for (long long n_out : {1LL, 7LL, 9LL, 61LL}) bad += ragged_rows(cs, n_out);
