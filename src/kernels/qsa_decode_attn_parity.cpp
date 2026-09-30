@@ -5,7 +5,7 @@
 //      host softmax over the same decoded pool values, for fp16, int8 and q4_0 pools behind a permuted page table,
 //      with a batch of queries whose widths cover one cell, partial chunks, whole chunks and the full 2,051;
 //   2. the prefetching kernel BITWISE equal to the previous one, in the batch and the single-query forms;
-//   3. B14 (#12): cells whose page is -1 (a KV-streaming overflow) are masked in every variant - the output is the
+//   3. cells whose page is -1 (a KV-streaming overflow) are masked in every variant - the output is the
 //      reference without those cells, a chunk with no resolvable cell contributes nothing, and a query with none
 //      at all gives zeros;
 //   4. a V pool that is not 16-byte aligned falls back to the previous kernel, bitwise;
@@ -286,7 +286,7 @@ bool run(int fmt) {
                 single_bad == 0);
         ok &= single_bad == 0;
     }
-    // 3. B14: unresolved pages are masked
+    // 3. unresolved pages are masked
     {
         std::vector<int32_t> holes = table;
         // every 5th page the selections name, a run of 16 consecutive pages (one whole 64-cell chunk of the 2,051
