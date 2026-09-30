@@ -155,7 +155,7 @@ __global__ void s_gemv_q8_split_kernel(const uint8_t* __restrict__ x, const uint
     // THE LOAD AND THE BARRIER COME BEFORE THE EARLY RETURN, as in `s_gemv_q8k_kernel`.  The return used to
     // sit above them, so whenever `n_out % 8 != 0` the last block's surplus warps left before a barrier the
     // others still waited at - undefined behaviour that every shape in the pack (a multiple of 8) happened to
-    // avoid (#2).  `o` is per-WARP, so the return below keeps whole warps together and the shuffle reduction's
+    // avoid.  `o` is per-WARP, so the return below keeps whole warps together and the shuffle reduction's
     // full mask stays valid.
     __shared__ signed char s_iq4nl[16];
     if (threadIdx.x < 16) s_iq4nl[threadIdx.x] = kIq4Nl[threadIdx.x];

@@ -104,7 +104,7 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
         if (t < n_here) {
             const int cell = ids[c0 + t];
             const long long page = (long long) p.page_table[cell / page_size];
-            // B14: a block the KV streaming could not make resident keeps page -1 (ctl[3]); its cells are masked
+            // a block the KV streaming could not make resident keeps page -1 (ctl[3]); its cells are masked
             // (score -FLT_MAX, weight 0) instead of being read from before the pool.
             if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
         }
@@ -147,7 +147,7 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
 #pragma unroll
     for (int h = 0; h < G; ++h) acc[h] = 0.0f;
     for (int c = 0; c < n_here; ++c) {
-        if (srow[c] < 0) continue;   // B14: masked above, weight 0
+        if (srow[c] < 0) continue;   // masked above, weight 0
         float v;
         if constexpr (KV_MODE == 0) {
             v = __half2float(__ushort_as_half(p.v_pool[srow[c] * HD + t]));
@@ -259,7 +259,7 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_pf_kernel(const float* __r
         if (t < n_here) {
             const int cell = ids[c0 + t];
             const long long page = (long long) p.page_table[cell / page_size];
-            if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);   // B14, as above
+            if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);   // as above
         }
         srow[t] = r;
     }
