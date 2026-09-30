@@ -24,9 +24,15 @@ of a word): faster than you can read.
 ## What StrataGP adds
 
 StrataGP is a fork of **[Strata](https://github.com/Niko1221/Strata) by Niko1221**. The engine, the installer, the
-app, the measurements and the [paper](docs/paper/Strata-Paper.pdf) are his work; StrataGP follows it (currently engine
-**0.1.21**, upstream commit `f1b1d96`, including its experimental layer split: one model across two or three GPUs, see
-[docs/MULTI_GPU.md](docs/MULTI_GPU.md)) and adds a round of performance and precision work on top of it.
+app, the measurements and the [paper](docs/paper/Strata-Paper.pdf) are his work; StrataGP follows it and adds a round
+of performance and precision work on top of it. The base is upstream engine **0.1.21** (commit `f1b1d96`, including
+its experimental layer split: one model across two or three GPUs, see [docs/MULTI_GPU.md](docs/MULTI_GPU.md)), plus a
+targeted pick of 21 correctness fixes from upstream 0.1.22 to 0.1.29 (merge `bdabfcd`, checked on an RTX 5090; the
+CMake version reads 0.1.28). The rest of 0.1.22 to 0.1.29 was not taken, see
+[docs/PERF-CHANGES.md, section 6.6](docs/PERF-CHANGES.md#66-suivi). Upstream 0.1.29 already ships the StrataGP fixes
+(#154) and the sampler (#197); two more pull requests are open on it: the grouped Q2_0 kernels
+([Niko1221/Strata#241](https://github.com/Niko1221/Strata/pull/241)) and the IQ grid decode
+([Niko1221/Strata#242](https://github.com/Niko1221/Strata/pull/242)).
 
 **How it was done.** The engine was read end to end and audited: [docs/AUDIT-PERF.md](docs/AUDIT-PERF.md) lists what
 could be faster or more exact, with an estimate for each item. That gave 53 issues; 52 of them were worked on, in 16

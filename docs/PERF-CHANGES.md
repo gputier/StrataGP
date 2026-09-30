@@ -497,8 +497,10 @@ Ce cas touche la répartition sur plusieurs GPU, qui impose `--no-prefill-borrow
   [Niko1221/Strata#149](https://github.com/Niko1221/Strata/issues/149). Réponse du 29/09/2026 : les six
   correctifs sont dans [Niko1221/Strata#154](https://github.com/Niko1221/Strata/pull/154) et le sampler dans
   #197 ; l'amont les a intégrés dans la 0.1.29. Notre base amont réelle reste la 0.1.21, plus la reprise ciblée
-  de 21 commits de justesse de 0.1.22 à 0.1.29 (porte GPU passée sur la .99). Restent à proposer, sur 0.1.29 :
-  la PR du noyau Q2_0 groupé, puis celle du décodage de grille IQ. L'indexeur et la conv GDN tiled sont écartés,
+  de 21 commits de justesse de 0.1.22 à 0.1.29 (porte GPU passée sur la .99). Le 30/09/2026, deux PR sont
+  ouvertes sur 0.1.29 : le noyau Q2_0 groupé
+  ([Niko1221/Strata#241](https://github.com/Niko1221/Strata/pull/241)) et le décodage de grille IQ
+  ([Niko1221/Strata#242](https://github.com/Niko1221/Strata/pull/242)). L'indexeur et la conv GDN tiled sont écartés,
   l'amont les a faits de son côté.
   Familles amont non reprises : perf D-1 (tensor cores), #187, E-9, mémoire épinglée, k8v4, faible RAM,
   multi-GPU par étages, HIP, CJK.

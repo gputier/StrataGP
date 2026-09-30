@@ -31,6 +31,10 @@ partiels.
   `--pcie-frac` » de la section 7 (S2).
 - **0.1.21** (`3801f86`) : sa propre correction de CMake pour T1 (`-DSTRATA_BUILD_TESTS=ON` sans le dossier
   `tests/`), qui remplace celle que `perf/base` (`b858f9b`) avait faite ; c'est la version de l'amont qui est gardée.
+- **0.1.22 à 0.1.29** : le moteur n'a pas été refusionné en bloc. Une reprise ciblée de 21 commits de justesse est
+  dans `main` (fusion `bdabfcd`, porte GPU passée sur la RTX 5090) ; l'amont 0.1.29 a aussi intégré les correctifs
+  de [Niko1221/Strata#154](https://github.com/Niko1221/Strata/pull/154) et le sampler de
+  [#197](https://github.com/Niko1221/Strata/pull/197). Détail : [`PERF-CHANGES.md`, section 6.6](PERF-CHANGES.md#66-suivi).
 
 Restent sans issue, par choix : le balayage CLOCK de `kv_stream.cu` (section B11 : cas impossible aujourd'hui) et le
 non-déterminisme du glouton avec le cache adaptatif (déjà documenté par le projet).
@@ -89,7 +93,7 @@ non-déterminisme du glouton avec le cache adaptatif (déjà documenté par le p
 | S3 | [#51](https://github.com/gputier/StrataGP/issues/51) | Évaluer : prédire les experts de la couche suivante pour lancer leurs copies en avance | fait | `research` |
 | S4 | [#52](https://github.com/gputier/StrataGP/issues/52) | Évaluer : meilleure quantification du brouillon MTP (taux d'acceptation) | fait | `server-tools` |
 | S5 | [#53](https://github.com/gputier/StrataGP/issues/53) | Évaluer : état GDN en BF16 (moitié moins de trafic) | fait | `research` |
-| S6 | [#54](https://github.com/gputier/StrataGP/issues/54) | Évaluer : prefill couche par couche (chaque expert diffusé une fois par prompt) | non fait | — |
+| S6 | [#54](https://github.com/gputier/StrataGP/issues/54) | Évaluer : prefill couche par couche (chaque expert diffusé une fois par prompt) | non fait | - |
 
 ## Ce qu'il faut retenir
 
@@ -270,10 +274,10 @@ Le taux de hits VRAM est de 0,72 ; le CPU lit 41 Go/s d'experts.
 |---|---:|---|---:|
 | Poids denses (lus une fois par fenêtre) | ~3,5 Go | VRAM 672 Go/s | 5,2 ms |
 | Experts en VRAM (~1 500 distincts, 72 % en VRAM) | ~1,5 Go | VRAM | 2,2 ms |
-| Experts sur CPU (28 %) | ~0,58 Go | DDR5, 41 Go/s mesurés en concurrence, 52 seul | 10,6–14 ms |
+| Experts sur CPU (28 %) | ~0,58 Go | DDR5, 41 Go/s mesurés en concurrence, 52 seul | 10,6 à 14 ms |
 | États GDN (lecture et écriture, plus la réécriture du commit) | ~0,45 Go | VRAM | 0,7 ms |
 | KV et indexeur à 4K | < 10 Mo | VRAM | ~0 |
-| Lignes PLE | T × 16 lignes (cache RAM, puis SSD) | NVMe, ~80 µs par lecture 4K à QD1 | 0–2 ms (voir O1) |
+| Lignes PLE | T × 16 lignes (cache RAM, puis SSD) | NVMe, ~80 µs par lecture 4K à QD1 | 0 à 2 ms (voir O1) |
 
 **Ce que cela montre :**
 - **GPU.** Le plancher est d'environ 7,4 ms, pour 14,6 ms mesurés : environ 50 % d'efficacité. L'écart vient des
@@ -512,7 +516,7 @@ Le coût du lancement est mesuré : le graphe par bloc tourne en 1,585 ms, contr
   `cudaGridDependencySynchronize()`, disponible sur sm_90+ dont sm_120 et compatible avec la capture de graphe. Il
   recouvre le prologue de chaque petit kernel avec la fin du précédent.
 
-**4. Gain (HYPOTHÈSE) :** environ 1 000 nœuds de moins par fenêtre à 1–2 µs pièce, plus le recouvrement PDL : **1 à
+**4. Gain (HYPOTHÈSE) :** environ 1 000 nœuds de moins par fenêtre à 1 à 2 µs pièce, plus le recouvrement PDL : **1 à
 3 ms par tour, soit 3 à 8 % (5070) et 6 à 15 % (5090)**. À mesurer avec `nsys` avant d'y investir.
 
 **5. Risque de précision :** faible. Seul l'ordre de réduction du routeur multi-colonnes change si l'on ne garde pas
