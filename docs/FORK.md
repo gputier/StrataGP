@@ -1,12 +1,19 @@
 # StrataGP, le fork
 
 StrataGP est un fork de [Strata](https://github.com/Niko1221/Strata), le moteur de Niko1221. Depuis le 3 octobre 2026,
-`main` repart de la version amont `v0.1.37` (`CMakeLists.txt` annonce `0.1.37`). Le README, les autres documents de
-`docs/` et le moteur sont ceux de l'amont, sauf les quatre ajouts ci-dessous.
+`main` repart de l'amont : il est à la version `v0.1.38` (tag `99f3dbd`, publiée le 3 octobre ; `CMakeLists.txt` annonce
+`0.1.38`). Le README, les autres documents de `docs/` et le moteur sont ceux de l'amont, sauf les quatre ajouts
+ci-dessous.
+
+Le même jour, `main` a d'abord repris la 0.1.37, puis fusionné la 0.1.38 (commit `236388d`, « Merge v0.1.38 into main »).
+Le delta du fork reste de 12 fichiers, comme sur la 0.1.37. La fusion n'a eu qu'un conflit, dans
+`tools/test_setup_choices.py`, où les tests des deux côtés sont gardés.
 
 ## Ce que le fork ajoute
 
-Quatre branches, fusionnées dans `main` et proposées une à une à l'amont :
+Quatre branches, fusionnées dans `main` et proposées une à une à l'amont. La 0.1.38 n'en reprend aucune. La #569 a dû
+être reportée sur la 0.1.38 (la branche de la PR pointe maintenant `1058756`) parce qu'elle entrait en conflit ; les
+trois autres restent fusionnables.
 
 - [Niko1221/Strata#567](https://github.com/Niko1221/Strata/pull/567), cache d'encodage du prompt. Le serveur ne
   retokenise que la fin du prompt, à partir du dernier jeton spécial qu'il partage avec un prompt récent
@@ -31,7 +38,7 @@ modèle IQ3_S, trois passages par cas, la 0.1.37 nue lit le prompt plus vite que
 groupée du prefill apportait +12 % sur l'ancien `main`, qui restait pourtant sous la 0.1.37. L'amont a repris les lots
 Q2_0 groupé et grille IQ dans sa 0.1.31 (anciennes PR 241 et 242), et d'autres sous une autre forme.
 
-`STRATA_PF_FUSED=1` reste disponible sur la 0.1.37 (lue dans `src/prefill/prefill.cpp`, décrite dans `docs/DETAILS.md`).
+Sur la 0.1.37, `STRATA_PF_FUSED=1` existe (lue dans `src/prefill/prefill.cpp`, décrite dans `docs/DETAILS.md`).
 Mesuré : lecture du prompt +7,5 % à 2 520 jetons et +17,5 % à 23 020, mais des jetons différents et une acceptation des
 brouillons de 0,612 contre 0,760 à 2 520. La variable n'est donc pas activée par défaut.
 
@@ -61,7 +68,8 @@ START-HERE.bat --setup --build
 RTX 5090), `deploy-build.bat` ne reconstruit que la cible `strata` dans le dossier de build du clone, voir la page
 StrataGP du wiki.
 
-Validation, depuis le dossier de build du clone : `ctest` pour les tests de parité (53 sur 53 le 3 octobre sur la `.99`),
+Validation, depuis le dossier de build du clone : `ctest` pour les tests de parité (61 sur 61 le 3 octobre sur la `.99`,
+sur le commit `236388d`),
 puis les tests Python `serve/test_*.py` et `tools/test_*.py`. Chaque ajout a ses tests : `ple_parity` et `gr_parity`
 pour #568, `serve/test_server.py` et `tools/test_strata_tokenizer.py` pour #567 et #569, `tools/test_setup_choices.py`
 pour #569 et #570.
