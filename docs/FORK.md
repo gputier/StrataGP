@@ -2,18 +2,20 @@
 
 StrataGP est un fork de [Strata](https://github.com/Niko1221/Strata), le moteur de Niko1221. Depuis le 3 octobre 2026,
 `main` repart de l'amont : il est à la version `v0.1.38` (tag `99f3dbd`, publiée le 3 octobre ; `CMakeLists.txt` annonce
-`0.1.38`). Le README, les autres documents de `docs/` et le moteur sont ceux de l'amont, sauf les quatre ajouts
+`0.1.38`). Le README, les autres documents de `docs/` et le moteur sont ceux de l'amont, sauf les cinq ajouts
 ci-dessous.
 
 Le même jour, `main` a d'abord repris la 0.1.37, puis fusionné la 0.1.38 (commit `236388d`, « Merge v0.1.38 into main »).
-Le delta du fork reste de 12 fichiers, comme sur la 0.1.37. La fusion n'a eu qu'un conflit, dans
-`tools/test_setup_choices.py`, où les tests des deux côtés sont gardés.
+La fusion n'a eu qu'un conflit, dans `tools/test_setup_choices.py`, où les tests des deux côtés sont gardés. Le correctif
+de la #594 est entré ensuite, par `106c457`. Mesuré par `git diff --stat v0.1.38 main`, le delta du fork est de 12
+fichiers, le même nombre que sur la 0.1.37 : le correctif de la #594 ne touche que `serve/server.py` et
+`serve/test_server.py`, déjà modifiés par les autres ajouts.
 
 ## Ce que le fork ajoute
 
-Quatre branches, fusionnées dans `main` et proposées une à une à l'amont. La 0.1.38 n'en reprend aucune. La #569 a dû
+Cinq branches, fusionnées dans `main` et proposées une à une à l'amont. La 0.1.38 n'en reprend aucune. La #569 a dû
 être reportée sur la 0.1.38 (la branche de la PR pointe maintenant `1058756`) parce qu'elle entrait en conflit ; les
-trois autres restent fusionnables.
+quatre autres restent fusionnables.
 
 - [Niko1221/Strata#567](https://github.com/Niko1221/Strata/pull/567), cache d'encodage du prompt. Le serveur ne
   retokenise que la fin du prompt, à partir du dernier jeton spécial qu'il partage avec un prompt récent
@@ -29,6 +31,14 @@ trois autres restent fusionnables.
 - [Niko1221/Strata#570](https://github.com/Niko1221/Strata/pull/570), `--gguf-dir` en lecture seule : si le dossier
   n'accepte pas l'écriture, `setup.py` avertit au lieu de s'arrêter quand il ne peut pas poser la marque de fin sur un
   fichier complet.
+- [Niko1221/Strata#594](https://github.com/Niko1221/Strata/pull/594), corps de requête lu avant la fermeture. Le
+  serveur HTTP/1.0 répond parfois sans avoir lu le corps (401 mauvaise clé, 403 origine ou `Host`, `/load`, `/unload`,
+  501 méthode sans gestionnaire) puis ferme la connexion. Sous Windows, fermer sur des octets non lus envoie un RST : un
+  client Python (`http.client`, `urllib`, `requests`), qui envoie le corps après les en-têtes, reçoit `WinError 10054`
+  au lieu de la réponse. `curl` n'est pas touché. Après chaque réponse, `_drain_body` dans `serve/server.py` lit et jette
+  le corps qu'aucun gestionnaire n'a pris, jusqu'à 1 MiB et avec un délai de 5 s par lecture. Un corps plus gros ou
+  chunked reste non lu, comme avant. La classe `AnswerBeforeTheBody` de `serve/test_server.py` compte 5 tests, rouges sur
+  la 0.1.38 nue et verts avec le correctif.
 
 ## Pourquoi un redémarrage depuis la 0.1.37
 
@@ -72,4 +82,7 @@ Validation, depuis le dossier de build du clone : `ctest` pour les tests de pari
 sur le commit `236388d`),
 puis les tests Python `serve/test_*.py` et `tools/test_*.py`. Chaque ajout a ses tests : `ple_parity` et `gr_parity`
 pour #568, `serve/test_server.py` et `tools/test_strata_tokenizer.py` pour #567 et #569, `tools/test_setup_choices.py`
-pour #569 et #570.
+pour #569 et #570, `serve/test_server.py` pour #594.
+
+Le correctif de la #594 a été validé sur `106c457` : la suite `serve` en conteneur Linux passe, 210 tests, OK avec 9
+ignorés ; `serve.test_server` sous Windows sur la `.99` (RTX 5090) a passé 123 tests avant la fusion.
