@@ -39,7 +39,9 @@ Cinq branches, fusionnées dans `main` et proposées une à une à l'amont. La 0
   une lecture de socket à la fois (`read1`), sinon un client qui envoie un octet de temps en temps n'est jamais lâché.
   Un corps chunked reste non lu, comme avant. La 0.1.39 lit déjà le corps de `/load` et `/unload` (#630) : ces deux
   routes et `/config` passent maintenant par `_body`, qui marque le corps comme lu, sinon la connexion se fermait 5 s
-  trop tard. La classe `AnswerBeforeTheBody` de `serve/test_server.py` compte 8 tests.
+  trop tard. Un corps de `/load` qui arrive en plus de 2 s reçoit un 400 : `_body` ne le marque alors pas comme lu, et
+  le drain lit la suite sur la socket, car Python refuse toute lecture de `rfile` après un dépassement de délai. La
+  classe `AnswerBeforeTheBody` de `serve/test_server.py` compte 10 tests.
 
 ## La liste de brouillon française (#664)
 
@@ -94,8 +96,8 @@ Validation, depuis le dossier de build du clone : `ctest` pour les tests de pari
 `serve/test_prompt_encoder.py`, `serve/test_server.py` et `tools/test_strata_tokenizer.py` pour #567,
 `serve/test_server.py` pour #569 et #594, `tools/test_setup_choices.py` pour #569 et #570.
 
-Mesuré le 5 octobre sur `main` (base 0.1.39), en conteneur Linux, Python 3.13, avec le vocabulaire qwen35 de
-llama.cpp : la suite `serve` passe 288 tests, 9 ignorés, avec 1 erreur dans `serve/test_responses.py`
+Mesuré le 5 octobre sur `main` (commit `dce5834`, base 0.1.39), en conteneur Linux, Python 3.13, avec le vocabulaire
+qwen35 de llama.cpp : la suite `serve` lance 290 tests, 9 ignorés, avec 1 erreur dans `serve/test_responses.py`
 (`test_json_schema_text_format`) qui sort aussi sur la 0.1.39 nue ; `tools/test_strata_tokenizer.py` passe 11 tests, 1
 ignoré. `tools/test_setup_amd.py`, `tools/test_setup_choices.py` et `tools/test_setup_golden.py` ont des échecs dans ce
 conteneur, les mêmes test pour test sur la 0.1.39 nue. Pas encore mesuré sur cette base : `ctest` et les tests sous
