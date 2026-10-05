@@ -100,5 +100,6 @@ Mesuré le 5 octobre sur `main` (commit `dce5834`, base 0.1.39), en conteneur Li
 qwen35 de llama.cpp : la suite `serve` lance 290 tests, 9 ignorés, avec 1 erreur dans `serve/test_responses.py`
 (`test_json_schema_text_format`) qui sort aussi sur la 0.1.39 nue ; `tools/test_strata_tokenizer.py` passe 11 tests, 1
 ignoré. `tools/test_setup_amd.py`, `tools/test_setup_choices.py` et `tools/test_setup_golden.py` ont des échecs dans ce
-conteneur, les mêmes test pour test sur la 0.1.39 nue. Pas encore mesuré sur cette base : `ctest` et les tests sous
-Windows sur la `.99`. Le 3 octobre, sur la 0.1.38 (commit `236388d`), `ctest` passait 61 tests sur 61.
+conteneur, les mêmes test pour test sur la 0.1.39 nue. Sur la `.99` (Windows, RTX 5090), pour le commit `d76de0c`,
+après un build complet : `ctest` passe 69 tests sur 69, et `serve.test_server`, `serve.test_security` et
+`serve.test_prompt_encoder` passent 183 tests sur 183.
