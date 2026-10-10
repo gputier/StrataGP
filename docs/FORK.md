@@ -3,7 +3,7 @@
 StrataGP est un fork de [Strata](https://github.com/Niko1221/Strata), le moteur de Niko1221. Depuis le 10 octobre 2026,
 `main` repart de l'amont à la version `v0.1.42` (tag `61b3fb5`). Le README, les autres documents de `docs/` et le
 moteur sont ceux de l'amont, sauf l'ajout ci-dessous. Mesuré par `git diff --stat v0.1.42 fork/main-0.1.42`, le delta du
-fork est de 7 fichiers (868 ajouts, 14 suppressions), ce document compris.
+fork est de 7 fichiers (901 ajouts, 14 suppressions), ce document compris.
 
 `main` a été reconstruit comme à la 0.1.37, à la 0.1.39 et à la 0.1.41 : une branche neuve depuis le tag `v0.1.42`, la
 fusion de la branche de PR, ce document, puis une fusion qui rattache l'ancien `main` sans garder son contenu
@@ -23,10 +23,10 @@ Une branche, fusionnée dans `main` et proposée à l'amont.
   0.1.42, les passages en texte brut des #537 et #931 (une balise `</think>` ou un `<|im_end|>` cité dans un message
   reste du texte) décident aussi des jetons spéciaux retenus. Le préfixe commun s'arrête donc là où ces passages
   diffèrent entre les deux prompts. Ce report est celui de blange48, repris dans notre commit avec lui en co-auteur. La
-  PR compte sept commits : le cache, les tests de serveur recalés sur un `encode_prompt` complet, un test des vecteurs
+  PR compte huit commits : le cache, les tests de serveur recalés sur un `encode_prompt` complet, un test des vecteurs
   de llama.cpp qui prend le vocabulaire qwen35 au lieu de celui d'un paquet choisi par `$STRATA_TOKENIZER`, le
   nettoyage de `ByteTokenizer`, la règle des prompts gardés, et deux corrections de revue : les prompts gardés suivent
-  les emplacements du cache de conversation du moteur, et le comptage de jetons ne stocke pas de prompt.
+  les emplacements du cache de conversation du moteur, y compris à un démarrage paresseux, et le comptage de jetons ne stocke pas de prompt.
 
   Cette règle vient de ce que tout prompt rendu commence par l'en-tête du modèle de conversation, une frontière de jeton
   spécial. Le prompt d'une autre conversation passait pour une suite du prompt gardé et le remplaçait : la requête d'un
@@ -121,5 +121,5 @@ Validation, depuis le dossier de build du clone : `ctest` pour les tests de pari
 
 Mesuré le 10 octobre sur `fork/main-0.1.42`, en conteneur Linux, Python 3.12, `pip install -r requirements.txt`, avec le
 vocabulaire qwen35 réel de llama.cpp (`STRATA_GGUF_PY`) : `python -m pytest -q serve tools/test_strata_tokenizer.py`
-passe 713 tests, 8 ignorés, 0 échec. La `v0.1.42` nue en passe 688, avec les mêmes 8 ignorés (le paquet de
-tokenisation de `serve/test_detok.py` et trois tests propres à Windows) : les 25 tests de plus sont ceux de l'ajout.
+passe 715 tests, 8 ignorés, 0 échec. La `v0.1.42` nue en passe 688, avec les mêmes 8 ignorés (le paquet de
+tokenisation de `serve/test_detok.py` et trois tests propres à Windows) : les 27 tests de plus sont ceux de l'ajout.
