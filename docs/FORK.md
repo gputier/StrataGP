@@ -2,7 +2,7 @@
 
 StrataGP est un fork de [Strata](https://github.com/Niko1221/Strata), le moteur de Niko1221. Depuis le 10 octobre 2026,
 `main` repart de l'amont à la version `v0.1.42` (tag `61b3fb5`). Le README, les autres documents de `docs/` et le
-moteur sont ceux de l'amont, sauf l'ajout ci-dessous. Mesuré par `git diff --stat v0.1.42 fork/main-0.1.42`, le delta du
+moteur sont ceux de l'amont, sauf l'ajout ci-dessous. Mesuré par `git diff --stat v0.1.42 main`, le delta du
 fork est de 7 fichiers (901 ajouts, 14 suppressions), ce document compris.
 
 `main` a été reconstruit comme à la 0.1.37, à la 0.1.39 et à la 0.1.41 : une branche neuve depuis le tag `v0.1.42`, la
@@ -119,7 +119,7 @@ Validation, depuis le dossier de build du clone : `ctest` pour les tests de pari
 `serve/test_*.py` et `tools/test_*.py`. L'ajout a ses tests : `serve/test_prompt_encoder.py`, `serve/test_server.py` et
 `tools/test_strata_tokenizer.py`.
 
-Mesuré le 10 octobre sur `fork/main-0.1.42`, en conteneur Linux, Python 3.12, `pip install -r requirements.txt`, avec le
+Mesuré le 10 octobre sur la branche `fork/main-0.1.42`, supprimée le 11/10/2026 (son contenu est dans `main`), en conteneur Linux, Python 3.12, `pip install -r requirements.txt`, avec le
 vocabulaire qwen35 réel de llama.cpp (`STRATA_GGUF_PY`) : `python -m pytest -q serve tools/test_strata_tokenizer.py`
 passe 715 tests, 8 ignorés, 0 échec. La `v0.1.42` nue en passe 688, avec les mêmes 8 ignorés (le paquet de
 tokenisation de `serve/test_detok.py` et trois tests propres à Windows) : les 27 tests de plus sont ceux de l'ajout.
