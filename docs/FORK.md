@@ -13,14 +13,14 @@ ne montre que `docs/FORK.md`.
 
 Le fork n'a plus de code à lui. Ce qu'il ajoutait se trouve dans l'amont.
 
-- [Niko1221/Strata#1852](https://github.com/Niko1221/Strata/pull/1852), cache d'encodage du prompt, la #567 de blange48
-  soumise de nouveau. Niko1221 l'a reprise dans la v0.1.45 par le commit `f13a870d5`, avec gputier et blange48 en
-  co-auteurs. Le travail a été rebasé à la main sur la 0.1.44.1, où `prepare()` prend un nouvel argument `cancel`. Les
-  fichiers `tools/strata_tokenizer.py`, `serve/test_prompt_encoder.py`, `tools/test_strata_tokenizer.py` et `SECURITY.md`
-  sont identiques à ceux de notre branche. `serve/server.py` porte les mêmes changements. Mesure de Niko1221 : sur une
-  conversation synthétique de 140 000 jetons, l'encodage à chaud passe de 22,6 ms à 5,4 ms, avec les mêmes identifiants.
-  Les PR #1455 (W1nge) et #1823 (xrip), encore ouvertes, font le même travail, et Niko1221 les dit couvertes par
-  celle-ci.
+- [Niko1221/Strata#1852](https://github.com/Niko1221/Strata/pull/1852), cache d'encodage du prompt, la #567, qui
+  reprenait le port de blange48, soumise de nouveau. Niko1221 l'a reprise dans la v0.1.45 par le commit `f13a870d5`,
+  avec gputier et blange48 en co-auteurs. Le travail a été rebasé à la main sur la 0.1.44.1, où `prepare()` prend un
+  nouvel argument `cancel`. Les fichiers `tools/strata_tokenizer.py`, `serve/test_prompt_encoder.py`,
+  `tools/test_strata_tokenizer.py` et `SECURITY.md` sont identiques à ceux de notre branche. `serve/server.py` porte les
+  mêmes changements. Mesure de Niko1221 : sur une conversation synthétique de 140 000 jetons, l'encodage à chaud passe
+  de 22,6 ms à 5,4 ms, avec les mêmes identifiants. Les PR #1455 (W1nge) et #1823 (xrip), encore ouvertes, font le même
+  travail, et Niko1221 les dit couvertes par celle-ci.
 
   Le serveur ne retokenise que la fin du prompt, à partir du dernier jeton spécial qu'il partage avec un prompt récent
   (`PromptEncoder` dans `tools/strata_tokenizer.py`, appelé par `Service.encode_prompt` dans `serve/server.py`). Les
@@ -63,11 +63,11 @@ en partie. Le fork n'en porte plus rien : il prend la version de l'amont.
   commit est pris : `gr_parity` et `ple_parity` attendent la fin de leur préparation avant de lancer leurs kernels sur
   un flux non bloquant.
 
+## Ce qui n'a pas été repris
+
 Deux choses ne sont pas reprises, donc perdues pour le fork. Le second commit de la #568 : `ple_parity` reste lié aux
 fichiers `ple_in.bin` et `ple_out.bin`, absents du dépôt, au lieu de la référence en double précision écrite dans le
-test. Et le refus de `setup.py --api-key` quand la clé est vide.
-
-## Ce qui n'a pas été repris
+test. Et, de la #569, le refus de `setup.py --api-key` quand la clé est vide.
 
 La #1934 n'a pas été reprise. Elle élargit la recherche d'échelle Q2_0 dans `tools/mtp_pack.py`, de 0,15 à 1,0 fois
 max|w|, avec deux signes.
@@ -76,10 +76,13 @@ Mesure de Niko1221 sur une RTX 3060, 4 prompts anglais de 200 jetons, 5 tours al
 2355/3567 (0,660) avec l'ancien pack, 2325/3585 (0,648) avec le nouveau. Décodage de 50,9 contre 52,4 jetons par
 seconde : l'écart tient dans le bruit de mesure. Le pack prend 9 min 15 au lieu de 2 min 20.
 
-Notre mesure, sur la RTX 5090 avec la liste de brouillon française en service, sur 8 paires, donne une acceptation de
-0,716 à 0,732. Nous avons fermé la PR le 17/10/2026. Le gain ne justifie pas un pack quatre fois plus long. La branche
-est gardée sous le tag `sauvegarde/pr-mtp-scale-0.1.42`. La tête de brouillon française construite avec ce packer
-(`mtp-fr-ms`) reste en service chez nous.
+Notre mesure de la #1934, rapportée dans le corps de la PR, sur la RTX 5090 avec la liste de brouillon française en
+service, donne sur 8 paires une acceptation de 0,716 à 0,732 et un débit de sortie de +9,4 % sur un prompt de 22 785
+jetons (8 paires sur 8). Les prompts courts et la lecture à froid de 99K jetons sont dans le bruit. Nous avons fermé la
+PR le 17/10/2026. La conclusion : un gain mesuré sur une seule carte, avec la liste de brouillon française, ne justifie
+pas un pack quatre fois plus long, et Niko1221 ne le retrouve pas sur la RTX 3060. La branche est gardée sous le tag
+`sauvegarde/pr-mtp-scale-0.1.42`. La tête de brouillon française construite avec ce packer (`mtp-fr-ms`) reste en
+service chez nous.
 
 ## La liste de brouillon française (#664)
 
@@ -127,9 +130,9 @@ historique par une fusion qui n'en garde pas le contenu : `git log` le montre, l
 
 ## Compiler et valider sous Windows
 
-Le moteur précompilé que télécharge `START-HERE.bat` vient des releases de l'amont. Le fork n'ayant plus de code à lui,
-ce moteur et le serveur de l'amont sont ceux du fork. Pour compiler le moteur soi-même, avec les Build Tools de Visual
-Studio et le CUDA Toolkit :
+Le moteur précompilé que télécharge `setup.py`, lancé par `START-HERE.bat`, vient des releases de l'amont
+(`setup.py:175`, `PREBUILT_URL`). Le fork n'ayant plus de code à lui, ce moteur et le serveur de l'amont sont ceux du
+fork. Pour compiler le moteur soi-même, avec les Build Tools de Visual Studio et le CUDA Toolkit :
 
 ```bat
 START-HERE.bat --setup --build
