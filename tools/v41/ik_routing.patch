@@ -1,0 +1,75 @@
+diff --git a/examples/imatrix/imatrix.cpp b/examples/imatrix/imatrix.cpp
+index b6dacfb..59996f4 100644
+--- a/examples/imatrix/imatrix.cpp
++++ b/examples/imatrix/imatrix.cpp
+@@ -10,6 +10,8 @@
+ #include "llama-spec-features.h"
+ 
+ #include <cmath>
++#include <cstdint>
++#include <cstdlib>
+ #include <cstdio>
+ #include <cstring>
+ #include <ctime>
+@@ -251,6 +253,11 @@ public:
+     void set_collect_lsim(bool yes_or_no) { m_collect_lsim = yes_or_no; }
+     void print_layer_importance();
+ private:
++    // Routing trace: set IK_IMATRIX_ROUTING=<file> to write, for every layer and every evaluated token, the
++    // layer and the expert ids chosen by the router. Written by dump_routing(), never read back here.
++    void dump_routing(const std::string & wname, const ggml_tensor * ids);
++    std::ofstream                          m_route_out;
++    bool                                   m_route_init = false;
+     std::unordered_map<std::string, Stats> m_stats;
+     gpt_params                             m_params;
+     std::mutex                             m_mutex;
+@@ -462,6 +469,8 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void *
+         m_ids.resize(ggml_nbytes(ids));
+         ggml_backend_tensor_get(ids, m_ids.data(), 0, ggml_nbytes(ids));
+ 
++        dump_routing(wname, ids);
++
+         auto & e = m_stats[wname];
+ 
+         ++e.ncall;
+@@ -610,6 +619,40 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void *
+     return true;
+ }
+ 
++void IMatrixCollector::dump_routing(const std::string & wname, const ggml_tensor * ids) {
++    if (!m_route_init) {
++        m_route_init = true;
++        if (const char * path = std::getenv("IK_IMATRIX_ROUTING")) {
++            m_route_out.open(path, std::ios::binary | std::ios::trunc);
++            // header: magic, then the number of experts chosen per token
++            const char magic[4] = {'R', 'T', 'R', '1'};
++            const int32_t n_used = (int32_t) ids->ne[0];
++            m_route_out.write(magic, sizeof(magic));
++            m_route_out.write((const char *) &n_used, sizeof(n_used));
++        }
++    }
++    if (!m_route_out.is_open()) {
++        return;
++    }
++    // one record per layer and per ubatch: the up projection is evaluated once per layer, fused or not
++    int il = -1;
++    if (std::sscanf(wname.c_str(), "blk.%d.ffn_up_exps", &il) != 1) {
++        return;
++    }
++    // record: uint16 layer, then n_used x uint16 expert ids; the k-th record of a layer is token k
++    for (int row = 0; row < (int) ids->ne[1]; ++row) {
++        uint16_t rec[1 + 16];
++        GGML_ASSERT(ids->ne[0] <= 16);
++        rec[0] = (uint16_t) il;
++        for (int idx = 0; idx < (int) ids->ne[0]; ++idx) {
++            rec[1 + idx] = (uint16_t) *(const int32_t *) (m_ids.data() + row*ids->nb[1] + idx*ids->nb[0]);
++        }
++        m_route_out.write((const char *) rec, (1 + ids->ne[0]) * sizeof(uint16_t));
++    }
++    // flushed per call, so a window cut short keeps every token already evaluated
++    m_route_out.flush();
++}
++
+ void IMatrixCollector::save_imatrix(int ncall) const {
+     auto fname = m_params.out_file;
+     if (fname.empty()) {
