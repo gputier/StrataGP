@@ -247,3 +247,25 @@ def test_default_expert_count_is_384_and_the_top_quarter_is_96(tmp_path):
     assert es.main(["--half-a", str(a), "--half-b", str(b), "--out", str(out)]) == 0
     r = json.loads(out.read_text())
     assert r["n_expert"] == 384 and r["top_k"] == 96 and len(r["counts"]["A"][0]) == 384
+
+
+@pytest.mark.parametrize("n_used", [0, 65])
+def test_n_used_outside_one_to_sixty_four_is_refused(tmp_path, capsys, n_used):
+    bad = write_rtr1(tmp_path / "a.rtr", [], n_used=n_used)
+    good = write_rtr1(tmp_path / "b.rtr", hot_records([0, 1, 2, 3]))
+    assert es.main(["--half-a", str(bad), "--half-b", str(good), "--n-expert", str(N_EXPERT)]) == 2
+    assert f"n_used {n_used} is out of range" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("n_used", [1, 64])
+def test_n_used_bounds_are_accepted(tmp_path, n_used):
+    assert es.read_header(write_rtr1(tmp_path / "a.rtr", [], n_used=n_used)) == n_used
+
+
+def test_top_set_breaks_ties_on_the_lower_id():
+    # 5 leads, then four experts tied at 3: with k = 3 the two lowest ids of the tie (1 and 2) join it
+    assert es.top_set([5, 3, 3, 3, 3, 1], 3) == {0, 1, 2}
+    # all tied: the k lowest ids
+    assert es.top_set([2, 2, 2, 2], 2) == {0, 1}
+    # a higher count beats a lower id
+    assert es.top_set([1, 1, 4], 1) == {2}

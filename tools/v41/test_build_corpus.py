@@ -241,6 +241,70 @@ def test_render_item_shapes_the_tool_conversation():
     assert args["path"] == "src/a.cpp" and "alpha_beta" in seen[-1][3]["content"]
 
 
+def test_pick_word_needs_an_identifier_of_six_characters():
+    rng = bc.random.Random(1)
+    with pytest.raises(ValueError, match="no identifier"):
+        bc.pick_word("1 22 333 4444 abc_d", rng)
+    assert bc.pick_word("alpha_beta alpha_beta alpha_beta other_name", rng) == "alpha_beta"
+    assert bc.pick_word("zeta_one alpha_two", rng) == "alpha_two"       # none thrice: the first in order
+
+
+def test_manifest_counts_usage_and_wikitext_tokens_by_hand():
+    # the stand-in counter is ceil(chars / 3)
+    parts = {"A": [{"kind": "short", "sources": ["q"], "text": "abcdef"},
+                   {"kind": "wikitext", "sources": ["t"], "text": "abcdefghi"}],
+             "B": [{"kind": "long", "sources": ["f"], "text": "abcd"},
+                   {"kind": "wikitext", "sources": ["u"], "text": "ab"}]}
+    texts = {"A": "abcdef\nabcdefghi\n", "B": "abcd\nab\n"}
+    m = bc.manifest_for(texts, parts, bc.Counter(), {"seed": 1})
+    a, b = m["halves"]["A"], m["halves"]["B"]
+    assert (a["tokens_usage"], a["tokens_wikitext"], a["tokens"], a["chars"]) == (2, 3, 6, 17)      # 6/3, 9/3, 17/3
+    assert (b["tokens_usage"], b["tokens_wikitext"], b["tokens"], b["chars"]) == (2, 1, 3, 8)       # 4/3, 2/3, 8/3
+    assert a["by_kind"]["short"] == {"items": 1, "chars": 6, "tokens": 2}
+    assert m["tokens_exact"] is False and m["params"] == {"seed": 1}
+    assert a["sha256"] == bc.hashlib.sha256(texts["A"].encode()).hexdigest()
+
+
+def test_manifest_usage_and_wikitext_add_up_on_a_built_corpus():
+    texts, parts = build()
+    m = bc.manifest_for(texts, parts, bc.Counter(), {})
+    for n in "AB":
+        row = m["halves"][n]
+        wiki = sum(-(-len(it["text"]) // 3) for it in parts[n] if it["kind"] == "wikitext")
+        usage = sum(-(-len(it["text"]) // 3) for it in parts[n] if it["kind"] != "wikitext")
+        assert (row["tokens_usage"], row["tokens_wikitext"]) == (usage, wiki)
+        assert sum(r["items"] for r in row["by_kind"].values()) == len(parts[n]) == len(row["sources"])
+
+
+def write_tar(path):
+    with tarfile.open(path, "w") as t:
+        for k, name, text in make_candidates():
+            data = text.encode()
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            t.addfile(info, io.BytesIO(data))
+
+
+def test_main_hashes_the_source_tar_and_refuses_stdin(tmp_path):
+    tar = tmp_path / "repo.tar"
+    write_tar(tar)
+    enc = tmp_path / "encoding.py"
+    enc.write_text("def encode_messages(messages, thinking_mode='chat'):\n"
+                   "    return '\\n'.join(m['role'] + (m.get('content') or '') for m in messages)\n")
+    wiki = tmp_path / "w.jsonl"
+    wiki.write_text("".join(json.dumps({"text": line}) + "\n" for _, text in make_articles()
+                            for line in text.splitlines(keepends=True)), encoding="utf-8")
+    argv = ["--out-dir", str(tmp_path / "corpus"), "--encoding-py", str(enc), "--wikitext", str(wiki),
+            "--rev", "label", "--tokens-per-half", "6000", "--long-tokens", "1500", "--file-chars", "600"]
+    assert bc.main([*argv, "--source-tar", str(tar)]) == 0
+    params = json.loads((tmp_path / "corpus" / "manifest.json").read_text())["params"]
+    assert params["source_tar_sha256"] == bc.sha256_of(tar)
+    assert params["source"] == {"tar": str(tar), "rev": "label"}
+    with pytest.raises(SystemExit) as stdin:
+        bc.main([*argv, "--source-tar", "-"])
+    assert stdin.value.code == 2
+
+
 # ---- with DeepSeek's real chat template
 
 @pytest.mark.skipif(not REAL_ENCODING, reason="V41_ENCODING_PY is not set")
@@ -256,12 +320,7 @@ def test_real_template_renders_every_kind():
 @pytest.mark.skipif(not REAL_ENCODING, reason="V41_ENCODING_PY is not set")
 def test_main_writes_halves_and_manifest(tmp_path):
     tar = tmp_path / "repo.tar"
-    with tarfile.open(tar, "w") as t:
-        for k, name, text in make_candidates():
-            data = text.encode()
-            info = tarfile.TarInfo(name)
-            info.size = len(data)
-            t.addfile(info, io.BytesIO(data))
+    write_tar(tar)
     wiki = tmp_path / "w.jsonl"
     wiki.write_text("".join(json.dumps({"text": line}) + "\n" for _, text in make_articles()
                             for line in text.splitlines(keepends=True)), encoding="utf-8")

@@ -19,6 +19,11 @@ stability per layer and on average, and the verdicts.
 `--profile FILE` also writes a STRP expert profile (the format src/core/expert_cache.cpp reads) ranking every
 (layer, expert) pair by its total calls, with `n_layers` taken from the data.
 
+The exit code is 0 whenever the files are read and the verdicts are written, passing or not: read `all_pass` in the
+JSON (or the stderr line), not the exit code.  It is 2 for a routing file that cannot be trusted.  The STRP profile
+has the model's own size (40 x 384 for V4.1); tools/make_profile.py reads only 48 x 512 profiles, so it cannot
+take this one as its --base.
+
     python tools/v41/expert_stats.py --half-a a1.rtr a2.rtr --half-b b1.rtr [--n-expert 384] [--out stats.json]
                                      [--profile expert-profile.bin] [--trim-ragged]
 """
@@ -27,6 +32,7 @@ import json
 import struct
 import sys
 from pathlib import Path
+from statistics import fmean
 
 MAGIC = b"RTR1"
 HEADER_BYTES = 8
@@ -136,10 +142,6 @@ def stability(row_a, row_b, k):
     return len(top_set(row_a, k) & top_set(row_b, k)) / k
 
 
-def mean(values):
-    return sum(values) / len(values)
-
-
 def analyse(counts_a, counts_b, tokens_a, tokens_b, n_used, n_expert, top_fraction=TOP_FRACTION):
     k = round(n_expert * top_fraction)
     if k < 1:
@@ -149,9 +151,9 @@ def analyse(counts_a, counts_b, tokens_a, tokens_b, n_used, n_expert, top_fracti
     stab = [stability(a, b, k) for a, b in zip(counts_a, counts_b)]
     total = [[x + y for x, y in zip(a, b)] for a, b in zip(counts_a, counts_b)]
     verdicts = {
-        "concentration_A": {"value": mean(conc_a), "threshold": THRESHOLDS["concentration"]},
-        "concentration_B": {"value": mean(conc_b), "threshold": THRESHOLDS["concentration"]},
-        "stability": {"value": mean(stab), "threshold": THRESHOLDS["stability"]},
+        "concentration_A": {"value": fmean(conc_a), "threshold": THRESHOLDS["concentration"]},
+        "concentration_B": {"value": fmean(conc_b), "threshold": THRESHOLDS["concentration"]},
+        "stability": {"value": fmean(stab), "threshold": THRESHOLDS["stability"]},
     }
     for v in verdicts.values():
         v["pass"] = v["value"] >= v["threshold"]
@@ -160,9 +162,9 @@ def analyse(counts_a, counts_b, tokens_a, tokens_b, n_used, n_expert, top_fracti
         "n_layers": len(counts_a), "n_expert": n_expert, "n_used": n_used, "top_k": k,
         "tokens": {"A": tokens_a, "B": tokens_b},
         "counts": {"A": counts_a, "B": counts_b, "total": total},
-        "concentration": {"A": {"per_layer": conc_a, "mean": mean(conc_a)},
-                          "B": {"per_layer": conc_b, "mean": mean(conc_b)}},
-        "stability": {"per_layer": stab, "mean": mean(stab)},
+        "concentration": {"A": {"per_layer": conc_a, "mean": fmean(conc_a)},
+                          "B": {"per_layer": conc_b, "mean": fmean(conc_b)}},
+        "stability": {"per_layer": stab, "mean": fmean(stab)},
         "verdicts": verdicts,
     }
 

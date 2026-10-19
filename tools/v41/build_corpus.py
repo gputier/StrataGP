@@ -14,8 +14,8 @@ Usage part, rendered with DeepSeek's own `encode_messages(msgs, thinking_mode='c
   short         a short technical question in French
   long          one long prompt of about --long-tokens tokens per half: several files and a synthesis question
 Files are read with `git show <rev>:<path>` (--repo, --rev) so only tracked files are used, or from a
-`git archive` stream (--source-tar, '-' for stdin), which holds the same bytes.  Nothing from the wiki or the
-second brain.
+`git archive` tar file (--source-tar), which holds the same bytes; the tar is hashed into the manifest and --rev is then
+only a label.  Nothing from the wiki or the second brain.
 
 Wikitext part: wikitext-2-raw-v1 (--wikitext, a jsonl of rows, fetched by --fetch-wikitext from Hugging Face),
 cut at its level-1 headings into articles, which are dealt alternately to the two halves.
@@ -90,6 +90,7 @@ EXPLAIN_DOC_ASKS = [
     "Résume ce document en français, puis liste les points qui demandent une action de la part d'un utilisateur.",
     "Reformule ce document en français simple. Quelles sont les limites ou les pièges qu'il signale ?",
 ]
+CODE_ASKS = {"review": REVIEW_ASKS, "explain_code": EXPLAIN_CODE_ASKS}
 TOOL_ASKS = [
     "Regarde `{path}` et dis-moi ce que fait la première fonction.",
     "Ouvre `{path}` et explique-moi son rôle en quelques phrases.",
@@ -226,10 +227,9 @@ def git_candidates(repo, rev):
 
 
 def tar_candidates(source):
-    """The same list from a `git archive` stream ('-' is stdin)."""
-    fileobj = sys.stdin.buffer if source == "-" else open(source, "rb")
+    """The same list from a `git archive` tar file."""
     found = []
-    with tarfile.open(fileobj=fileobj, mode="r|*") as tar:
+    with open(source, "rb") as fileobj, tarfile.open(fileobj=fileobj, mode="r|*") as tar:
         for member in tar:
             if not member.isreg():
                 continue
@@ -291,6 +291,8 @@ def pick_word(text, rng):
     for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]{5,}", text):
         words[w] = words.get(w, 0) + 1
     common = sorted(w for w, n in words.items() if n >= 3)
+    if not words:
+        raise ValueError("no identifier of 6 characters or more to ask about")
     return rng.choice(common) if common else sorted(words)[0]
 
 
@@ -305,11 +307,8 @@ def render_item(kind, source, rng, encode, file_chars):
         return encode([{"role": "user", "content": source}])
     path, text = source
     body = head(text, file_chars)
-    if kind == "review":
-        ask = rng.choice(REVIEW_ASKS).format(path=path)
-        return encode([{"role": "user", "content": f"{ask}\n\n```\n{body}\n```"}])
-    if kind == "explain_code":
-        ask = rng.choice(EXPLAIN_CODE_ASKS).format(path=path)
+    if kind in CODE_ASKS:
+        ask = rng.choice(CODE_ASKS[kind]).format(path=path)
         return encode([{"role": "user", "content": f"{ask}\n\n```\n{body}\n```"}])
     if kind == "explain_doc":
         ask = rng.choice(EXPLAIN_DOC_ASKS)
@@ -379,8 +378,8 @@ def build(candidates, articles, questions, encode, counter, *, tokens_per_half, 
         half_rng = random.Random(f"{seed}/{name}")
         code, docs = list(pools["code"][i]), list(pools["doc"][i])
         # the long prompt takes files from the front of the half's pools, alternating code and doc
-        long_files = [(p, head(t, LONG_FILE_CHARS)) for pair in itertools.zip_longest(code, docs) for p, t in
-                      [x for x in pair if x]]
+        long_files = [(p, head(t, LONG_FILE_CHARS))
+                      for pair in itertools.zip_longest(code, docs) for p, t in filter(None, pair)]
         long_prompt, long_used = render_long(long_files, counter, encode, long_tokens)
         # the files the long prompt used are not reused below
         code = [c for c in code if c[0] not in long_used]
@@ -467,13 +466,16 @@ def main(argv=None):
     ap.add_argument("--fetch-wikitext", action="store_true", help="download --wikitext from Hugging Face first")
     ap.add_argument("--tokenizer", help="tokenizer.json of DeepSeek-V4.1 (exact token counts)")
     ap.add_argument("--repo", default=".", help="git repository to read (default: the current directory)")
-    ap.add_argument("--rev", default="HEAD", help="revision read with git show (the label when --source-tar)")
-    ap.add_argument("--source-tar", help="a `git archive` tar to read instead of --repo ('-' for stdin)")
+    ap.add_argument("--rev", default="HEAD",
+                    help="revision read with git show; only a label when --source-tar, which is hashed instead")
+    ap.add_argument("--source-tar", help="a `git archive` tar file to read instead of --repo (not '-': it is hashed)")
     ap.add_argument("--tokens-per-half", type=int, default=100_000)
     ap.add_argument("--long-tokens", type=int, default=30_000, help="size of each half's long prompt")
     ap.add_argument("--file-chars", type=int, default=3000, help="characters of a file kept in an ordinary item")
     ap.add_argument("--seed", type=int, default=SEED)
     a = ap.parse_args(argv)
+    if a.source_tar == "-":
+        ap.error("--source-tar needs a file, not stdin: the archive is hashed into the manifest")
 
     if a.fetch_wikitext:
         fetch_wikitext(a.wikitext)
@@ -490,15 +492,16 @@ def main(argv=None):
                          seed=a.seed)
     params = {"seed": a.seed, "tokens_per_half": a.tokens_per_half, "long_tokens": a.long_tokens,
               "file_chars": a.file_chars, "source": origin, "candidates": len(candidates),
+              "source_tar_sha256": sha256_of(a.source_tar) if a.source_tar else None,
               "wikitext_sha256": sha256_of(a.wikitext), "encoding_py_sha256": sha256_of(a.encoding_py),
               "tokenizer_sha256": sha256_of(a.tokenizer) if a.tokenizer else None}
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     for name in "AB":
         (out / f"half_{name.lower()}.txt").write_text(texts[name], encoding="utf-8")
-    (out / "manifest.json").write_text(json.dumps(manifest_for(texts, parts, counter, params), indent=1,
-                                                  ensure_ascii=False) + "\n", encoding="utf-8")
-    m = json.loads((out / "manifest.json").read_text(encoding="utf-8"))["halves"]
+    manifest = manifest_for(texts, parts, counter, params)
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    m = manifest["halves"]
     for name in "AB":
         print(f"half {name}: {m[name]['tokens']} tokens (usage {m[name]['tokens_usage']}, "
               f"wikitext {m[name]['tokens_wikitext']}), {m[name]['chars']} chars", file=sys.stderr)

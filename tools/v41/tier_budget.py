@@ -16,6 +16,9 @@ verdict is taken on the less favourable direction, never on the total, which is 
 
 All sizes are in bytes and all Go are 10^9 bytes.
 
+The exit code is 0 whenever the report is written, passing or not: read the verdict lines or `verdict.pass` in
+the JSON, not the exit code.
+
     python3 -I tools/v41/tier_budget.py --stats stats.json --out budget.json
         [--vram-gb 26] [--ram-gb 100] [--plan NAME=hot,warm,cold ...]
 """
@@ -25,9 +28,12 @@ import sys
 from pathlib import Path
 
 GB = 10**9
-PARAMS_PER_EXPERT = 3 * 2304 * 5120       # gate, up, down
+# gate, up, down; 2304 = deepseek41.expert_feed_forward_length and 5120 = deepseek41.embedding_length, both read in
+# the header of the Q2_K GGUF
+PARAMS_PER_EXPERT = 3 * 2304 * 5120
 
-# type -> (weights per block, bytes per block), from ggml-common.h (fp4 native: e8m0 scale per 32 weights)
+# type -> (weights per block, bytes per block), from ggml-common.h (fp4 is MXFP4: 32 weights and one e8m0 scale in
+# 17 bytes, which is the size read in the safetensors, 18 800 640 bytes per expert)
 BLOCKS = {
     "fp4": (32, 17),
     "q4_k": (256, 144),
@@ -51,7 +57,8 @@ NVME_BYTES_PER_TOKEN_MAX = 0.2 * GB
 NVME_GBPS = 6.8
 RAM_GBPS = (21.0, 83.0)
 
-# engram: 2 tables, 48 rows read per token, read by 4096-byte pages, about 2 % of the rows straddle a page
+# engram: 48 rows read per token in all (2 tables x 3 n-gram sizes x 8 heads, so 24 per table), read by 4096-byte
+# pages, about 2 % of the rows straddle a page (Q2_K rows)
 ENGRAM_PAGES_PER_TOKEN = 48
 ENGRAM_PAGE_BYTES = 4096
 ENGRAM_STRADDLE = 0.02
