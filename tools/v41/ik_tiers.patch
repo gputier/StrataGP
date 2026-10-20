@@ -1,0 +1,515 @@
+Routed experts split in three quantization tiers for ik_llama.cpp (DeepSeek V4 graph).
+
+Base: ikawrakow/ik_llama.cpp at c446f1e089f3dc2436b0600596c23abde00d988f, with ik_routing.patch applied first.
+Apply, from the ik_llama root:  git apply ik_tiers.patch
+Each layer's routed experts are read from blk.L.tK.ffn_{gate,up,down}_exps.weight (K = 0..2) plus the index table
+blk.L.tK.ffn_exps_map.weight; the graph, the loader and the backend scheduler follow.
+Test: tests/test-moe-tiers.cpp (target test-moe-tiers).
+check_ik_patches.sh checks that both patches apply on the base commit.
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index d2a74454..2eeb50f0 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2131,6 +2131,9 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
+                     for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
+                         for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
+                             int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
++                            if (id < 0 || id >= n_expert) {
++                                continue; // the kernels zero the rows of such ids, there is no expert to copy
++                            }
+                             unique_ids[id >> 5] |= (1u << (id & 31));
+                         }
+                     }
+diff --git a/src/graphs/build_deepseek4.cpp b/src/graphs/build_deepseek4.cpp
+index 08afba42..9a1cb494 100644
+--- a/src/graphs/build_deepseek4.cpp
++++ b/src/graphs/build_deepseek4.cpp
+@@ -1745,6 +1745,8 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
+                     ? selected_experts->ne[0]
+                     : n_expert_used;
+ 
++            GGML_ASSERT((!model.layers[il].ffn_exps_tiers.present() || (!is_mtp && !lctx.cparams.mtp && !lctx.dflash.capture)) &&
++                    "tiered experts are not supported with MTP or DFlash");
+             auto moe_out = llm_build_moe_ffn(ctx0, lctx, cur,
+                         model.layers[il].ffn_gate_inp,
+                         nullptr,
+@@ -1760,7 +1762,7 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
+                         true, hparams.expert_weights_scale,
+                         (enum llm_expert_gating_func_type) hparams.expert_gating_func,
+                         cb, il, gf, false, model.layers[il].ffn_up_gate_exps, nullptr, nullptr, nullptr,
+-                        selected_experts);
++                        selected_experts, &model.layers[il].ffn_exps_tiers);
+ 
+             ggml_build_forward_expand(gf, moe_out);
+             cb(moe_out, "ffn_moe_out", il);
+@@ -2008,6 +2010,7 @@ ggml_cgraph * llm_build_context::build_dflash_dsv4() {
+                 layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, &post, &comb, cb, il,
+                 hc_attn_pre, hc_lag ? &hc_pre_mix : nullptr);
+         cur = llm_build_norm(ctx0, cur, hparams, layer.ffn_norm, nullptr, LLM_NORM_RMS, cb, il);
++        GGML_ASSERT(!layer.ffn_exps_tiers.present() && "tiered experts are not supported by the DFlash graph");
+         ggml_tensor * moe = llm_build_moe_ffn(ctx0, lctx, cur,
+                 layer.ffn_gate_inp, nullptr,
+                 layer.ffn_up_exps, nullptr,
+@@ -2760,6 +2763,7 @@ ggml_cgraph * llm_build_context::build_deepseek41() {
+             ? layer.ffn_exp_probs_b_vl
+             : layer.ffn_exp_probs_b;
+         ggml_tensor * selected_experts = nullptr;
++        GGML_ASSERT(!layer.ffn_exps_tiers.present() && "tiered experts are not supported by the separate V4.1 graph");
+         ggml_tensor * moe_out = llm_build_moe_ffn(ctx0, lctx, cur,
+                 layer.ffn_gate_inp, nullptr,
+                 layer.ffn_up_exps, nullptr,
+diff --git a/src/llama-build-context.cpp b/src/llama-build-context.cpp
+index 4a1a8516..84aed7f1 100644
+--- a/src/llama-build-context.cpp
++++ b/src/llama-build-context.cpp
+@@ -1538,10 +1538,18 @@ llm_expert_gating_func_type   gating_op,
+          const llm_build_cb & cb, int il, ggml_cgraph * graph, bool add_input,
+          ggml_tensor * up_gate_exps, ggml_tensor * up_gate_exps_b,
+          ggml_tensor * input_logits, ggml_tensor * down_exps_s,
+-         ggml_tensor * selected_experts) {
++         ggml_tensor * selected_experts, const llama_moe_tiers * tiers) {
+ 
+     GGML_ASSERT(gate_inp || input_logits);
+ 
++    const bool tiered = tiers && tiers->present();
++    if (tiered) {
++        GGML_ASSERT(!up_exps && !gate_exps && !down_exps && !up_gate_exps);
++        GGML_ASSERT(!up_exps_b && !gate_exps_b && !down_exps_b && !up_gate_exps_b && !down_exps_s);
++        GGML_ASSERT(type_op == LLM_FFN_SILU && lctx.model.arch != LLM_ARCH_LLAMA4);
++        GGML_ASSERT(!lctx.moe_cache && "tiered experts do not support the MoE cache");
++    }
++
+     auto input = cur;
+ 
+     int64_t n_embd = cur->ne[0];
+@@ -1701,7 +1709,24 @@ llm_expert_gating_func_type   gating_op,
+     bool can_use_fmoe = (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU || type_op == LLM_FFN_SWIGLU_OAI);
+ 
+     ggml_tensor * par;
+-    if (can_use_fmoe && up_gate_exps && (!cache_ids || !up_gate_exps_b)) {
++    ggml_tensor * experts;
++    if (tiered) {
++        // The weights above come from the original expert ids. Each tier sees the ids remapped to its own
++        // positions (-1 when the expert is elsewhere, which the kernels zero), so exactly one tier is non-zero per slot.
++        ggml_tensor * flat_ids = ggml_reshape_1d(ctx, ggml_is_contiguous(selected_experts) ? selected_experts :
++                ggml_cont(ctx, selected_experts), ggml_nelements(selected_experts));
++        experts = nullptr;
++        for (int k = 0; k < llama_moe_tiers::n_tiers; ++k) {
++            ggml_tensor * tier_ids = ggml_reshape_2d(ctx, ggml_get_rows(ctx, tiers->map[k], flat_ids), n_expert_used, n_tokens);
++            cb(tier_ids, "ffn_moe_tier_ids", il);
++            ggml_tensor * tier_par = ggml_moe_up_gate(ctx, tiers->up[k], tiers->gate[k], cur, tier_ids, GGML_UNARY_OP_SILU);
++            *((float *)(tier_par->op_params + 1)) = lctx.model.swiglu_limit(il, false);
++            cb(tier_par, "ffn_moe_tier_gate_par", il);
++            ggml_tensor * tier_out = ggml_mul_mat_id(ctx, tiers->down[k], tier_par, tier_ids); // [n_embd, n_expert_used, n_tokens]
++            cb(tier_out, "ffn_moe_tier_down", il);
++            experts = experts ? ggml_add(ctx, experts, tier_out) : tier_out;
++        }
++    } else if (can_use_fmoe && up_gate_exps && (!cache_ids || !up_gate_exps_b)) {
+         ggml_tensor * weight = cached_up_gate ? cached_up_gate : up_gate_exps;
+         ggml_tensor * expert_ids = cache_ids ? cache_ids : selected_experts;
+         if (up_gate_exps_b || type_op == LLM_FFN_SWIGLU_OAI) {
+@@ -1792,9 +1817,11 @@ llm_expert_gating_func_type   gating_op,
+     }
+     }
+     }
+-    cb(par, "ffn_moe_gate_par", il);
++    if (!tiered) {
++        cb(par, "ffn_moe_gate_par", il);
+ 
+-    ggml_tensor * experts = llm_build_lora_mm_id(lctx, ctx, down_exps, par, selected_experts, cached_down, cache_ids); // [n_embd, n_expert_used, n_tokens]
++        experts = llm_build_lora_mm_id(lctx, ctx, down_exps, par, selected_experts, cached_down, cache_ids); // [n_embd, n_expert_used, n_tokens]
++    }
+     cb(experts, "ffn_moe_down", il);
+ 
+     if (down_exps_b) {
+diff --git a/src/llama-build-context.h b/src/llama-build-context.h
+index d981f70a..6b72a38e 100644
+--- a/src/llama-build-context.h
++++ b/src/llama-build-context.h
+@@ -12,6 +12,7 @@ struct llama_context;
+ struct llama_cparams;
+ struct llama_batch;
+ struct llama_kv_cache;
++struct llama_moe_tiers;
+ 
+ struct ggml_cgraph;
+ struct ggml_tensor;
+@@ -555,7 +556,7 @@ llm_expert_gating_func_type   gating_op,
+          const llm_build_cb & cb, int il, ggml_cgraph * graph = nullptr, bool add_input = false,
+          ggml_tensor * up_gate_exps = nullptr, ggml_tensor * up_gate_exps_b = nullptr,
+          ggml_tensor * input_logits = nullptr, ggml_tensor * down_exps_s = nullptr,
+-         ggml_tensor * selected_experts = nullptr);
++         ggml_tensor * selected_experts = nullptr, const llama_moe_tiers * tiers = nullptr);
+ 
+     static ggml_tensor * llm_build_moe_ffn(ggml_context * ctx, llama_context & lctx,
+          ggml_tensor * cur,
+diff --git a/src/llama-load-tensors.cpp b/src/llama-load-tensors.cpp
+index 3db48836..3e527d80 100644
+--- a/src/llama-load-tensors.cpp
++++ b/src/llama-load-tensors.cpp
+@@ -3517,6 +3517,24 @@ bool create_tensors_helper::create_deepseek4_tensors(const LLM_TN & tn) {
+         return format("blk.%d.%s.weight", i, stem);
+     };
+ 
++    // Experts split by quantization tier: blk.L.tK.ffn_{up,gate,down}_exps.weight hold the experts
++    // listed in blk.L.tK.ffn_exps_map.weight. Every tensor is created, so each one of the file is consumed once.
++    auto create_tiered_exps = [&](ggml_context * ctx, int i, llama_moe_tiers & tiers) {
++        if (ml.merge_up_gate_exps) {
++            throw std::runtime_error("tiered experts cannot be combined with merged up/gate experts");
++        }
++        for (int k = 0; k < llama_moe_tiers::n_tiers; ++k) {
++            tiers.up  [k] = create_tensor_from_meta(ctx, format("blk.%d.t%d.ffn_up_exps.weight",   i, k));
++            tiers.gate[k] = create_tensor_from_meta(ctx, format("blk.%d.t%d.ffn_gate_exps.weight", i, k));
++            tiers.down[k] = create_tensor_from_meta(ctx, format("blk.%d.t%d.ffn_down_exps.weight", i, k));
++            tiers.map [k] = create_tensor_from_meta(ctx, format("blk.%d.t%d.ffn_exps_map.weight",  i, k));
++            if (tiers.up[k]->ne[2] != tiers.gate[k]->ne[2] || tiers.up[k]->ne[2] != tiers.down[k]->ne[2] ||
++                tiers.map[k]->type != GGML_TYPE_I32 || tiers.map[k]->ne[0] != 1 || tiers.map[k]->ne[1] != n_expert) {
++                throw std::runtime_error(format("inconsistent expert tier %d in layer %d", k, i));
++            }
++        }
++    };
++
+     const int mtp_layer = n_layer - (int) hparams.nextn_predict_layers;
+     const bool is_standalone_mtp = hparams.nextn_predict_layers == 1 &&
+         ml.get_tensor_meta("blk.0.attn_norm.weight") == nullptr &&
+@@ -3645,7 +3663,11 @@ bool create_tensors_helper::create_deepseek4_tensors(const LLM_TN & tn) {
+         layer.ffn_gate_inp   = create_tensor_from_meta(ctx_split, layer_weight_name(i, "ffn_gate_inp"));
+         layer.ffn_norm       = create_tensor_from_meta(ctx_split, layer_weight_name(i, "ffn_norm"));
+ 
+-        use_mmap_buffer &= !create_std_ffn_exps_from_meta(tn, i, 0);
++        if (ml.get_tensor_meta(format("blk.%d.t0.ffn_up_exps.weight", i).c_str()) != nullptr) {
++            create_tiered_exps(ctx_split, i, layer.ffn_exps_tiers);
++        } else {
++            use_mmap_buffer &= !create_std_ffn_exps_from_meta(tn, i, 0);
++        }
+ 
+         layer.ffn_gate_shexp = create_tensor_from_meta(ctx_split, layer_weight_name(i, "ffn_gate_shexp"));
+         layer.ffn_down_shexp = create_tensor_from_meta(ctx_split, layer_weight_name(i, "ffn_down_shexp"));
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 3023ff09..38ca3b0b 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -151,6 +151,19 @@ struct llama_layer_nextn {
+     struct ggml_tensor * hc_head_up        = nullptr;
+ };
+ 
++// Routed experts split by quantization tier: tier K holds the experts listed in map[K]
++// (position of the expert inside the tier tensors, or -1 when it is not in the tier).
++struct llama_moe_tiers {
++    static constexpr int n_tiers = 3;
++
++    struct ggml_tensor * up  [n_tiers] = {};
++    struct ggml_tensor * gate[n_tiers] = {};
++    struct ggml_tensor * down[n_tiers] = {};
++    struct ggml_tensor * map [n_tiers] = {}; // I32 [1, n_expert]
++
++    bool present() const { return up[0] != nullptr; }
++};
++
+ // TODO: separate into "llama_layer_enc" and "llama_layer_dec"
+ struct llama_layer {
+     // normalization
+@@ -311,6 +324,7 @@ struct llama_layer {
+     struct ggml_tensor * ffn_down_exps = nullptr;
+     struct ggml_tensor * ffn_up_exps  = nullptr;
+     struct ggml_tensor * ffn_up_gate_exps  = nullptr;
++    llama_moe_tiers ffn_exps_tiers;
+ 
+     llama_split_tensor split_ffn_gate_inp;
+     llama_split_tensor split_ffn_up_exps;
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index a0f93a33..a4880601 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -224,3 +224,8 @@ target_link_libraries(${TEST_TARGET} PRIVATE llama)
+ add_executable(test-moe-cache-shares test-moe-cache-shares.cpp)
+ target_include_directories(test-moe-cache-shares PRIVATE ${PROJECT_SOURCE_DIR}/src)
+ add_test(NAME test-moe-cache-shares COMMAND $<TARGET_FILE:test-moe-cache-shares>)
++
++add_executable(test-moe-tiers test-moe-tiers.cpp)
++target_link_libraries(test-moe-tiers PRIVATE ggml)
++target_include_directories(test-moe-tiers PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
++add_test(NAME test-moe-tiers COMMAND $<TARGET_FILE:test-moe-tiers>)
+diff --git a/tests/test-moe-tiers.cpp b/tests/test-moe-tiers.cpp
+new file mode 100644
+index 00000000..be870280
+--- /dev/null
++++ b/tests/test-moe-tiers.cpp
+@@ -0,0 +1,276 @@
++// Checks that routed experts split in quantization tiers give the same bits as one op over all the experts.
++// A tier sees the expert ids remapped to its own positions (-1 when the expert is in another tier).
++
++#include "ggml.h"
++#include "ggml-backend.h"
++#include "ggml-alloc.h"
++#include "ggml-backend-impl.h"
++
++#include <algorithm>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <random>
++#include <vector>
++
++namespace {
++
++constexpr int n_tiers  = 3;
++constexpr int n_expert = 24;
++constexpr int n_used   = 6;
++constexpr int n_tokens = 7;
++constexpr int n_dim    = 256; // input and ff size, a multiple of every block size under test
++constexpr float swiglu_limit = 2.0f;
++
++struct tier_table {
++    std::vector<std::vector<int>> members; // members[k]: increasing expert ids of tier k
++    std::vector<int32_t> map[n_tiers];     // map[k][e]: position of e in tier k, -1 when absent
++};
++
++tier_table make_table(std::mt19937 & rng) {
++    tier_table t;
++    for (;;) {
++        t.members.assign(n_tiers, {});
++        for (int e = 0; e < n_expert; ++e) {
++            t.members[rng() % n_tiers].push_back(e);
++        }
++        if (std::none_of(t.members.begin(), t.members.end(), [](const std::vector<int> & m) { return m.empty(); })) {
++            break;
++        }
++    }
++    for (int k = 0; k < n_tiers; ++k) {
++        t.map[k].assign(n_expert, -1);
++        for (size_t p = 0; p < t.members[k].size(); ++p) {
++            t.map[k][t.members[k][p]] = (int32_t) p;
++        }
++    }
++    return t;
++}
++
++// n_used distinct experts per token, stored with the row stride of a full [n_expert, n_tokens] top-k result
++std::vector<int32_t> make_ids(std::mt19937 & rng) {
++    std::vector<int32_t> ids(n_expert * n_tokens, 0);
++    std::vector<int32_t> perm(n_expert);
++    for (int t = 0; t < n_tokens; ++t) {
++        for (int e = 0; e < n_expert; ++e) perm[e] = e;
++        std::shuffle(perm.begin(), perm.end(), rng);
++        std::copy(perm.begin(), perm.begin() + n_used, ids.begin() + (size_t) t * n_expert);
++    }
++    return ids;
++}
++
++std::vector<float> make_floats(std::mt19937 & rng, size_t n, float scale) {
++    std::normal_distribution<float> dist(0.0f, scale);
++    std::vector<float> v(n);
++    for (auto & x : v) x = dist(rng);
++    return v;
++}
++
++// n_expert experts of [n_dim, n_dim] quantized one after the other
++std::vector<uint8_t> make_experts(std::mt19937 & rng, ggml_type type, size_t & expert_size) {
++    expert_size = ggml_row_size(type, n_dim) * n_dim;
++    std::vector<float> imatrix;
++    if (ggml_quantize_requires_imatrix(type)) {
++        imatrix.assign(n_dim, 1.0f);
++    }
++    std::vector<uint8_t> bytes(expert_size * n_expert);
++    for (int e = 0; e < n_expert; ++e) {
++        const auto src = make_floats(rng, (size_t) n_dim * n_dim, 0.1f);
++        const size_t written = ggml_quantize_chunk(type, src.data(), bytes.data() + e * expert_size, 0, n_dim, n_dim,
++                imatrix.empty() ? nullptr : imatrix.data(), nullptr);
++        if (written != expert_size) {
++            std::fprintf(stderr, "quantization of type %s wrote %zu bytes, expected %zu\n", ggml_type_name(type), written, expert_size);
++            std::exit(1);
++        }
++    }
++    return bytes;
++}
++
++struct weights {
++    ggml_tensor * full;
++    ggml_tensor * tier[n_tiers];
++};
++
++weights make_weights(ggml_context * ctx, ggml_type type, const std::vector<uint8_t> & bytes, size_t expert_size, const tier_table & table) {
++    weights w;
++    w.full = ggml_new_tensor_3d(ctx, type, n_dim, n_dim, n_expert);
++    std::memcpy(w.full->data, bytes.data(), bytes.size());
++    for (int k = 0; k < n_tiers; ++k) {
++        w.tier[k] = ggml_new_tensor_3d(ctx, type, n_dim, n_dim, (int64_t) table.members[k].size());
++        for (size_t p = 0; p < table.members[k].size(); ++p) {
++            std::memcpy((char *) w.tier[k]->data + p * expert_size, bytes.data() + table.members[k][p] * expert_size, expert_size);
++        }
++    }
++    return w;
++}
++
++ggml_tensor * up_gate(ggml_context * ctx, ggml_tensor * up, ggml_tensor * gate, ggml_tensor * cur, ggml_tensor * ids) {
++    ggml_tensor * par = ggml_moe_up_gate(ctx, up, gate, cur, ids, GGML_UNARY_OP_SILU);
++    *((float *) (par->op_params + 1)) = swiglu_limit;
++    return par;
++}
++
++// Compares, for one weight type, the single op over all experts with the sum over the tiers.
++bool check_type(ggml_type type, int n_threads, std::mt19937 & rng) {
++    const tier_table table = make_table(rng);
++    const std::vector<int32_t> ids_data = make_ids(rng);
++    const auto cur_data = make_floats(rng, (size_t) n_dim * n_tokens, 1.0f);
++    size_t expert_size = 0;
++    const auto up_bytes   = make_experts(rng, type, expert_size);
++    const auto gate_bytes = make_experts(rng, type, expert_size);
++    const auto down_bytes = make_experts(rng, type, expert_size);
++
++    // the memory is filled with NaN patterns: a result row the kernels do not write shows up in the comparison
++    std::vector<uint8_t> mem(64u << 20, 0xff);
++    ggml_init_params params = { mem.size(), mem.data(), false };
++    ggml_context * ctx = ggml_init(params);
++
++    const weights up   = make_weights(ctx, type, up_bytes,   expert_size, table);
++    const weights gate = make_weights(ctx, type, gate_bytes, expert_size, table);
++    const weights down = make_weights(ctx, type, down_bytes, expert_size, table);
++
++    ggml_tensor * cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_dim, 1, n_tokens);
++    std::memcpy(cur->data, cur_data.data(), ggml_nbytes(cur));
++
++    ggml_tensor * ids_full = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert, n_tokens);
++    std::memcpy(ids_full->data, ids_data.data(), ggml_nbytes(ids_full));
++    ggml_tensor * ids = ggml_view_2d(ctx, ids_full, n_used, n_tokens, ids_full->nb[1], 0);
++
++    ggml_tensor * maps[n_tiers];
++    for (int k = 0; k < n_tiers; ++k) {
++        maps[k] = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
++        std::memcpy(maps[k]->data, table.map[k].data(), ggml_nbytes(maps[k]));
++    }
++
++    ggml_tensor * ref_mm    = ggml_mul_mat_id(ctx, up.full, cur, ids);
++    ggml_tensor * ref_par   = up_gate(ctx, up.full, gate.full, cur, ids);
++    ggml_tensor * ref_chain = ggml_mul_mat_id(ctx, down.full, ref_par, ids);
++
++    ggml_tensor * flat_ids = ggml_reshape_1d(ctx, ggml_cont(ctx, ids), ggml_nelements(ids));
++    ggml_tensor * tier_mm = nullptr;
++    ggml_tensor * tier_par_sum = nullptr;
++    ggml_tensor * tier_chain = nullptr;
++    for (int k = 0; k < n_tiers; ++k) {
++        ggml_tensor * tier_ids = ggml_reshape_2d(ctx, ggml_get_rows(ctx, maps[k], flat_ids), n_used, n_tokens);
++        ggml_tensor * mm    = ggml_mul_mat_id(ctx, up.tier[k], cur, tier_ids);
++        ggml_tensor * par   = up_gate(ctx, up.tier[k], gate.tier[k], cur, tier_ids);
++        ggml_tensor * chain = ggml_mul_mat_id(ctx, down.tier[k], par, tier_ids);
++        tier_mm      = tier_mm      ? ggml_add(ctx, tier_mm, mm)           : mm;
++        tier_par_sum = tier_par_sum ? ggml_add(ctx, tier_par_sum, par)     : par;
++        tier_chain   = tier_chain   ? ggml_add(ctx, tier_chain, chain)     : chain;
++    }
++
++    ggml_cgraph * gf = ggml_new_graph(ctx);
++    for (ggml_tensor * t : { ref_mm, ref_par, ref_chain, tier_mm, tier_par_sum, tier_chain }) {
++        ggml_build_forward_expand(gf, t);
++    }
++    bool ok = ggml_graph_compute_with_ctx(ctx, gf, n_threads) == GGML_STATUS_SUCCESS;
++
++    const struct { const char * name; ggml_tensor * ref; ggml_tensor * tier; } pairs[] = {
++        { "mul_mat_id",        ref_mm,    tier_mm      },
++        { "moe_up_gate",       ref_par,   tier_par_sum },
++        { "up_gate + down",    ref_chain, tier_chain   },
++    };
++    for (const auto & p : pairs) {
++        const bool same = ggml_nbytes(p.ref) == ggml_nbytes(p.tier) && std::memcmp(p.ref->data, p.tier->data, ggml_nbytes(p.ref)) == 0;
++        std::printf("%-8s threads=%d %-16s %s\n", ggml_type_name(type), n_threads, p.name, same ? "identical" : "DIFFERENT");
++        ok &= same;
++    }
++
++    ggml_free(ctx);
++    return ok;
++}
++
++// A split computed away from the experts copies only the active experts: ids outside [0, n_expert) have no expert to copy.
++bool check_scheduler(std::mt19937 & rng) {
++    const ggml_type type = GGML_TYPE_MXFP4;
++    size_t expert_size = 0;
++    const auto bytes = make_experts(rng, type, expert_size);
++    const auto cur_data = make_floats(rng, (size_t) n_dim * n_tokens, 1.0f);
++    std::vector<int32_t> ids_data(n_used * n_tokens);
++    for (size_t i = 0; i < ids_data.size(); ++i) {
++        ids_data[i] = i % 3 == 0 ? -1 : (int32_t) ((i * 5) % n_expert);
++    }
++
++    ggml_backend_t owner  = ggml_backend_cpu_init();
++    ggml_backend_t worker = ggml_backend_cpu_init();
++    ggml_backend_t backends[] = { worker, owner }; // the scheduler never moves a node to a lower priority backend
++
++    ggml_init_params wparams = { ggml_tensor_overhead() * 4, nullptr, true };
++    ggml_context * wctx = ggml_init(wparams);
++    ggml_tensor * experts = ggml_new_tensor_3d(wctx, type, n_dim, n_dim, n_expert);
++    ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(wctx, owner);
++    ggml_backend_buffer_set_usage(wbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++    ggml_backend_tensor_set(experts, bytes.data(), 0, bytes.size());
++
++    ggml_init_params gparams = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
++    ggml_context * gctx = ggml_init(gparams);
++    ggml_tensor * cur = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, n_dim, 1, n_tokens);
++    ggml_tensor * ids = ggml_new_tensor_2d(gctx, GGML_TYPE_I32, n_used, n_tokens);
++    ggml_set_input(cur);
++    ggml_set_input(ids);
++    ggml_tensor * out = ggml_mul_mat_id(gctx, experts, cur, ids);
++    ggml_set_output(out);
++    ggml_cgraph * gf = ggml_new_graph(gctx);
++    ggml_build_forward_expand(gf, out);
++
++    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false);
++    ggml_backend_sched_set_only_active_experts(sched, true);
++    // the worker no longer accepts the buffers of the owner, like a GPU with host memory: the scheduler must copy
++    worker->iface.supports_buft = [](ggml_backend_t, ggml_backend_buffer_type_t) { return false; };
++    ggml_backend_sched_set_tensor_backend(sched, out, worker);
++    bool ok = ggml_backend_sched_alloc_graph(sched, gf);
++    if (ok) {
++        ggml_backend_tensor_set(cur, cur_data.data(), 0, ggml_nbytes(cur));
++        ggml_backend_tensor_set(ids, ids_data.data(), 0, ggml_nbytes(ids));
++        ok = ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS;
++    }
++    std::vector<float> result(ggml_nelements(out));
++    if (ok) {
++        ggml_backend_tensor_get(out, result.data(), 0, ggml_nbytes(out));
++    }
++    const bool split = ggml_backend_sched_get_tensor_backend(sched, out) == worker &&
++            ggml_backend_sched_get_tensor_backend(sched, experts) == owner;
++
++    // reference: the same op on one backend
++    std::vector<uint8_t> mem(64u << 20, 0xff);
++    ggml_init_params params = { mem.size(), mem.data(), false };
++    ggml_context * ctx = ggml_init(params);
++    ggml_tensor * ref_experts = ggml_new_tensor_3d(ctx, type, n_dim, n_dim, n_expert);
++    std::memcpy(ref_experts->data, bytes.data(), bytes.size());
++    ggml_tensor * ref_cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_dim, 1, n_tokens);
++    std::memcpy(ref_cur->data, cur_data.data(), ggml_nbytes(ref_cur));
++    ggml_tensor * ref_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
++    std::memcpy(ref_ids->data, ids_data.data(), ggml_nbytes(ref_ids));
++    ggml_tensor * ref = ggml_mul_mat_id(ctx, ref_experts, ref_cur, ref_ids);
++    ggml_cgraph * rf = ggml_new_graph(ctx);
++    ggml_build_forward_expand(rf, ref);
++    ok &= ggml_graph_compute_with_ctx(ctx, rf, 2) == GGML_STATUS_SUCCESS;
++    const bool same = ok && std::memcmp(ref->data, result.data(), ggml_nbytes(ref)) == 0;
++    std::printf("scheduler, ids with -1: experts copied to the worker=%s result %s\n", split ? "yes" : "NO", same ? "identical" : "DIFFERENT");
++
++    ggml_free(ctx);
++    ggml_backend_sched_free(sched);
++    ggml_free(gctx);
++    ggml_backend_buffer_free(wbuf);
++    ggml_free(wctx);
++    ggml_backend_free(worker);
++    ggml_backend_free(owner);
++    return ok && same && split;
++}
++
++} // namespace
++
++int main() {
++    std::mt19937 rng(1234);
++    bool ok = true;
++    for (ggml_type type : { GGML_TYPE_MXFP4, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ1_M }) {
++        for (int n_threads : { 1, 4 }) {
++            ok &= check_type(type, n_threads, rng);
++        }
++    }
++    ok &= check_scheduler(rng);
++    std::printf("%s\n", ok ? "PASS" : "FAIL");
++    return ok ? 0 : 1;
++}
