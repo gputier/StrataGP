@@ -10,7 +10,9 @@ Inputs (logs of the four runs on the same text, 45 chunks of 2 048 tokens):
       "KL divergence statistics" blocks (PPL of the run and of the base, mean ln(PPL/PPL(base)) with its paired
       uncertainty, KLD mean, median and 99 %, RMS of the probability change, share of identical top tokens).
 A log carrying `Oops`, another number of chunks or another context than asked, or a base perplexity that is not R's
-(1 % tolerance) is refused: the runs would not be comparable.
+(1e-4 relative) is refused: the runs would not be comparable.  R's chunks and context are read from its "Final
+estimate" line; those of the `--kl-divergence` logs, which print no such line, from the index of the last row of the
+per-chunk table and from the `n_ctx` of the context the run created.
 
 The estimate of P3 (hot experts in MXFP4 in VRAM, warm in IQ2_XS in RAM, cold in IQ1_M on NVMe) is a first-order
 model, never a measurement.  With the call shares of the tiers (`tier_budget.py` JSON, cross-validation, plan P3):
@@ -22,11 +24,12 @@ the VRAM share being at R's type.  It is computed for both cross-validation dire
 an order of magnitude.
 
 Verdict, the plan's quality threshold, written before any measurement and never retouched.  "Passes" means a
-perplexity that does not exceed PPL(Q), the oracle measured again on this text.  In this order:
+perplexity that does not exceed PPL(Q), the oracle measured again on this text.  In this order, the first that holds
+wins (U1 passing is tested first, so it wins over the estimate being within 0.1 of PPL(Q)):
   * U1 passes: "retenu", and the quality is acquired for any bit plan (P3 lies between R and U1);
   * else the estimate within 0.1 of PPL(Q), above or below, or the estimate passing while U1 fails: "zone grise"
     (P3 itself must be built and measured);
-  * else "échec".
+  * else "échec", which stands for every other case (the plan words only the first two verdicts).
 Verdict words are the plan's, in French.  The exit code is 0 whenever the report is written, the verdict is in the
 output (and in the JSON `verdict`); it is 2 for a log that cannot be trusted.
 
@@ -40,10 +43,11 @@ import re
 import sys
 from pathlib import Path
 
-N_CTX = 2048
-CHUNKS = 45
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from eval_text import CHUNKS_WANTED as CHUNKS, N_CTX  # noqa: E402
+
 GRAY_BAND = 0.1          # |estimate - PPL(Q)| below this is the grey zone (plan threshold)
-BASE_TOLERANCE = 0.01    # relative gap allowed between PPL(base) of a KL run and PPL(R)
+BASE_TOLERANCE = 1e-4    # relative gap allowed between PPL(base) of a KL run and PPL(R): the logs print 6 decimals
 
 RETAINED, GRAY, FAILED = "retenu", "zone grise", "échec"
 
@@ -51,6 +55,10 @@ FINAL = re.compile(r"Final estimate: PPL over (\d+) chunks for n_ctx=(\d+) = ([\
 # "Name   :  value ± unc %": the statistics lines of the KL run
 STAT = re.compile(r"^(?P<key>[^:\n]+?)\s*:\s*(?P<val>-?\d+(?:\.\d+)?)(?:\s*(?:Â?±|\ufffd)\s*(?P<unc>\d+(?:\.\d+)?))?\s*%?\s*$",
                   re.MULTILINE)
+# a row of the per-chunk table of a KL run: chunk index, PPL, ±, uncertainty
+CHUNK_ROW = re.compile(r"^\s*(\d+)\s+\d+\.\d+\s+\S+\s+\d+\.\d+", re.MULTILINE)
+# the context created by the run
+CONTEXT = re.compile(r"^llama_\w+: n_ctx\s*=\s*(\d+)", re.MULTILINE)
 # statistic -> key of the log line, once the spaces are collapsed and the non-ASCII characters dropped (a log
 # redirected by Windows PowerShell may have them re-encoded)
 KL_KEYS = {
@@ -99,12 +107,18 @@ def parse_base(text, name="R", n_ctx=N_CTX, chunks=CHUNKS):
     return {"ppl": float(ppl), "ppl_unc": float(unc), "chunks": int(n), "n_ctx": int(ctx)}
 
 
-def parse_kl(text, name):
-    """The statistics of a `--kl-divergence` run as {statistic: value} and {statistic + '_unc': uncertainty}."""
+def parse_kl(text, name, n_ctx=N_CTX, chunks=CHUNKS):
+    """The statistics of a `--kl-divergence` run as {statistic: value} and {statistic + '_unc': uncertainty}, with
+    the `chunks` and `n_ctx` of the run, which must be those asked."""
     check_clean(text, name)
+    rows, contexts = CHUNK_ROW.findall(text), CONTEXT.findall(text)
+    if not rows or not contexts:
+        raise LogError(f"{name}: no per-chunk table or no n_ctx line (is it a --kl-divergence log?)")
+    if int(rows[-1]) != chunks or int(contexts[-1]) != n_ctx:
+        raise LogError(f"{name}: {rows[-1]} chunks at n_ctx={contexts[-1]}, expected {chunks} at {n_ctx}")
     lines = {ascii_key(m["key"]): (float(m["val"]), float(m["unc"]) if m["unc"] else None)
              for m in STAT.finditer(text)}
-    out = {}
+    out = {"chunks": int(rows[-1]), "n_ctx": int(contexts[-1])}
     for stat, key in KL_KEYS.items():
         if ascii_key(key) not in lines:
             raise LogError(f"{name}: no '{key}' line (is it a --kl-divergence log?)")
@@ -116,7 +130,9 @@ def parse_kl(text, name):
 
 def verdict(ppl_q, ppl_u1, estimate, band=GRAY_BAND):
     """The plan's quality verdict from PPL(Q), PPL(U1) and the estimate of PPL(P3), and whether the quality is
-    acquired for any bit plan."""
+    acquired for any bit plan.  "U1 passes" is tested first, so it wins when the estimate is also within `band` of
+    PPL(Q).  The plan words only "retenu" and "zone grise"; `FAILED` stands for every other case.  The estimate is the
+    one of the less favourable cross-validation direction (the higher PPL), which the plan does not state."""
     u1_passes = ppl_u1 <= ppl_q
     est_passes = estimate <= ppl_q
     if u1_passes:
@@ -148,7 +164,7 @@ def estimate_p3(ppl_r, ppl_r_unc, d_u2, d_u2_unc, d_u1, d_u1_unc, share):
 def analyse(logs, budget_path, plan="P3", n_ctx=N_CTX, chunks=CHUNKS):
     """The full report from the texts of the four logs {'R', 'Q', 'U2', 'U1'}."""
     r = parse_base(logs["R"], "R", n_ctx, chunks)
-    runs = {name: parse_kl(logs[name], name) for name in ("Q", "U2", "U1")}
+    runs = {name: parse_kl(logs[name], name, n_ctx, chunks) for name in ("Q", "U2", "U1")}
     for name, run in runs.items():
         gap = abs(run["ppl_base"] - r["ppl"]) / r["ppl"]
         if gap > BASE_TOLERANCE:

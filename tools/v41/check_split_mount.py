@@ -13,9 +13,11 @@ name (llama-model-loader.cpp, llama-hparams.cpp:2605, llama.cpp:3018).
 
 Checks, on the mounted file (Q8_0 shards 1-7 plus Q2_K shards 8-10):
   * same `split.count`, `split.no` = 0 on the first shard, and the shard count it announces;
-  * the tensors of every shard have the names and shapes of the same shard of the Q2_K oracle (which loads);
+  * the tensors of every shard have the names and shapes of the same shard of the Q2_K oracle (which loads),
+    whatever their order in the file;
   * `split.tensors.count` equals the number of tensors of the mounted shards;
-  * shards 1 to 7 hold only `ffn_*_exps` tensors;
+  * shards 1 to 7 hold only `ffn_*_exps` tensors, all of them in MXFP4 (the shards 8 to 10 are the oracle's own
+    files, so their types are the oracle's by construction and are not compared);
   * every metadata key of the Q8_0 first shard against the Q2_K first shard: each difference is listed and flagged
     as mattering or not (an unknown difference matters).
 
@@ -41,12 +43,16 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from gguf_reader import GGML_TYPES  # noqa: E402
+
 REPO = "https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-GGUF/resolve/main"
 SHARD_URL = REPO + "/{quant}/DeepSeek-V4.1-Flash-1017-{quant}-{no:05d}-of-00010.gguf"
 N_SHARDS = 10
 FROM_Q80 = range(1, 8)       # shards taken from the Q8_0
 FROM_Q2K = range(8, 11)      # shards taken from the Q2_K oracle
 EXPERT_TENSOR = re.compile(r"^blk\.\d+\.ffn_(gate|up|down)_exps\.weight$")
+EXPERT_TYPE = "MXFP4"        # type of the routed experts in the Q8_0 GGUF (shards 1 to 7)
 
 VERDICT_OK, VERDICT_GAP, VERDICT_UNKNOWN = "montage chargeable", "écart", "indéterminé"
 
@@ -57,10 +63,6 @@ HARMLESS_KEYS = {
                          "llama-hparams.cpp:2605, llama.cpp:3018)",
 }
 
-GGUF_TYPES = {0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1", 8: "Q8_0", 9: "Q8_1", 10: "Q2_K",
-              11: "Q3_K", 12: "Q4_K", 13: "Q5_K", 14: "Q6_K", 15: "Q8_K", 16: "IQ2_XXS", 17: "IQ2_XS",
-              18: "IQ3_XXS", 19: "IQ1_S", 20: "IQ4_NL", 21: "IQ3_S", 22: "IQ2_S", 23: "IQ4_XS", 24: "I8",
-              25: "I16", 26: "I32", 27: "I64", 28: "F64", 29: "IQ1_M", 30: "BF16", 39: "MXFP4"}
 SCALARS = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
 STRING, ARRAY = 8, 9
 SHORT_ARRAY = 64
@@ -78,26 +80,33 @@ class RangeReader:
         self.buf, self.start = b"", 0       # `buf` holds the file from offset `start`
         self.pos = 0
 
+    def fetch(self, got):
+        """The chunk of the file from byte `got` (empty past the end); the server must answer with that range."""
+        req = urllib.request.Request(self.url, headers={"Range": f"bytes={got}-{got + self.chunk - 1}"})
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                first = re.match(r"bytes (\d+)-", r.headers.get("Content-Range", ""))
+                if r.status != 206 or first is None or int(first.group(1)) != got:
+                    raise HeaderError(f"{self.url}: asked for the range from byte {got}, the server answered "
+                                      f"{r.status} with Content-Range {r.headers.get('Content-Range')!r}")
+                return r.read()
+        except urllib.error.HTTPError as e:
+            if e.code != 416:               # the range starts at or beyond the end of the file
+                raise
+            return b""
+
     def read(self, n):
-        while self.pos + n > self.start + len(self.buf):
-            got = self.start + len(self.buf)
-            req = urllib.request.Request(self.url, headers={"Range": f"bytes={got}-{got + self.chunk - 1}"})
-            try:
-                with urllib.request.urlopen(req, timeout=120) as r:
-                    data = r.read()
-            except urllib.error.HTTPError as e:
-                if e.code != 416:           # the range starts at or beyond the end of the file
-                    raise
-                data = b""
-            if not data:
-                raise HeaderError(f"{self.url}: the file ends before byte {self.pos + n}")
-            self.buf += data
+        if self.pos + n > self.start + len(self.buf):
+            # drop what was consumed so a long header does not stay in memory, then load what is missing
+            self.buf, self.start = self.buf[self.pos - self.start:], self.pos
+            while self.pos + n > self.start + len(self.buf):
+                data = self.fetch(self.start + len(self.buf))
+                if not data:
+                    raise HeaderError(f"{self.url}: the file ends before byte {self.pos + n}")
+                self.buf += data
         a = self.pos - self.start
         self.pos += n
-        out = self.buf[a:a + n]
-        # drop what was consumed so a long header does not stay in memory
-        self.buf, self.start = self.buf[a + n:], self.pos
-        return out
+        return self.buf[a:a + n]
 
 
 class BytesReader:
@@ -166,7 +175,7 @@ def read_header(r):
         (ndim,) = unpack(r, "I")
         dims = list(unpack(r, f"{ndim}Q"))
         ttype, offset = unpack(r, "IQ")
-        tensors.append([name, dims, GGUF_TYPES.get(ttype, ttype), offset])
+        tensors.append([name, dims, GGML_TYPES.get(ttype, ttype), offset])
     return {"version": version, "kv": kv, "tensors": tensors}
 
 
@@ -207,14 +216,15 @@ def check(q2k, q80):
     # tensors by shard: names and shapes against the oracle, for every shard both sides have
     layout = {}
     for n in present:
-        names2 = [(t[0], tuple(t[1])) for t in q2k[n]["tensors"]]
-        names8 = [(t[0], tuple(t[1])) for t in q80[n]["tensors"]]
+        names2 = {(t[0], tuple(t[1])) for t in q2k[n]["tensors"]}
+        names8 = {(t[0], tuple(t[1])) for t in q80[n]["tensors"]}
         ok = names2 == names8
-        layout[n] = {"q2k_tensors": len(names2), "q80_tensors": len(names8), "names_and_shapes_equal": ok,
+        layout[n] = {"q2k_tensors": len(q2k[n]["tensors"]), "q80_tensors": len(q80[n]["tensors"]),
+                     "names_and_shapes_equal": ok,
                      "mounted_from": "Q8_0" if n in FROM_Q80 else "Q2_K"}
         if not ok:
-            only2 = sorted(set(names2) - set(names8))[:3]
-            only8 = sorted(set(names8) - set(names2))[:3]
+            only2 = sorted(names2 - names8)[:3]
+            only8 = sorted(names8 - names2)[:3]
             gaps.append(f"shard {n}: tensor names or shapes differ between Q8_0 and Q2_K "
                         f"(Q2_K only {only2}, Q8_0 only {only8})")
     checks["layout_by_shard"] = layout
@@ -232,6 +242,12 @@ def check(q2k, q80):
         checks["shards_1_to_7_foreign_tensors"] = foreign
         if foreign:
             gaps.append(f"shards 1 to 7 hold tensors other than ffn_*_exps: {foreign[:5]}")
+        # the experts of the Q8_0 GGUF are what the reference model takes: MXFP4, not a requantized type
+        wrong = sorted(f"{t[0]} ({t[2]})" for n in FROM_Q80 for t in mounted[n]["tensors"]
+                       if EXPERT_TENSOR.match(t[0]) and t[2] != EXPERT_TYPE)
+        checks["shards_1_to_7_expert_types_not_mxfp4"] = wrong
+        if wrong:
+            gaps.append(f"shards 1 to 7: {len(wrong)} expert tensors are not in {EXPERT_TYPE}: {wrong[:3]}")
     else:
         total = None
 
@@ -281,6 +297,7 @@ def format_report(result):
         lines.append(f"  shard {n:>2} from {s['mounted_from']}: Q2_K {s['q2k_tensors']} / Q8_0 {s['q80_tensors']} "
                      f"tensors, names and shapes {'equal' if s['names_and_shapes_equal'] else 'DIFFER'}")
     lines.append(f"shards 1 to 7, tensors other than ffn_*_exps: {c.get('shards_1_to_7_foreign_tensors')}")
+    lines.append(f"shards 1 to 7, expert tensors not in {EXPERT_TYPE}: {c.get('shards_1_to_7_expert_types_not_mxfp4')}")
     diffs = c.get("metadata_differences")
     if diffs is not None:
         lines.append(f"metadata keys of the first shard: Q2_K {c['metadata_keys']['q2k']}, "

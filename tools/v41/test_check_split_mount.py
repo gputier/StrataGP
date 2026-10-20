@@ -72,6 +72,23 @@ def test_a_renamed_tensor_in_a_replaced_shard_is_a_gap(pair):
     assert "shard 9" in r["reasons"][0]
 
 
+def test_an_expert_that_is_not_mxfp4_in_the_expert_shards_is_a_gap(pair):
+    q2k, q80 = pair
+    q80[4]["tensors"][1][2] = "Q8_0"
+    r = cm.check(q2k, q80)
+    assert r["verdict"] == "écart"
+    assert r["checks"]["shards_1_to_7_expert_types_not_mxfp4"] == ["blk.4.ffn_up_exps.weight (Q8_0)"]
+    assert "1 expert tensors are not in MXFP4" in r["reasons"][0]
+
+
+def test_the_same_tensors_in_another_order_are_still_loadable(pair):
+    q2k, q80 = pair
+    q80[3]["tensors"].reverse()
+    r = cm.check(q2k, q80)
+    assert r["verdict"] == "montage chargeable"
+    assert r["checks"]["layout_by_shard"][3]["names_and_shapes_equal"]
+
+
 def test_a_dense_tensor_in_the_expert_shards_is_a_gap(pair):
     q2k, q80 = pair
     for h in (q2k, q80):
@@ -166,14 +183,11 @@ def test_the_input_headers_are_not_modified(pair):
 
 def gguf_bytes(kv_items, tensor_items):
     """A GGUF v3 header: kv_items [(key, type id, payload bytes)], tensor_items [(name, dims, type id, offset)]."""
-    def s(text):
-        raw = text.encode()
-        return struct.pack("<Q", len(raw)) + raw
     out = b"GGUF" + struct.pack("<IQQ", 3, len(tensor_items), len(kv_items))
     for key, vtype, payload in kv_items:
-        out += s(key) + struct.pack("<I", vtype) + payload
+        out += string(key) + struct.pack("<I", vtype) + payload
     for name, dims, ttype, offset in tensor_items:
-        out += s(name) + struct.pack("<I", len(dims)) + struct.pack(f"<{len(dims)}Q", *dims)
+        out += string(name) + struct.pack("<I", len(dims)) + struct.pack(f"<{len(dims)}Q", *dims)
         out += struct.pack("<IQ", ttype, offset)
     return out
 
@@ -218,14 +232,17 @@ def test_the_reader_refuses_a_bad_magic_and_a_cut_header():
         cm.read_header(cm.BytesReader(data[:-5]))
 
 
-def serve(data):
-    """A local HTTP server answering `Range: bytes=a-b` of `data` with 206; returns (url, server)."""
+def serve(data, honour_range=True):
+    """A local HTTP server answering `Range: bytes=a-b` of `data` with 206 and its Content-Range (416 past the end);
+    with `honour_range` false it ignores the header and answers 200 with the whole file.  Returns (url, server)."""
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             a, b = self.headers["Range"].split("=")[1].split("-")
             a, b = int(a), int(b)
-            body = data[a:b + 1]
-            self.send_response(206 if body else 416)
+            body = data[a:b + 1] if honour_range else data
+            self.send_response((206 if body else 416) if honour_range else 200)
+            if honour_range and body:
+                self.send_header("Content-Range", f"bytes {a}-{a + len(body) - 1}/{len(data)}")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -254,6 +271,16 @@ def test_the_range_reader_refuses_a_file_that_ends_early():
     try:
         with pytest.raises(cm.HeaderError, match="ends before"):
             cm.read_header(cm.RangeReader(url, 16))
+    finally:
+        server.shutdown()
+
+
+def test_a_server_that_ignores_range_is_refused():
+    # a 200 with the whole file would put the header bytes at the wrong place without any error
+    url, server = serve(gguf_bytes(SAMPLE_KV, SAMPLE_TENSORS), honour_range=False)
+    try:
+        with pytest.raises(cm.HeaderError, match="answered 200"):
+            cm.read_header(cm.RangeReader(url, 64))
     finally:
         server.shutdown()
 

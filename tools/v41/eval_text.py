@@ -8,10 +8,11 @@ corpus) as the plain text `llama-perplexity -f` reads, and proves it shares noth
 paragraph of more than 80 characters of the validation text appears in `half_a.txt` or `half_b.txt` (compared with
 the whitespace collapsed).  One overlap and the script stops with exit code 2 and writes no text.
 
-The text is the rows of the dataset joined, an empty row becoming a bare newline (the convention of
-build_corpus.load_wikitext).  Its sha256 is printed and written in the report, so every perplexity run can be tied
+The text is the rows of the dataset joined, an empty row becoming a bare newline (`build_corpus.rows_to_text`, the
+rule `build_corpus.load_wikitext` reads the corpus with).  Its sha256 is printed and written in the report, so every perplexity run can be tied
 to the exact bytes.  `--control-rows` runs the same check with the test rows, which the corpus does hold: it must
-find overlaps, otherwise the check cannot see and the script stops (exit code 2).
+find overlaps, otherwise the check cannot see and the script stops (exit code 2).  Without it the report says
+`"control": null` and a warning goes to stderr: the check ran without proof that it can see.
 
 With `--tokenizer` (tokenizer.json of DeepSeek-V4.1, `tokenizers` library) it counts the tokens and the chunks of
 `--n-ctx` tokens `llama-perplexity` cuts (`tokens // n_ctx`, one BOS token counted in front), and says whether the
@@ -38,16 +39,6 @@ SPLIT = "validation"
 
 class OverlapError(RuntimeError):
     """The held-out text shares a paragraph with the corpus."""
-
-
-def read_rows(path):
-    """The texts of a jsonl of dataset rows, in order."""
-    return [json.loads(line)["text"] for line in Path(path).read_text(encoding="utf-8").splitlines() if line]
-
-
-def to_text(rows):
-    """The plain text of the rows: joined, an empty row being a bare newline."""
-    return "".join(r if r else "\n" for r in rows)
 
 
 def squash(text):
@@ -92,21 +83,26 @@ def main(argv=None):
     rows_path = Path(args.rows) if args.rows else out / f"wikitext-2-raw-v1.{SPLIT}.jsonl"
     if args.fetch:
         build_corpus.fetch_wikitext(rows_path, split=SPLIT)
-    rows = read_rows(rows_path)
+    rows = build_corpus.read_rows(rows_path)
     corpus = {"half_a.txt": Path(args.half_a).read_text(encoding="utf-8"),
               "half_b.txt": Path(args.half_b).read_text(encoding="utf-8")}
 
     paragraphs = long_paragraphs(rows)
     report = {"split": SPLIT, "rows": len(rows), "paragraphs_checked": len(paragraphs),
-              "min_paragraph_chars": MIN_PARAGRAPH_CHARS, "rows_sha256": build_corpus.sha256_of(rows_path)}
+              "min_paragraph_chars": MIN_PARAGRAPH_CHARS, "rows_sha256": build_corpus.sha256_of(rows_path),
+              "limit": f"only the distinct rows of more than {MIN_PARAGRAPH_CHARS} characters, whitespace "
+                       f"collapsed, are compared with the corpus; shorter rows (headings, short lines) are not"}
     if args.control_rows:
-        control = long_paragraphs(read_rows(args.control_rows))
+        control = long_paragraphs(build_corpus.read_rows(args.control_rows))
         hits = find_overlaps(control, corpus)
         report["control"] = {"split": "test", "paragraphs_checked": len(control), "overlaps": len(hits)}
         if not hits:
             print("error: the control (wikitext-2 test, which the corpus holds) found no overlap: the check is "
                   "blind", file=sys.stderr)
             return 2
+    else:
+        report["control"] = None
+        print("warning: no --control-rows: nothing proves that the check can see an overlap", file=sys.stderr)
     overlaps = find_overlaps(paragraphs, corpus)
     report["overlaps"] = len(overlaps)
     if overlaps:
@@ -116,7 +112,7 @@ def main(argv=None):
               file=sys.stderr)
         return 2
 
-    text = to_text(rows)
+    text = build_corpus.rows_to_text(rows)
     (out / "wiki_valid.txt").write_text(text, encoding="utf-8", newline="")
     raw = text.encode("utf-8")
     report.update({"file": "wiki_valid.txt", "bytes": len(raw), "chars": len(text),

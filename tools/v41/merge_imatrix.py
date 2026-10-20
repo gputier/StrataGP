@@ -21,15 +21,22 @@ Which counts weight what:
     mean = (n_A * mean_A + n_B * mean_B) / (n_A + n_B); one half having no call, the other half's mean as is; no call
     in either half, 1.
   * any other tensor: weighted by the entry's own `ncall` (calls of the tensor in each half), which the .dat holds.
-    Merged mean = (ncall_A * mean_A + ncall_B * mean_B) / (ncall_A + ncall_B).
+    Merged mean = (ncall_A * mean_A + ncall_B * mean_B) / (ncall_A + ncall_B).  This is exact only if every call
+    carries the same number of tokens (batches of equal size): `count` of `save_imatrix` is in tokens, `ncall` in
+    calls, and the .dat holds no token count to weight with.
 The output `ncall` of an entry is the sum of the two, and its values are the merged mean times it, so the loader finds
-the merged mean.  Both files must hold the same entries.
+the merged mean.  Both files must hold the same entries.  `--out` must not be one of the inputs.
+
+The merged file has no `ffn_gate_exps` entry, only `ffn_up_exps` and `ffn_down_exps`, as the two inputs.
+`llama-quantize` gives the `ffn_gate_exps` tensor the matrix of `ffn_up_exps` when it has none of its own
+(src/llama-quantize.cpp:1880-1889 at c446f1e0).  The format above and this fallback were read in that source.
 
     python3 -I tools/v41/merge_imatrix.py --a imatrix_a.dat --b imatrix_b.dat --stats stats.json --out imatrix_ab.dat
         [--report report.json]
 """
 import argparse
 import json
+import os
 import re
 import struct
 import sys
@@ -141,6 +148,9 @@ def check_filler(slice_, ncall, n, name, expert, half):
 
 def merge(path_a, path_b, stats_path, out_path):
     """Writes the merged matrix to `out_path`; returns a summary of what was merged."""
+    for path in (path_a, path_b):
+        if os.path.exists(out_path) and os.path.samefile(out_path, path):
+            raise ImatrixError(f"--out {out_path} is the input {path}: it would be emptied before being read")
     entries_a, trailer_a = index(path_a)
     entries_b, trailer_b = index(path_b)
     by_name_b = {e.name: e for e in entries_b}

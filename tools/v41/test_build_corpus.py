@@ -183,6 +183,14 @@ def test_head_and_fit_prefix():
     assert bc.Counter().count(got + lines[len(got.splitlines())]) > 50
 
 
+def test_the_text_of_the_rows_is_joined_with_a_bare_newline_for_an_empty_row(tmp_path):
+    rows = ["", " = A = \n", "", "text one\n"]
+    assert bc.rows_to_text(rows) == "\n = A = \n\ntext one\n"
+    p = tmp_path / "w.jsonl"
+    p.write_text("".join(json.dumps({"text": r}) + "\n" for r in rows), encoding="utf-8")
+    assert bc.read_rows(p) == rows
+
+
 def test_load_wikitext_splits_at_level_one_headings(tmp_path):
     rows = ["", " = Alpha = \n", "", " Un texte . \n", "", " = = Section = = \n", " Suite . \n", "",
             " = Beta = \n", " Autre . \n"]

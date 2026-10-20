@@ -28,10 +28,15 @@ def final_line(ppl, unc, chunks=45, n_ctx=2048):
             f"[1]4.1,[2]4.0,\nFinal estimate: PPL over {chunks} chunks for n_ctx={n_ctx} = {ppl:.4f} +/- {unc:.5f}\n")
 
 
-def kl_log(ppl, ppl_base, ln_ratio, kld=0.05, extra=""):
-    """The statistics blocks of a --kl-divergence run, as perplexity.cpp prints them."""
-    return f"""chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence
-   1       4.1000 ±    0.1000       0.01000 ±    0.00100       0.01000 ±    0.00100
+def kl_log(ppl, ppl_base, ln_ratio, kld=0.05, extra="", chunks=45, n_ctx=2048):
+    """The statistics blocks of a --kl-divergence run, as perplexity.cpp prints them: the context line of the run,
+    then the per-chunk table, whose last row index is the number of chunks."""
+    table = "".join(f"{i:4d}       4.1000 ±    0.1000       0.01000 ±    0.00100       0.01000 ±    0.00100\n"
+                    for i in range(1, chunks + 1))
+    return f"""llm_load_print_meta: n_ctx_train      = 1048576
+llama_init_from_model: n_ctx         = {n_ctx}
+chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence
+{table}
 ====== Perplexity statistics ======
 Mean PPL(Q)                   : {ppl:10.6f} ±   0.020000
 Mean PPL(base)                : {ppl_base:10.6f} ±   0.010000
@@ -159,6 +164,36 @@ def test_another_chunk_count_or_context_is_refused(bud):
         qe.analyse(bad, bud)
 
 
+@pytest.mark.parametrize("name", ["Q", "U2", "U1"])
+def test_a_kl_log_with_another_chunk_count_or_context_is_refused(bud, name):
+    bad = logs()
+    bad[name] = kl_log(4.8, PPL_R, 0.18, chunks=6)
+    with pytest.raises(qe.LogError, match=f"{name}: 6 chunks at n_ctx=2048, expected 45 at 2048"):
+        qe.analyse(bad, bud)
+    bad[name] = kl_log(4.8, PPL_R, 0.18, n_ctx=512)
+    with pytest.raises(qe.LogError, match=f"{name}: 45 chunks at n_ctx=512"):
+        qe.analyse(bad, bud)
+    bad[name] = "\n".join(l for l in kl_log(4.8, PPL_R, 0.18).splitlines() if "llama_init" not in l)
+    with pytest.raises(qe.LogError, match="no per-chunk table or no n_ctx line"):
+        qe.analyse(bad, bud)
+
+
+def test_the_chunks_and_context_of_a_kl_run_are_reported():
+    s = qe.parse_kl(kl_log(4.8, 4.0, 0.18, chunks=3), "Q", chunks=3)
+    assert s["chunks"] == 3 and s["n_ctx"] == 2048
+
+
+def test_the_base_tolerance_is_1e_minus_4_relative(bud):
+    assert qe.BASE_TOLERANCE == 1e-4
+    ok = logs()
+    ok["U1"] = kl_log(4.0 * math.exp(0.5), PPL_R * (1 + 5e-5), 0.5)          # 5e-5 apart: read
+    qe.analyse(ok, bud)
+    bad = logs()
+    bad["U1"] = kl_log(4.0 * math.exp(0.5), PPL_R * (1 + 1e-3), 0.5)         # 1e-3 apart: refused
+    with pytest.raises(qe.LogError, match="U1: PPL.base. .* is not R's"):
+        qe.analyse(bad, bud)
+
+
 def test_a_run_against_another_base_is_refused(bud):
     bad = logs()
     bad["U1"] = kl_log(6.6, 4.5, 0.5)                 # base 4.5 is 12.5 % away from R
@@ -169,6 +204,9 @@ def test_a_run_against_another_base_is_refused(bud):
 def test_a_log_without_the_kl_block_is_refused(bud):
     bad = logs()
     bad["Q"] = final_line(5.0, 0.1)
+    with pytest.raises(qe.LogError, match="Q: no per-chunk table or no n_ctx line"):
+        qe.analyse(bad, bud)
+    bad["Q"] = kl_log(5.0, PPL_R, 0.2).split("====== Perplexity")[0]       # the table, none of the statistics
     with pytest.raises(qe.LogError, match="Mean PPL.Q."):
         qe.analyse(bad, bud)
     with pytest.raises(qe.LogError, match="no 'Final estimate"):

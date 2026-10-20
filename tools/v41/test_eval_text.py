@@ -43,10 +43,6 @@ def test_the_limit_is_more_than_80_characters_once_whitespace_is_collapsed():
     assert et.long_paragraphs([P81, P81]) == [P81]
 
 
-def test_the_text_is_the_rows_joined_with_a_bare_newline_for_an_empty_row():
-    assert et.to_text(["", " = A = \n", "", "text one\n"]) == "\n = A = \n\ntext one\n"
-
-
 def test_a_paragraph_found_in_a_half_is_an_overlap_whatever_its_wrapping():
     halves = {"half_a.txt": "intro\n" + SHARED.replace(", so", ",\n   so") + "\nend", "half_b.txt": "nothing here"}
     assert et.find_overlaps([et.squash(SHARED), et.squash(OWN)], halves) == [(et.squash(SHARED), "half_a.txt")]
@@ -72,6 +68,15 @@ def test_an_overlap_stops_without_writing_the_text(tmp_path, capsys):
     report = json.loads((out / "eval_text.json").read_text())
     assert report["overlaps"] == 1 and report["overlap_examples"][0]["in"] == "half_b.txt"
     assert "1 validation paragraphs appear in the corpus" in capsys.readouterr().err
+
+
+def test_without_a_control_the_report_says_so_and_states_the_length_limit(tmp_path, capsys):
+    code, out = run(tmp_path, [OWN + "\n"], half_a="a", half_b="b")
+    assert code == 0
+    report = json.loads((out / "eval_text.json").read_text())
+    assert report["control"] is None
+    assert "more than 80 characters" in report["limit"]
+    assert "no --control-rows" in capsys.readouterr().err
 
 
 def test_a_control_that_finds_nothing_means_the_check_is_blind(tmp_path, capsys):

@@ -242,10 +242,24 @@ def tar_candidates(source):
     return sorted(found, key=lambda c: c[1])
 
 
+def read_rows(path):
+    """The texts of a jsonl of dataset rows, in order."""
+    return [json.loads(line)["text"] for line in Path(path).read_text(encoding="utf-8").splitlines() if line]
+
+
+def rows_to_lines(rows):
+    """The pieces of text of the rows: an empty row becomes a bare newline."""
+    return [r if r else "\n" for r in rows]
+
+
+def rows_to_text(rows):
+    """The plain text of the rows, joined (the text `llama-perplexity -f` reads)."""
+    return "".join(rows_to_lines(rows))
+
+
 def load_wikitext(path):
     """The articles [(title, text)] of the wikitext rows: cut at the level-1 headings (` = Title = `)."""
-    rows = [json.loads(line)["text"] for line in Path(path).read_text(encoding="utf-8").splitlines() if line]
-    lines = [r if r else "\n" for r in rows]
+    lines = rows_to_lines(read_rows(path))
     heading = re.compile(r"^ = [^=].* = \n?$")
     articles, title, buf = [], None, []
     for line in lines:

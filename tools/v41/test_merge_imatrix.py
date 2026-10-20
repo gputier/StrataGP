@@ -226,6 +226,17 @@ def test_the_hand_check_recomputes_one_expert_of_each_kind(files):
     assert all(s["max_abs_error"] < 1e-6 for s in found.values())
 
 
+def test_an_output_that_is_an_input_is_refused_and_the_input_is_left_intact(files, tmp_path, capsys):
+    before = {k: files[k].read_bytes() for k in ("a", "b")}
+    link = tmp_path / "link.dat"
+    link.symlink_to(files["b"])
+    for out in (files["a"], files["b"], link):
+        assert mi.main(["--a", str(files["a"]), "--b", str(files["b"]), "--stats", str(files["stats"]),
+                        "--out", str(out)]) == 2
+        assert "is the input" in capsys.readouterr().err
+    assert {k: files[k].read_bytes() for k in ("a", "b")} == before
+
+
 def test_main_writes_the_report_and_returns_zero(files, tmp_path, capsys):
     report = tmp_path / "report.json"
     assert mi.main(["--a", str(files["a"]), "--b", str(files["b"]), "--stats", str(files["stats"]),
