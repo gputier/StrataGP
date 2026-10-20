@@ -124,6 +124,15 @@ def test_the_identity_mode_runs_from_the_command_line(tmp_path, capsys):
     assert "sha256" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("which", [0, 1])
+def test_out_may_not_be_an_input(files, which, capsys):
+    before = Path(files[which]).read_bytes()
+    assert tt.main(["--mode", "p3", "--stats", str(files[0]), "--budget", str(files[1]),
+                    "--out", str(files[which])]) == 2
+    assert "would be overwritten" in capsys.readouterr().err
+    assert Path(files[which]).read_bytes() == before
+
+
 def test_a_bad_budget_gives_exit_code_2(files, tmp_path, capsys):
     bad = write_budget(tmp_path / "bad.json", sizes=(1, 1, 1))
     assert tt.main(["--mode", "p3", "--stats", str(files[0]), "--budget", str(bad),

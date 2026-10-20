@@ -28,6 +28,7 @@ the file is printed.
 import argparse
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -139,6 +140,9 @@ def main(argv=None):
         if args.mode == "p3":
             if not (args.stats and args.budget):
                 ap.error("--mode p3 needs --stats and --budget")
+            for path in (args.stats, args.budget):
+                if os.path.exists(args.out) and os.path.samefile(args.out, path):
+                    raise TableError(f"--out {args.out} is the input {path}: it would be overwritten")
             table = build_p3(args.stats, args.budget, args.plan)
         else:
             table = build_identity(args.n_layer, args.n_expert)

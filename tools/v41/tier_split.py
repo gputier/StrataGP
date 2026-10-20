@@ -37,12 +37,13 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gguf_reader import GGUF_META, GGUFFile, TensorInfo  # noqa: E402
+import tier_table  # noqa: E402
 
 HEADER_BYTES = 24  # magic, version, tensor count (u64), key-value count (u64)
 TYPE_I32 = 26
 TYPE_MXFP4 = 39
-N_TIERS = 3
 COPY_CHUNK = 16 << 20
 
 EXPERT_RE = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
@@ -95,29 +96,14 @@ class Shard:
 def load_table(path: Path) -> Table:
     raw = path.read_bytes()
     try:
-        doc = json.loads(raw)
-        mode, n_expert, n_layer = doc["mode"], doc["n_expert"], doc["n_layer"]
-        tier_types, layers = doc["tier_types"], doc["layers"]
-    except (ValueError, KeyError) as exc:
-        raise SplitError(f"{path}: not a tier table ({exc!r})") from exc
-    if mode not in ("p3", "identity"):
-        raise SplitError(f"{path}: mode {mode!r}, expected 'p3' or 'identity'")
-    if not isinstance(n_expert, int) or n_expert < N_TIERS:
-        raise SplitError(f"{path}: n_expert {n_expert!r}")
-    if len(tier_types) != N_TIERS:
-        raise SplitError(f"{path}: {len(tier_types)} tier types, expected {N_TIERS}")
-    if len(layers) != n_layer:
-        raise SplitError(f"{path}: n_layer {n_layer} but {len(layers)} layers")
+        doc = tier_table.check_table(json.loads(raw), str(path))
+    except (ValueError, TypeError) as exc:
+        raise SplitError(f"{path}: not a usable tier table ({exc})") from exc
+    mode, n_expert, layers = doc["mode"], doc["n_expert"], doc["layers"]
     for layer, tiers in enumerate(layers):
-        if len(tiers) != N_TIERS:
-            raise SplitError(f"{path}: layer {layer} has {len(tiers)} tiers, expected {N_TIERS}")
         for tier, experts in enumerate(tiers):
             if not experts:
                 raise SplitError(f"{path}: layer {layer} tier {tier} is empty")
-            if any(a >= b for a, b in zip(experts, experts[1:])):
-                raise SplitError(f"{path}: layer {layer} tier {tier} is not strictly increasing")
-        if sorted(e for experts in tiers for e in experts) != list(range(n_expert)):
-            raise SplitError(f"{path}: layer {layer} is not a partition of 0..{n_expert - 1}")
     return Table(mode, n_expert, dict(enumerate(layers)), hashlib.sha256(raw).hexdigest())
 
 
@@ -320,19 +306,15 @@ def header_bytes(shard: Shard, n_tensors: int, new_total: int) -> bytes:
     return bytes(head)
 
 
-def write_zeros(out, count: int) -> None:
-    out.write(bytes(count))
-
-
 def write_shard(shard: Shard, entries: list[Entry], new_total: int, placed: tuple[int, int], target: Path) -> None:
     data_start, size = placed
     head = header_bytes(shard, len(entries), new_total)
     with shard.path.open("rb") as src, target.open("xb") as out:
         out.write(head)
         out.write(encode_infos(entries))
-        write_zeros(out, data_start - out.tell())
+        out.write(bytes(data_start - out.tell()))
         for e in entries:
-            write_zeros(out, data_start + e.offset - out.tell())
+            out.write(bytes(data_start + e.offset - out.tell()))
             if e.payload is not None:
                 out.write(e.payload)
             elif e.experts is not None:
@@ -345,7 +327,7 @@ def write_shard(shard: Shard, entries: list[Entry], new_total: int, placed: tupl
                 while left:
                     out.write(read_exact(src, min(left, COPY_CHUNK)))
                     left -= min(left, COPY_CHUNK)
-        write_zeros(out, size - out.tell())
+        out.write(bytes(size - out.tell()))
 
 
 def read_exact(fh, n: int) -> bytes:

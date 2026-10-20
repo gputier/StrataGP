@@ -179,6 +179,18 @@ def test_an_empty_tier_is_refused(tmp_path):
         ti.split_matrix(merged_matrix(tmp_path / "ab.dat"), table, tmp_path / "o.dat")
 
 
+@pytest.mark.parametrize("family, other", [("up", "down"), ("down", "up")])
+def test_a_layer_without_its_up_or_down_entry_is_refused(tmp_path, family, other):
+    values = expert_values(up_value, 1, UP_WIDTH)
+    src = write_dat(tmp_path / "missing.dat", [
+        ("blk.0.ffn_up_exps.weight", 10, expert_values(up_value, 0, UP_WIDTH)),
+        ("blk.0.ffn_down_exps.weight", 10, expert_values(down_value, 0, DOWN_WIDTH)),
+        (f"blk.1.ffn_{other}_exps.weight", 20, values if other == "up" else expert_values(down_value, 1, DOWN_WIDTH)),
+    ])
+    with pytest.raises(mi.ImatrixError, match=f"layer 1 has no blk.1.ffn_{family}_exps.weight"):
+        ti.split_matrix(src, TABLE, tmp_path / "o.dat")
+
+
 def test_out_may_not_be_the_input(tmp_path):
     src = merged_matrix(tmp_path / "ab.dat")
     with pytest.raises(mi.ImatrixError, match="would be emptied"):

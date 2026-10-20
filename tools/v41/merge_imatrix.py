@@ -44,7 +44,7 @@ from array import array
 from collections import namedtuple
 from pathlib import Path
 
-EXPERT_ENTRY = re.compile(r"^blk\.(\d+)\.ffn_(?:gate|up|down)_exps\.weight$")
+EXPERT_ENTRY = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
 
 # an entry of a file: where its floats start, so they can be read one entry at a time
 Entry = namedtuple("Entry", "name ncall nval offset")
@@ -104,6 +104,11 @@ def write_entry(f, name, ncall, values):
     if sys.byteorder != "little":
         out.byteswap()
     out.tofile(f)
+
+
+def write_trailer(f, last_call, dataset):
+    raw = dataset.encode("utf-8")
+    f.write(struct.pack("<i", last_call) + struct.pack("<i", len(raw)) + raw)
 
 
 def load_counts(path):
@@ -191,9 +196,7 @@ def merge(path_a, path_b, stats_path, out_path):
                             else "experts_neither"] += 1
                 summary["expert_entries"] += 1
             write_entry(out, ea.name, ea.ncall + eb.ncall, merged)
-        out.write(struct.pack("<i", last_call))
-        raw = dataset.encode("utf-8")
-        out.write(struct.pack("<i", len(raw)) + raw)
+        write_trailer(out, last_call, dataset)
     return summary
 
 

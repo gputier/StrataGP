@@ -18,16 +18,13 @@ identity mode too.  The file format is that of merge_imatrix.py.
 import argparse
 import hashlib
 import os
-import re
 import struct
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tier_table  # noqa: E402
-from merge_imatrix import ImatrixError, index, read_values, write_entry  # noqa: E402
-
-EXPERT_ENTRY = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
+from merge_imatrix import EXPERT_ENTRY, ImatrixError, index, read_values, write_entry, write_trailer  # noqa: E402
 
 
 def tier_name(layer, tier, family):
@@ -43,8 +40,10 @@ def tier_slices(values, ids, width):
 
 
 def check_entries(entries, table):
-    """Number of entries the output holds; refuses an expert entry that does not fit the table."""
+    """Number of entries the output holds; refuses an expert entry that does not fit the table, and a layer that
+    lacks its up or its down entry."""
     n_out = 0
+    present = set()
     for e in entries:
         m = EXPERT_ENTRY.match(e.name)
         if m is None:
@@ -57,7 +56,12 @@ def check_entries(entries, table):
                                f"{table['n_expert']} experts")
         if any(not ids for ids in table["layers"][int(m.group(1))]):
             raise ImatrixError(f"{e.name}: layer {m.group(1)} has an empty tier, its entry would hold no value")
+        present.add((int(m.group(1)), m.group(2)))
         n_out += tier_table.N_TIERS
+    for layer in range(table["n_layer"]):
+        for family in ("up", "down"):
+            if (layer, family) not in present:
+                raise ImatrixError(f"layer {layer} has no blk.{layer}.ffn_{family}_exps.weight entry")
     return n_out
 
 
@@ -83,8 +87,7 @@ def split_matrix(path_in, table, path_out):
                 name = tier_name(layer, k, family)
                 write_entry(out, name, e.ncall, tier_slices(values, ids, width))
                 written.append((name, len(ids) * width, len(ids), width))
-        raw = trailer["dataset"].encode("utf-8")
-        out.write(struct.pack("<i", trailer["last_call"]) + struct.pack("<i", len(raw)) + raw)
+        write_trailer(out, trailer["last_call"], trailer["dataset"])
     return {"entries_in": len(entries), "entries_out": n_out, "tier_entries": written}
 
 
