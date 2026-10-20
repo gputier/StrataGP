@@ -281,6 +281,11 @@ if(STRATA_BUILD_TESTS)
   add_executable(rope_yarn_reference_test tests/core/rope_yarn_reference_test.cpp)
   target_include_directories(rope_yarn_reference_test PRIVATE include)
   add_test(NAME rope_yarn_reference_test COMMAND rope_yarn_reference_test)
+  # strata-q36's `--kv q4` cache on one KV head (Hadamard rotation, q4_0 cells, rotation back): scores and attention output
+  # against float64 attention on the unrotated values (header only)
+  add_executable(q36_kv_q4_reference_test tests/core/q36_kv_q4_reference_test.cpp)
+  target_include_directories(q36_kv_q4_reference_test PRIVATE include)
+  add_test(NAME q36_kv_q4_reference_test COMMAND q36_kv_q4_reference_test)
 
   # the hipBLASLt tuning header's architecture gate: RDNA4 siblings share solution IDs, RDNA3 siblings share
   # theirs, cross-family pairs and version mismatches stay rejected (synthetic tables: no model, no GPU)
