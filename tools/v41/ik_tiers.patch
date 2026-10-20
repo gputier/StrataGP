@@ -218,6 +218,32 @@ index 3023ff09..38ca3b0b 100644
  
      llama_split_tensor split_ffn_gate_inp;
      llama_split_tensor split_ffn_up_exps;
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 95874de7..afb0bbbb 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -4416,6 +4416,21 @@ static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_
+             }
+         }
+         if (!is_mla) {
++            // Expert tier tensors, blk.L.tK.ffn_{up,gate,down}_exps.weight and blk.L.tK.ffn_exps_map.weight.
++            // Each tier produces a full [ne1, n_expert_used, n_tokens] output, so the three weights add up
++            // like classic experts. experts[il] stays empty: it holds one tensor per kind and its users
++            // build override patterns that do not match tier names.
++            auto tier_name = name.substr(pos1 + 1);
++            if (tier_name.size() > 3 && tier_name[0] == 't' && tier_name[1] >= '0' && tier_name[1] <= '9' && tier_name[2] == '.') {
++                tier_name = tier_name.substr(3);
++                if (tier_name == "ffn_up_exps.weight" || tier_name == "ffn_gate_exps.weight" || tier_name == "ffn_down_exps.weight") {
++                    ffn_exps[il] += t->ne[1] * n_ubatch * model.hparams.n_expert_used * sizeof(float);
++                    continue;
++                }
++                if (tier_name == "ffn_exps_map.weight") {
++                    continue;
++                }
++            }
+             auto ttype = llm_tensor_type(model.arch, name, il);
+             if (ttype == LLM_TENSOR_UNKNOWN) {
+                 LLAMA_LOG_WARN("Oops: got unknown for tensor %s\n", name.c_str());
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
 index a0f93a33..a4880601 100644
 --- a/tests/CMakeLists.txt
