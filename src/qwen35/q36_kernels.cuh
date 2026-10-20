@@ -162,6 +162,14 @@ inline void launch_q8_rows(const void* w, const half* dpl, const void* x, float*
     launch_q8_rows_t<NC, NJ, PK>(w, dpl, x, y, nb, n_out, 8, 1024, s);
 }
 
+/// launch_q8_rows with NJ = ceil(nb / 32) for rows of up to 96 blocks (hidden 3072).
+template <int NC, bool PK>
+inline void launch_q8_rows_nb(const void* w, const half* dpl, const void* x, float* y, int nb, int n_out, cudaStream_t s) {
+    if (nb <= 32) launch_q8_rows<NC, 1, PK>(w, dpl, x, y, nb, n_out, s);
+    else if (nb <= 64) launch_q8_rows<NC, 2, PK>(w, dpl, x, y, nb, n_out, s);
+    else launch_q8_rows<NC, 3, PK>(w, dpl, x, y, nb, n_out, s);
+}
+
 /// The shared expert's gate and up products and SwiGLU + q8_1 in one launch: 32 rows (one q8_1 block of h) per 1024-thread
 /// block, warp w computing gate row and up row 32 b + w, then warp 0 applying native_swiglu_quantize_q8_1_kernel's body to
 /// the 32 pairs.  Column c of the h image is at hq + c * (n_out / 32).  n_out % 32 == 0.
@@ -219,14 +227,15 @@ __global__ void __launch_bounds__(256) k_add_rms_q(float* x, const float* y, con
     }
 }
 
-/// k_moe_out for T <= 8 rows (decode, verify windows) with n <= 2048 and n % 256 == 0: 1024 threads per row instead of 256
+inline constexpr int kMoeOutSmallN = 3072;   // the widest row it keeps in shared memory
+/// k_moe_out for T <= 8 rows (decode, verify windows) with n <= kMoeOutSmallN and n % 256 == 0: 1024 threads per row instead of 256
 /// (the elements' loads in parallel), the squares summed per old thread (element t, t + 256, ... in order) and the
 /// 256-wide tree as before: the same bits.  x += sum_k w_k part_k (+ gate * shared); h = rms(x) * wn; with hq the q8_1
 /// image of h as well (the next layer's input).
 __global__ void __launch_bounds__(1024) k_moe_out_small(float* x, const float* parts, const int32_t* prow, const float* wts,
                                                         int K_, const float* shared, const float* sgate, int sg_stride,
                                                         const float* wn, float* h, int n, float eps, QB* hq = nullptr) {
-    __shared__ float vv[2048];
+    __shared__ float vv[kMoeOutSmallN];
     __shared__ float sh[256];
     __shared__ const float* pk[16];
     const int t = blockIdx.x;

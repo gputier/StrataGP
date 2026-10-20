@@ -23,6 +23,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_router.hpp"
+#include "strata/kernels/rope_scaling.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/qwen35/engine.hpp"
@@ -251,12 +252,13 @@ struct RowSel {
 /// RMS-normed per head with their weights, NEOX RoPE over the first n_rot dims, k / v into the cache, the gate kept.
 /// Rotary position of a cell: the cell itself (text) plus *rdelta (what the pictures before a text run did not use
 /// of their cells, see mrope), or, with `mtab` (a request's prompt cells, device int32 [cell][3] = t, h, w), the
-/// interleaved M-RoPE position (llama.cpp's IMROPE with sections 11 / 11 / 10: pair p takes stream p % 3).
+/// interleaved M-RoPE position (llama.cpp's IMROPE with sections 11 / 11 / 10: pair p takes stream p % 3).  `ra`: the
+/// rope scaling's constants (rope_scaling.hpp; the identity when off).
 /// grid (H + HKV, T), block 256 (HD <= 256).
 __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, const float* qw, const float* kw,
                             float* q, float* gate, float* kc, float* vc, int H, int HKV, int HD, int n_rot,
                             const int32_t* pos0, int ctx, float base, float eps, const int32_t* rdelta,
-                            const int32_t* mtab, RowSel rs) {
+                            const int32_t* mtab, RowSel rs, strata::kernels::RopeKernelArgs ra) {
     __shared__ float sh[kThreads];
     __shared__ float buf[256];
     const int head = blockIdx.x, t = blockIdx.y;
@@ -282,7 +284,11 @@ __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, c
         const int rp = mtab ? __ldg(mtab + (size_t) pos * 3 + p % 3) : pos + dl;
         const float theta = (float) rp * powf(base, -2.0f * (float) p / (float) n_rot);
         float sn, cs;
-        sincosf(theta, &sn, &cs);
+        if (ra.freq_scale == 1.0f && ra.ext_factor == 0.0f && ra.attn_factor == 1.0f)
+            sincosf(theta, &sn, &cs);   // no scaling: the trained angles, as before
+        else
+            strata::kernels::rope_scaled_angle(theta, ra.freq_scale, ra.corr_low, ra.corr_high, ra.ext_factor, ra.attn_factor, p,
+                                               cs, sn);
         v = i < half ? buf[i] * cs - buf[i + half] * sn : buf[i - half] * sn + buf[i] * cs;
     }
     if (isq) {
@@ -872,6 +878,9 @@ struct Model {
     int64_t top_k = 8;
     float eps = 1e-6f, rope_base = 1e7f;
     int n_rot = 64;
+    strata::kernels::RopeKernelArgs rope;   // the rope scaling's constants (identity = off), set by run()
+    std::string rope_type;                  // the GGUF's rope.scaling.type / .factor / .original_context_length, if any
+    double rope_factor = 0, rope_orig_ctx = 0;
     std::vector<Layer> layers;
     const float* out_norm = nullptr;
     Mat head;
@@ -976,6 +985,9 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
     if (const strata::MetaValue* v = gm.meta().get(p + "attention.layer_norm_rms_epsilon")) m.eps = (float) v->num();
     if (const strata::MetaValue* v = gm.meta().get(p + "rope.freq_base")) m.rope_base = (float) v->num();
     if (const strata::MetaValue* v = gm.meta().get(p + "rope.dimension_count")) m.n_rot = (int) v->u;
+    if (const strata::MetaValue* v = gm.meta().get(p + "rope.scaling.type")) m.rope_type = v->s;
+    if (const strata::MetaValue* v = gm.meta().get(p + "rope.scaling.factor")) m.rope_factor = v->num();
+    if (const strata::MetaValue* v = gm.meta().get(p + "rope.scaling.original_context_length")) m.rope_orig_ctx = v->num();
     uint64_t bytes = 0;
     auto find = [&](const std::string& name, size_t& s) -> const strata::TensorInfo* {
         const strata::TensorInfo* t = gm.find(name, &s);
@@ -1600,14 +1612,12 @@ struct Engine {
         if (!fast_k || w.type != 8 || T < 1 || T > 8 || w.n_in % 32 != 0) return false;
         if (K::native_q8_0_packed_eligible(w.n_in, w.n_out) && K::native_q8_0_packed_enabled()) return false;
         const int nb = w.n_in / 32;
-        if (nb > 64) return false;
+        if (nb > 96) return false;
         const void* wp = w.d;
         const half* dpl = nullptr;
-        const int NJ = nb <= 32 ? 1 : 2;
 #define Q36_Q8(NCV)                                                                                          \
     case NCV:                                                                                                \
-        if (NJ == 1) q36k::launch_q8_rows<NCV, 1, false>(wp, dpl, q, out, nb, w.n_out, st);                  \
-        else q36k::launch_q8_rows<NCV, 2, false>(wp, dpl, q, out, nb, w.n_out, st);                          \
+        q36k::launch_q8_rows_nb<NCV, false>(wp, dpl, q, out, nb, w.n_out, st);                               \
         break;
         switch (T) { Q36_Q8(1) Q36_Q8(2) Q36_Q8(3) Q36_Q8(4) Q36_Q8(5) Q36_Q8(6) Q36_Q8(7) Q36_Q8(8) }
 #undef Q36_Q8
@@ -1675,8 +1685,8 @@ struct Engine {
         if (fast_k && T <= kGemmT) {
             if (verify_k) {
                 if (!vx_) {
-                    CK(cudaMalloc((void**) &vx_, (size_t) 8 * 2048 * 4));
-                    CK(cudaMalloc((void**) &vh_, (size_t) 8 * 2048 * 4));
+                    CK(cudaMalloc((void**) &vx_, (size_t) 8 * N * 4));
+                    CK(cudaMalloc((void**) &vh_, (size_t) 8 * N * 4));
                 }
                 CK(cudaMemcpyAsync(vx_, x, (size_t) T * N * 4, cudaMemcpyDeviceToDevice, st));
                 k_add_rms<<<T, kThreads, 0, st>>>(vx_, y, L.post_norm, vh_, N, m->eps);
@@ -1697,7 +1707,7 @@ struct Engine {
         const int FS = (int) m->g.n_ff_shexp;
         const Mat &a = L.sh_gate, &b = L.sh_up;
         if (!fast_k || T < 1 || T > 4 || a.type != 8 || b.type != 8 || a.n_in != b.n_in || a.n_out != FS || b.n_out != FS ||
-            a.n_in % 32 != 0 || a.n_in / 32 > 64 || a.n_in / 32 <= 32 || FS % 32 != 0 ||
+            a.n_in % 32 != 0 || a.n_in / 32 > 96 || a.n_in / 32 <= 32 || FS % 32 != 0 ||
             (K::native_q8_0_packed_eligible(a.n_in, a.n_out) && K::native_q8_0_packed_enabled()))
             return false;
         const int nb = a.n_in / 32;
@@ -1712,8 +1722,11 @@ struct Engine {
         if (pkd)                                                                                             \
             q36k::k_sh_gu<NCV, 2, true><<<grid, 1024, 0, st>>>(wa, da, wb, db, (const q36k::QB*) xq,        \
                                                                (q36k::QB*) q8, nb, FS);                      \
-        else                                                                                                 \
+        else if (nb <= 64)                                                                                   \
             q36k::k_sh_gu<NCV, 2, false><<<grid, 1024, 0, st>>>(wa, nullptr, wb, nullptr, (const q36k::QB*) xq, \
+                                                                (q36k::QB*) q8, nb, FS);                     \
+        else                                                                                                 \
+            q36k::k_sh_gu<NCV, 3, false><<<grid, 1024, 0, st>>>(wa, nullptr, wb, nullptr, (const q36k::QB*) xq, \
                                                                 (q36k::QB*) q8, nb, FS);                     \
         break;
         switch (T) { Q36_SH(1) Q36_SH(2) Q36_SH(3) Q36_SH(4) }
@@ -1836,11 +1849,11 @@ struct Engine {
     /// The MoE block's end (k_moe_out) for T rows.
     void moe_end(int T, const int32_t* prow, const float* shared, const float* sgate, const float* wn, float* hout, int sgs = 1) {
         const int N = (int) m->g.n_embd, Kp = (int) m->top_k;
-        const bool small = fast_k && T <= 8 && N <= 2048 && N % 256 == 0 && Kp <= 15;
+        const bool small = fast_k && T <= 8 && N <= q36k::kMoeOutSmallN && N % 256 == 0 && Kp <= 15;
         if (small && verify_k) {
             if (!vx_) {
-                CK(cudaMalloc((void**) &vx_, (size_t) 8 * 2048 * 4));
-                CK(cudaMalloc((void**) &vh_, (size_t) 8 * 2048 * 4));
+                CK(cudaMalloc((void**) &vx_, (size_t) 8 * N * 4));
+                CK(cudaMalloc((void**) &vh_, (size_t) 8 * N * 4));
             }
             CK(cudaMemcpyAsync(vx_, x, (size_t) T * N * 4, cudaMemcpyDeviceToDevice, st));
             k_moe_out<<<T, kThreads, 0, st>>>(vx_, eparts, prow, ewts, Kp, shared, sgate, sgs, wn, vh_, N, m->eps);
@@ -1937,7 +1950,7 @@ struct Engine {
             }
             k_attn_prep<<<dim3(H + HKV, T), kThreads, 0, st>>>(qg, kx, vx, L.q_norm, L.k_norm, q, gate, rows_mode ? nullptr : kc[li],
                                                               rows_mode ? nullptr : vc[li], H, HKV, HD, m->n_rot, dpos, ctx,
-                                                              m->rope_base, m->eps, d_delta, mtab_now, rs);
+                                                              m->rope_base, m->eps, d_delta, mtab_now, rs, m->rope);
             if (T > kGemmT) {
                 // a prompt chunk: scores = Q K^T and out = P V as FP16 GEMMs (FP32 accumulation, FP32 scores) per KV
                 // head (its query heads one strided batch over the shared K / V), the causal softmax in between writing
@@ -2109,7 +2122,7 @@ struct Engine {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
         const Mat& hd = m->head;
-        if (!fast_k || draft_n <= 0 || draft_n >= g.n_vocab || draft_n % 8 != 0 || hd.type != 8 || hd.n_in != N || N / 32 != 64) {
+        if (!fast_k || draft_n <= 0 || draft_n >= g.n_vocab || draft_n % 8 != 0 || hd.type != 8 || hd.n_in != N || N / 32 <= 32 || N / 32 > 96) {
             head_rows(hn, 1, logits_m, pick_m);
             return;
         }
@@ -2119,9 +2132,9 @@ struct Engine {
             if (std::get<0>(p) == hd.d) pk = std::get<1>(p);
         if (pk) {
             const half* dpl = reinterpret_cast<const half*>(pk + (size_t) hd.n_in * hd.n_out);
-            q36k::launch_q8_rows<1, 2, true>(pk, dpl, q8, logits_m, 64, draft_n, st);
+            q36k::launch_q8_rows_nb<1, true>(pk, dpl, q8, logits_m, N / 32, draft_n, st);
         } else {
-            q36k::launch_q8_rows<1, 2, false>(hd.d, nullptr, q8, logits_m, 64, draft_n, st);
+            q36k::launch_q8_rows_nb<1, false>(hd.d, nullptr, q8, logits_m, N / 32, draft_n, st);
         }
         k_argmax<<<dim3(kArgBlocks, 1), kThreads, 0, st>>>(logits_m, draft_n, pick_m, amv, ami, false);
         k_argmax<<<dim3(1, 1), kThreads, 0, st>>>(logits_m, kArgBlocks, pick_m, amv, ami, true);
@@ -3729,12 +3742,55 @@ int serve(Engine& E) {
 
 }  // namespace
 
+/// The rope scaling of the run into m.rope, with strata's resolution (generate.cpp): an explicit option over the GGUF's
+/// rope.scaling.* keys over none; YaRN with ext factor 1, attention factor 1, betas 32 / 1.  Before any graph capture:
+/// the kernels take the constants as arguments.
+static bool resolve_rope(Model& m, const std::string& type_opt, double scale_opt, double orig_opt, int ctx) {
+    using RST = strata::kernels::RopeScalingType;
+    strata::kernels::RopeScaling cfg;
+    cfg.freq_base = m.rope_base;
+    if (type_opt != "" && type_opt != "none" && type_opt != "linear" && type_opt != "yarn") {
+        std::fprintf(stderr, "strata-q36: --rope-scaling must be none, linear or yarn (got '%s')\n", type_opt.c_str());
+        return false;
+    }
+    if (!std::isfinite(scale_opt) || !std::isfinite(orig_opt) || scale_opt < 0 || orig_opt < 0 ||
+        (scale_opt != 0 && scale_opt < 1.0)) {
+        std::fprintf(stderr, "strata-q36: --rope-scale must be >= 1 and --rope-orig-ctx positive (0 = the model's)\n");
+        return false;
+    }
+    const std::string& type = type_opt.empty() ? m.rope_type : type_opt;
+    if (type == "linear") cfg.type = RST::Linear;
+    else if (type == "yarn") cfg.type = RST::YaRN;
+    else if (!type.empty() && type != "none") {
+        std::fprintf(stderr, "strata-q36: the model carries rope.scaling.type '%s' - none, linear or yarn only\n", type.c_str());
+        return false;
+    }
+    if (scale_opt > 0) cfg.factor = scale_opt;
+    else if (m.rope_factor > 1.0) cfg.factor = m.rope_factor;
+    if (orig_opt > 0) cfg.orig_ctx = orig_opt;
+    else if (m.rope_orig_ctx >= 1) cfg.orig_ctx = m.rope_orig_ctx;
+    cfg.ext_factor = cfg.type == RST::YaRN ? 1.0 : 0.0;
+    if (const char* why = strata::kernels::rope_scaling_invalid(cfg)) {
+        std::fprintf(stderr, "strata-q36: invalid rope scaling configuration: %s (factor %g, original context %g)\n", why,
+                     cfg.factor, cfg.orig_ctx);
+        return false;
+    }
+    m.rope = cfg.kernel_args(m.n_rot);
+    if (cfg.type != RST::None)
+        std::fprintf(stderr, "strata-q36: rope scaling %s, factor %.6g (freq_scale %.6g, base %.6g, mscale %.6f), --max-context %d "
+                     "against a trained context of %.0f\n", cfg.type == RST::YaRN ? "yarn" : "linear", cfg.factor,
+                     cfg.freq_scale(), cfg.freq_base, cfg.mscale(), ctx, cfg.orig_ctx);
+    return true;
+}
+
 int strata::qwen35::run(int argc, char** argv) {
     std::string model, tokens, force, dump_full, emb_file;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
     double expert_vram = -1.0;
     bool warm = true;
     int expert_slots = 0, batch = 0, draft_vocab = -1;
+    std::string rope_scaling;
+    double rope_scale = 0, rope_orig_ctx = 0;   // 0 = the option is absent (the GGUF's keys, else off)
     bool serve_mode = false, graph = true, vision = false, batch_mtp = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -3776,6 +3832,9 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
         else if (a == "--expert-slots") expert_slots = std::atoi(next().c_str());
         else if (a == "--hybrid-rows") hybrid_rows = std::atoi(next().c_str());
+        else if (a == "--rope-scaling") rope_scaling = next();                     // none | linear | yarn, as strata's
+        else if (a == "--rope-scale") rope_scale = std::atof(next().c_str());
+        else if (a == "--rope-orig-ctx" || a == "--yarn-orig-ctx") rope_orig_ctx = std::atof(next().c_str());
         else if (serve_mode && a.rfind("--", 0) == 0) {
             // serve passes the config's args plus a few of its own: one this engine does not have is said and skipped
             // (with its value), not fatal
@@ -3811,6 +3870,7 @@ int strata::qwen35::run(int argc, char** argv) {
         std::fprintf(stderr, "strata-q36: %s\n", e.what());
         return 1;
     }
+    if (!resolve_rope(m, rope_scaling, rope_scale, rope_orig_ctx, ctx)) return 2;
     Engine E;
     E.use_graph = graph;
     if (chunk == 0) {
