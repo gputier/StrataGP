@@ -5563,6 +5563,9 @@ def resolve_rope(ctx: int, scaling, scale, trained: int = 262144):
     past the trained range (the setup will not configure a run it knows is out of spec) rather than
     silently overridden.
     """
+    if scale is not None and scale < 1:
+        raise ValueError(f"--rope-scale {scale:g} is below 1: a factor under 1 would compress the positions "
+                         "the model was trained on")
     if ctx <= trained:
         if scale is not None and scaling in (None, "none"):
             raise ValueError("--rope-scale needs --rope-scaling linear or yarn (the chosen context fits the "
@@ -5717,12 +5720,11 @@ def own_path_vision(a, fam: dict, gpu: dict, hip: bool) -> str:
     return asked
 
 
-KV_CELL_BYTES = {"fp32": 1024, "q4": 144}     # one KV head's cell at head_dim 256: fp32, or 8 q4_0 blocks of 18 bytes
-
-
 def own_path_kv_bytes_per_token(fam: dict) -> int:
     """The engine's KV cache per context token in the family's own cache format (fam["kv"]; fp32 where it has none)."""
-    return fam["kv_bytes_per_token"] * KV_CELL_BYTES[fam.get("kv") or "fp32"] // KV_CELL_BYTES["fp32"]
+    if fam.get("kv") == "q4":
+        return fam["kv_bytes_per_token"] * 144 // 1024     # one q4_0 cell of a 256-wide head is 144 B against 1024 B in fp32
+    return fam["kv_bytes_per_token"]
 
 
 def own_path_parallel_slot_gb(fam: dict, ctx: int) -> float:
@@ -5846,6 +5848,9 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
             say(f"  {i}) {c // 1024}K tokens" + ("   (recommended for your GPU)" if c == rec_ctx else ""))
         ctx = ctxs[int(ask("Context?", [str(i) for i in range(1, len(ctxs) + 1)], str(ctxs.index(rec_ctx) + 1),
                            a.yes)) - 1]
+    max_ctx = fam.get("max_context", 262144)
+    if ctx > max_ctx:
+        fail(f"{ctx} tokens is past {fam['title']}'s limit of {max_ctx}", f"use --context {max_ctx} or lower")
     rope = None
     if fam.get("rope_scale"):                          # YaRN past the trained range; the card's static factor
         try:
@@ -5873,9 +5878,9 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
             n = int(ask("How many requests at once (1 = one at a time)?", [str(i) for i in range(1, PARALLEL_MAX + 1)],
                         "1", a.yes))
             par = n if n > 1 else None
-    kv = {"q4_0": "q4"}.get(a.kv) or fam.get("kv")     # the engine's q4 (Hadamard-rotated 4-bit) for the family that has it
-    if a.kv and a.kv != "q4_0" and fam.get("kv"):
-        warn(f"--kv {a.kv} is a Flash-Next setting: {fam['title']}'s KV cache is fp32 or q4 (--kv q4_0); using {kv}")
+    kv = fam.get("kv")                                 # the engine's q4 (Hadamard-rotated 4-bit) for the family that has it
+    if a.kv and kv:
+        warn(f"--kv {a.kv} is a Flash-Next setting: {fam['title']} always uses its q4 KV cache")
     unused = [flag for flag, used in (("--rope-scaling", a.rope_scaling and not fam.get("rope_scale")),
                                       ("--rope-scale", a.rope_scale and not fam.get("rope_scale")),
                                       ("--kv", a.kv and not fam.get("kv")),

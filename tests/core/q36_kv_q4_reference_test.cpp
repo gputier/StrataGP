@@ -223,7 +223,8 @@ int main() {
     // the prompt's key windows (k_attn_win): a chunk of T queries at cells pos0 .. pos0 + T - 1 attends window by window with
     // the running max / sum and the rescale of the accumulated rows, then divides by the sum; against the one-shot softmax
     // over [0, pos] of the same dequantized cells.  Window 96 does not divide the cells, so the last one is short, and the
-    // rows of the chunk end in different windows (some see nothing of the last one).
+    // rows of the chunk end at different cells of it.  Every row sees at least 29 cells of every window it enters, so the
+    // case of a row that sees none of a window is not exercised here.
     {
         const int T = 40, pos0 = 700, W = 96;
         const double fscale = scale;

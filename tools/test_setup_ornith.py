@@ -39,6 +39,11 @@ class OrnithEntry(unittest.TestCase):
         self.assertEqual(setup.own_path_kv_bytes_per_token(fam), 13 * 2 * 2 * 144)       # q4: 144 bytes per head and cell
         self.assertEqual(setup.own_path_kv_bytes_per_token(setup.OWN_PATH_FAMILIES["qwen36"]), 11 * 2 * 256 * 2 * 4)
 
+    def test_the_flash_next_cell_table_is_untouched(self):
+        self.assertEqual(setup.KV_CELL_BYTES, {"q4_0": 576, "k8v4": 816})
+        self.assertAlmostEqual(setup.kv_streaming_ram_gb(131072, "q4_0"), 131072 * 13 * 576 / 1e9)
+        self.assertAlmostEqual(setup.kv_streaming_ram_gb(131072, "k8v4"), 131072 * 13 * 816 / 1e9)
+
     def test_the_tags_do_not_collide(self):
         tags = [d["tag"] for d in setup.OWN_PATH_FAMILIES.values()]
         self.assertEqual(len(set(tags)), len(tags))
@@ -144,6 +149,30 @@ class InstallOrnith(unittest.TestCase):
         self.assertIn("--rope-scaling none", out)
         self.assertNotIn("Traceback", out)
 
+    def test_explicit_yarn_at_the_trained_range_writes_factor_1(self):
+        self.put_file()
+        rc, out = self.install(model="IQ3XXS-IQ4XS", context=131072, rope_scaling="yarn")
+        self.assertEqual(rc, 0, out)
+        a = self.cfg["args"]
+        self.assertEqual(a[a.index("--rope-scaling") + 1], "yarn")
+        self.assertEqual(a[a.index("--rope-scale") + 1], "1")
+        self.assertEqual(a[a.index("--rope-orig-ctx") + 1], "262144")
+
+    def test_a_factor_below_one_is_refused(self):
+        with self.assertRaises(ValueError):
+            setup.resolve_rope(524288, "yarn", 0.5)
+        self.put_file()
+        rc, out = self.install(model="IQ3XXS-IQ4XS", context=524288, rope_scale=0.5)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("below 1", out)
+        self.assertNotIn("Traceback", out)
+
+    def test_a_context_past_the_family_limit_is_refused(self):
+        self.put_file()
+        rc, out = self.install(model="IQ3XXS-IQ4XS", context=1048576)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("past Ornith-1.5-122B's limit of 524288", out)
+
     def test_an_asked_factor_wins(self):
         self.put_file()
         rc, out = self.install(model="IQ3XXS-IQ4XS", context=524288, rope_scale=4.0)
@@ -158,6 +187,13 @@ class InstallOrnith(unittest.TestCase):
         self.assertIn("--kv int8 is a Flash-Next setting", out)
         a = self.cfg["args"]
         self.assertEqual(a[a.index("--kv") + 1], "q4")
+
+    def test_a_kv_mode_on_ornith_gets_one_warning(self):
+        self.put_file()
+        rc, out = self.install(model="IQ3XXS-IQ4XS", kv="q4_0")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out.count("always uses its q4 KV cache"), 1)
+        self.assertNotIn("Flash-Next only", out)
 
     def test_images_are_off_even_when_asked(self):
         self.put_file()
@@ -175,6 +211,15 @@ class InstallOrnith(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         a = self.cfg["args"]
         self.assertEqual(a[a.index("--native") + 1], str(other / FILE))
+
+    def test_qwen36_writes_no_kv_whatever_is_asked(self):
+        gpu = {"index": 0, "count": 1, "vram_gb": 16.0, "name": "Test GPU"}
+        rc, out = run(setup.install_own_path, args(models_dir=str(self.root / "models"), model="UD-Q4_K_XL",
+                                                    vision="no", context=262144, kv="q4_0"), "qwen36", gpu, False, [],
+                      13, [], 8080, 64.0, None)
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("--kv", self.cfg["args"])
+        self.assertIn("--kv: Flash-Next only", out)
 
     def test_qwen36_keeps_its_install(self):
         gpu = {"index": 0, "count": 1, "vram_gb": 16.0, "name": "Test GPU"}

@@ -49,6 +49,8 @@ class Verdict(unittest.TestCase):
         self.assertEqual(kind, "family")
         self.assertIn("Qwen3.6-35B-A3B", sentence)
         self.assertIn("--family qwen36", sentence)
+        self.assertIn("Ornith-1.5-122B", sentence)
+        self.assertIn("--family ornith", sentence)
 
     def test_expert_type_without_kernel(self):
         fp = self.fp("qwen/IQ3_S")

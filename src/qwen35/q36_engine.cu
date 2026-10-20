@@ -16,6 +16,8 @@
 //
 // Modes: --serve (serve/server.py's engine protocol: READY / GEN / T / DONE / STOP / PP), --tokens IDS [--n N]
 // [--force IDS] [--dump-full-logits F] (tools/qwen35/kl.py's reference interface), --bench-pp N / --bench-tg N.
+// Options: --kv fp32|q4 (the K / V cache format), --rope-scaling none|linear|yarn with --rope-scale F and
+// --rope-orig-ctx N (the GGUF's rope.scaling.* keys when absent).
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/family_layout.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -1307,6 +1309,11 @@ struct ImgKey {
     bool operator==(const ImgKey& o) const { return cell == o.cell && n == o.n && hash == o.hash; }
 };
 
+/// Bytes of one KV head's K (or V) cell: a q4_0 row of the head, or head_dim fp32 floats.
+static size_t kv_cell_bytes_for(bool q4, int64_t head_dim) {
+    return q4 ? (size_t) strata::kernels::kv_q4_bytes_per_head((int) head_dim) : (size_t) head_dim * 4;
+}
+
 struct Engine {
     const Model* m = nullptr;
     cudaStream_t st = nullptr;
@@ -1332,9 +1339,7 @@ struct Engine {
     std::vector<float*> conv, S;
     std::vector<void*> kc, vc;   // per layer; the MTP block's K / V at index n_layers: the CURRENT session's (select)
     /// Bytes of one KV head's K (or V) cell.
-    size_t kv_cell_bytes() const {
-        return kv_q4 ? (size_t) strata::kernels::kv_q4_bytes_per_head((int) m->g.head_dim) : (size_t) m->g.head_dim * 4;
-    }
+    size_t kv_cell_bytes() const { return kv_cell_bytes_for(kv_q4, m->g.head_dim); }
     static constexpr int kKvWindow = 16384;   // q4: cells of the prompt attention's key window (k16 / v16 hold one)
     float *win_m = nullptr, *win_l = nullptr;   // q4: the windows' running max / sum per query row [tmax][H]
     /// Cells k16 / v16 hold: the whole context (fp32: one window), or one key window (q4).
@@ -2556,8 +2561,11 @@ struct Engine {
             const auto w = db.wait_ring(ring, [&] { return cudaStreamQuery(st) == cudaErrorNotReady; }, std::chrono::seconds(20));
             if (w != strata::q36::RingWait::Rang) {
                 db.release();   // no wait kernel may outlive the engine
+                const cudaError_t qe = cudaStreamQuery(st);   // a stream in error ends the wait too: say the CUDA error
                 std::fprintf(stderr, "strata-q36: the hybrid layer %zu %s\n", step.li,
-                             w == strata::q36::RingWait::Ended ? "never rang (the graph ended)" : "did not ring in 20 s");
+                             w == strata::q36::RingWait::Ended
+                                 ? (qe != cudaSuccess ? cudaGetErrorString(qe) : "never rang (the graph ended)")
+                                 : "did not ring in 20 s");
                 std::exit(1);
             }
             hy_cpu_compute(step.li, step.T);
@@ -4053,17 +4061,14 @@ static bool resolve_rope(Model& m, const std::string& type_opt, double scale_opt
         std::fprintf(stderr, "strata-q36: the model carries rope.scaling.type '%s' - none, linear or yarn only\n", type.c_str());
         return false;
     }
-    if (type_opt == "none" && (scale_opt > 0 || orig_opt > 0)) {
-        std::fprintf(stderr, "strata-q36: --rope-scaling none cannot be combined with --rope-scale or --rope-orig-ctx\n");
+    if (cfg.type == RST::None && (scale_opt > 0 || orig_opt > 0)) {
+        std::fprintf(stderr, "strata-q36: --rope-scale and --rope-orig-ctx need --rope-scaling linear or yarn (the run has "
+                     "no rope scaling: %s)\n", type_opt == "none" ? "--rope-scaling none" : "no --rope-scaling option and "
+                     "no rope.scaling.type in the GGUF, or none");
         return false;
     }
-    if (scale_opt > 0) cfg.factor = scale_opt;
+    if (scale_opt > 0) cfg.factor = scale_opt;           // an explicit factor, 1 included (generate.cpp's rule)
     else if (m.rope_factor > 1.0) cfg.factor = m.rope_factor;
-    if (cfg.type != RST::None && cfg.factor <= 1.0) {
-        std::fprintf(stderr, "strata-q36: --rope-scaling %s needs --rope-scale > 1 or a rope.scaling.factor > 1 in the GGUF "
-                     "(the factor is 1: the angles would not change)\n", cfg.type == RST::YaRN ? "yarn" : "linear");
-        return false;
-    }
     if (orig_opt > 0) cfg.orig_ctx = orig_opt;
     else if (m.rope_orig_ctx >= 1) cfg.orig_ctx = m.rope_orig_ctx;
     cfg.ext_factor = cfg.type == RST::YaRN ? 1.0 : 0.0;
@@ -4071,6 +4076,12 @@ static bool resolve_rope(Model& m, const std::string& type_opt, double scale_opt
         std::fprintf(stderr, "strata-q36: invalid rope scaling configuration: %s (factor %g, original context %g)\n", why,
                      cfg.factor, cfg.orig_ctx);
         return false;
+    }
+    if (cfg.type != RST::None && cfg.factor == 1.0) {
+        // the trained angles: m.rope stays the identity, so the angles are bit-identical to the run without the option
+        std::fprintf(stderr, "strata-q36: rope scaling %s with factor 1: the trained angles, no scaling is applied\n",
+                     cfg.type == RST::YaRN ? "yarn" : "linear");
+        return true;
     }
     m.rope = cfg.kernel_args(m.n_rot);
     if (cfg.type != RST::None)
@@ -4147,7 +4158,8 @@ int strata::qwen35::run(int argc, char** argv) {
             if (val) ++i;
         } else {
             std::fprintf(stderr,
-                         "usage: strata-q36 --model GGUF [--max-context 32768] [--chunk 512] [--no-graph]\n"
+                         "usage: strata-q36 --model GGUF [--max-context 32768] [--chunk 512] [--no-graph] [--kv fp32|q4]\n"
+                         "       [--rope-scaling none|linear|yarn [--rope-scale F] [--rope-orig-ctx N]]\n"
                          "       (--serve | --tokens IDS [--n 64] [--force IDS] [--dump-full-logits F] | --bench-pp N "
                          "--bench-tg N)\n");
             return 2;
@@ -4204,11 +4216,11 @@ int strata::qwen35::run(int argc, char** argv) {
             const int ns = std::max(1, batch);
             size_t n_attn = m.has_mtp ? 1 : 0;
             for (const Layer& L : m.layers) n_attn += L.attn ? 1 : 0;
-            const size_t kv_cell = kv_q4 ? strata::kernels::kv_q4_bytes_per_head((int) m.g.head_dim) : (size_t) m.g.head_dim * 4;
+            const size_t kv_cell = kv_cell_bytes_for(kv_q4, m.g.head_dim);
             const double kv_one = (double) (n_attn * 2 * (size_t) m.g.n_head_kv * kv_cell);   // 45056 on Qwen3.6-35B (11 planes)
             // per cell: the fp16 copies the prompt attention keeps.  5120 B is what was measured on Qwen3.6-35B-A3B; the formula
-            // 2 (K, V) x n_head_kv x head_dim x 2 B gives 2048 there, so the constant stays for fp32 and q4, whose k16 / v16
-            // hold one key window whatever the context, drops that part
+            // 2 (K, V) x n_head_kv x head_dim x 2 B gives 2048 there, so the constant stays: in fp32 k16 / v16 grow with the
+            // context and it counts them; in q4 they hold one kKvWindow window, so that part drops
             const double kv_f16_cell = 4.0 * (double) m.g.n_head_kv * (double) m.g.head_dim;
             const double kv_shared = kv_q4 ? 5120.0 - kv_f16_cell : 5120.0;
             const double sess_extra = std::max(0.0, (double) ctx * (kv_one * ns + kv_shared) - 8192.0 * (kv_one + kv_shared));

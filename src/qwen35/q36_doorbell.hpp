@@ -6,7 +6,8 @@
 //
 //   GPU   doorbell_publish          payload (hidden, expert ids) to mapped pinned memory, then *seq += 1
 //   host  wait_ring(k) ... answer(k)  sees seq >= k, runs the pool into mapped pinned memory, then *flag = k
-//   GPU   copy_rows_from_mapped_after  spins until *flag >= k, then copies the pool's rows
+//   GPU   copy_rows_from_mapped_after  spins until *flag >= k, then copies the missed entries' rows
+//                                     and zeroes the resident ones
 //
 // k is the layer's place among the hybrid layers of the graph (1, 2, ...), baked into the graph at capture.  A
 // replay is made unambiguous by arm(): the host zeroes both words after the previous replay has drained and before
