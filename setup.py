@@ -69,6 +69,7 @@ HF_REVISIONS = {
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": "5348543e0147355ac9cbcb031184a3546350988e",  # 2026-09-29
     "unsloth/Qwen3.8-Flash-Next-GGUF": "38bb39ee97821de2c9009abb7e93950eec396e66",                   # 2026-09-30
     "unsloth/Qwen3.6-35B-A3B-MTP-GGUF": "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",                  # 2026-10-12
+    "ornith-ai/Ornith-1.5-122B": "dfa07bab90e90746ffbfc0b0cba3126eb9265de2",                          # 2026-10-20
 }
 
 
@@ -456,7 +457,25 @@ OWN_PATH_FAMILIES = {
                # pictures: Unsloth's mmproj (the same projector family as Flash-Next's: qwen3vl_merger) through
                # strata-vision; a parallel slot's session: its KV cache (kv_bytes_per_token) and the recurrent state of
                # the 30 GDN layers (state_gb)
-               "vision": True, "state_gb": 0.07}
+               "vision": True, "state_gb": 0.07},
+    # Ornith-1.5-122B (ornith-ai; a Qwen3.5-122B-A10B fine-tune, GGUF architecture qwen35moe, hidden 3072, 48 layers: 12
+    # attention + 36 GDN, 256 experts top-8): the same engine path as Qwen3.6.  No published GGUF has expert types the
+    # engine's GPU kernels take, so the file is our own quantization (gate/up IQ3_XXS, down IQ4_XS, the rest Q8_0) of the
+    # pinned BF16 weights ("source"): setup downloads nothing and checks no hash, it needs the file in --gguf-dir or in
+    # the models folder.  Images off (no projector on this path).  Past the trained 262,144 positions the card
+    # recommends static YaRN, factor 2 for a window up to ~524K; the engine's KV cache is fp32 or q4.
+    "ornith": {"title": "Ornith-1.5-122B", "by": "ornith-ai; own IQ3_XXS / IQ4_XS quantization", "arch": "qwen35moe",
+               "about": "122B mixture of experts with 10B active (256 experts, top-8), a Qwen3.5-122B-A10B fine-tune, "
+                        "long-context YaRN to ~524K",
+               "source": "ornith-ai/Ornith-1.5-122B", "local": True, "file": "Ornith-1.5-122B-{q}.gguf",
+               "tag": "ornith-", "name": "ornith-1.5-122b", "license": "MIT: https://huggingface.co/ornith-ai/Ornith-1.5-122B",
+               # RAM: the experts (~50 GB) are kept in RAM when they do not all fit in VRAM, plus room for the OS
+               "models": {"IQ3XXS-IQ4XS": {"about": "3-bit gate/up, 4-bit down experts, our own quantization",
+                                           "ram_gb": 64}},
+               "sha256": {}, "size_gb": {"IQ3XXS-IQ4XS": 54},    # the plan's estimate: the file is not pinned
+               # 12 attention layers + the MTP block, 2 KV heads x 256, K and V in fp32; 36 GDN layers of 64 x 128 x 128
+               "kv_bytes_per_token": 13 * 2 * 256 * 2 * 4, "mtp": 2, "vision": False, "state_gb": 0.16,
+               "max_context": 524288, "rope_scale": 2.0, "kv": "q4"}
 }
 PREVIEW_FAMILIES = OWN_PATH_FAMILIES             # the earlier name (tools and tests that import it)
 # EXPERIMENTAL, off by default (setup asks): a control vector shipped with the repository, see its README
@@ -2357,6 +2376,12 @@ def menu_families(hip: bool) -> list:
     """The families the model menu lists, in menu order.  The NVFP4 packs run on NVIDIA cards only (the AMD and Intel
     engines have no NVFP4 kernels), so on those the menu does not offer them; `--family nvfp4` still says why not."""
     return [f for f in FAMILIES if not (hip and FAMILIES[f].get("ready"))]
+
+
+def menu_own_path_families() -> list:
+    """The own-engine-path families the model menu lists: those setup downloads.  A family whose file is our own
+    quantization (Ornith) is not offered to everyone; `--family ornith` installs it."""
+    return [f for f, d in OWN_PATH_FAMILIES.items() if not d.get("local")]
 
 
 def nvfp4_card_note(gpu) -> str:
@@ -5636,10 +5661,16 @@ def own_path_context(fam: dict, vram_gb: float) -> int:
     return 32768 if vram_gb <= 16.5 else 65536 if vram_gb <= 24.5 else 131072
 
 
+def own_path_file_bytes(fam: dict, model: str) -> float:
+    """The size of a model file: pinned for a downloaded one, else the family's estimate (a file of our own)."""
+    pinned = fam["sha256"].get(fam["file"].format(q=model))
+    return pinned[0] if pinned else fam["size_gb"][model] * 1e9
+
+
 def own_path_size(fam: dict, ram: float) -> str:
     """The recommended size: the largest file whose RAM need this PC has (the smallest when none fits)."""
     fits = [m for m, d in fam["models"].items() if ram >= d["ram_gb"]]
-    return max(fits, key=lambda m: fam["sha256"][fam["file"].format(q=m)][0]) if fits else next(iter(fam["models"]))
+    return max(fits, key=lambda m: own_path_file_bytes(fam, m)) if fits else next(iter(fam["models"]))
 
 
 def own_path_vision(a, fam: dict, gpu: dict, hip: bool) -> str:
@@ -5649,6 +5680,10 @@ def own_path_vision(a, fam: dict, gpu: dict, hip: bool) -> str:
     no VRAM; there is no GPU encoder for AMD yet).  A smaller NVIDIA card is recommended the CPU encoder (the GPU one takes
     room from the experts); what is asked for with --vision gpu is kept, with a note (recommend, never force)."""
     asked = a.vision
+    if not fam["vision"]:
+        if asked not in (None, "no", "none"):
+            warn(f"{fam['title']} has no image encoder on this engine path: images off")
+        return "none"
     vram = float(gpu.get("vram_gb", 0.0))
     big = vram >= UNSLOTH_IMAGES_MIN_VRAM_GB
     if asked in ("no", "none"):
@@ -5696,7 +5731,7 @@ PARALLEL_SMALL_SHARE = 0.35     # a card that does not hold every expert: the sl
 def own_path_parallel_fits_all(fam: dict, model: str, vram_gb: float, ctx: int, n: int) -> bool:
     """True where every routed expert still sits in VRAM beside n slots' sessions (one more session than the slots: the
     solo path's own)."""
-    size = fam["sha256"][fam["file"].format(q=model)][0] / 1e9
+    size = own_path_file_bytes(fam, model) / 1e9
     base = size * 0.93 + 4.5       # the routed experts + the dense weights and buffers (the file's 7% beyond them)
     return base + (n + 1) * own_path_parallel_slot_gb(fam, ctx) <= vram_gb
 
@@ -5772,9 +5807,10 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     say()
     for i, m in enumerate(names, 1):
         d = fam["models"][m]
-        size = fam["sha256"][fam["file"].format(q=m)][0]
+        size = own_path_file_bytes(fam, m)
         fit = "" if ram >= d["ram_gb"] else f"   <- needs {d['ram_gb']} GB RAM, you have {ram:.0f}"
-        say(f"  {i}) {m:10s} {d['about']}; download {size / 1e9:.1f} GB{fit}")
+        say(f"  {i}) {m:10s} {d['about']}; " + (f"file of ~{size / 1e9:.0f} GB, not downloaded" if fam.get("local")
+                                               else f"download {size / 1e9:.1f} GB") + fit)
     rec = own_path_size(fam, ram)
     if not a.model:
         say(f"  Recommended for {ram:.0f} GB of RAM: {rec} (the largest that fits; any size can be chosen)")
@@ -5792,7 +5828,8 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     if a.context:
         ctx = a.context
     else:
-        ctxs = [c for c in CONTEXTS if c <= 262144]   # the model's trained length; no rope scaling on this path yet
+        # the model's trained length, or what its static YaRN reaches (factor 2: 524K) where the family has it
+        ctxs = [c for c in CONTEXTS if c <= fam.get("max_context", 262144)]
         say()
         say("  Context length = how much text the model can see at once. Its cache takes "
             f"{fam['kv_bytes_per_token'] * 32768 / 2**30:.1f} GB of VRAM per 32K tokens, room the experts would use:")
@@ -5800,7 +5837,13 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
             say(f"  {i}) {c // 1024}K tokens" + ("   (recommended for your GPU)" if c == rec_ctx else ""))
         ctx = ctxs[int(ask("Context?", [str(i) for i in range(1, len(ctxs) + 1)], str(ctxs.index(rec_ctx) + 1),
                            a.yes)) - 1]
-    if ctx > 262144:
+    rope = None
+    if fam.get("rope_scale"):                          # YaRN past the trained range; the card's static factor
+        rope = resolve_rope(ctx, a.rope_scaling, a.rope_scale if a.rope_scale is not None
+                            else fam["rope_scale"] if ctx > 262144 else None)
+        if rope[0]:
+            ok(f"rope scaling: {rope[0]}, factor {rope[1]:g}")
+    elif ctx > 262144:
         warn(f"{ctx // 1024}K is past {fam['title']}'s trained 262,144 positions and this engine path has no rope "
              "scaling yet: kept as you chose, but answers past 256K are untested")
     ok(f"context: {ctx} tokens")
@@ -5818,14 +5861,24 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
             n = int(ask("How many requests at once (1 = one at a time)?", [str(i) for i in range(1, PARALLEL_MAX + 1)],
                         "1", a.yes))
             par = n if n > 1 else None
-    if a.rope_scaling or a.rope_scale or a.kv or a.resident_budget_gib is not None or a.low_ram not in (None, "auto"):
-        warn(f"--rope-scaling / --kv / --resident-budget-gib / --low-ram are Flash-Next settings: {fam['title']} "
-             "does not use them")
+    kv = {"q4_0": "q4"}.get(a.kv) or fam.get("kv")     # the engine's q4 (Hadamard-rotated 4-bit) for the family that has it
+    if a.kv and a.kv != "q4_0" and fam.get("kv"):
+        warn(f"--kv {a.kv} is a Flash-Next setting: {fam['title']}'s KV cache is fp32 or q4 (--kv q4_0); using {kv}")
+    unused = [flag for flag, used in (("--rope-scaling", a.rope_scaling and not fam.get("rope_scale")),
+                                      ("--rope-scale", a.rope_scale and not fam.get("rope_scale")),
+                                      ("--kv", a.kv and not fam.get("kv")),
+                                      ("--resident-budget-gib", a.resident_budget_gib is not None),
+                                      ("--low-ram", a.low_ram not in (None, "auto"))) if used]
+    if unused:
+        warn(f"{' / '.join(unused)} {'is a' if len(unused) == 1 else 'are'} Flash-Next setting"
+             f"{'' if len(unused) == 1 else 's'}: {fam['title']} does not use "
+             f"{'it' if len(unused) == 1 else 'them'}")
     folder = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
     gguf = folder / fam["file"].format(q=model)
-    size = fam["sha256"][gguf.name][0]
+    size = own_path_file_bytes(fam, model)
     part = gguf.with_name(gguf.name + ".part")
-    left = 0 if gguf.exists() and done(gguf) else (size - (part.stat().st_size if part.is_file() else 0)) / 1e9
+    left = 0 if fam.get("local") or gguf.exists() and done(gguf) else (
+        size - (part.stat().st_size if part.is_file() else 0)) / 1e9
     if left and free_gb(folder) < left + 1:
         fail(f"not enough free disk space in {folder}: need ~{left + 1:.0f} GB", "use --models-dir on a bigger drive")
 
@@ -5844,16 +5897,21 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     ok(f"engine: {eng / EXE}")
 
     step(5, f"downloading {fam['title']} {model}")
-    if gguf.exists() and done(gguf):
+    if fam.get("local"):                               # our own quantization: nothing to download, no hash to check
+        if not gguf.is_file():
+            fail(f"{gguf} is missing", f"{fam['title']} has no published file this engine reads: quantize "
+                 f"{fam['source']} (revision {HF_REVISIONS[fam['source']][:12]}) and put {gguf.name} in {folder}")
+    elif gguf.exists() and done(gguf):
         ok(f"{gguf.name} already downloaded")
     else:
         if a.gguf_dir:
             fail(f"{gguf} is missing", f"put {gguf.name} in {folder}, or drop --gguf-dir to download it")
         download(fam["hf"] + gguf.name, gguf)
-    verify_sha256(gguf, *fam["sha256"][gguf.name])
+    if not fam.get("local"):
+        verify_sha256(gguf, *fam["sha256"][gguf.name])
     ok(f"model file: {gguf}")
-    mmproj = folder / fam["mmproj"]
     if vision != "none":                               # the image encoder: Unsloth's mmproj, pinned, size + SHA-256 checked
+        mmproj = folder / fam["mmproj"]
         if mmproj.exists() and done(mmproj):
             ok(f"{mmproj.name} already downloaded")
         else:
@@ -5873,6 +5931,10 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
 
     step(7, "writing the start script")
     args = ["--native", str(gguf), "--max-context", str(ctx), "--prefill", "auto", "--mtp", str(fam["mtp"])]
+    if rope and rope[0]:                           # trained length is the YaRN reference, not the final context
+        args += ["--rope-scaling", rope[0], "--rope-scale", f"{rope[1]:g}", "--rope-orig-ctx", "262144"]
+    if kv:
+        args += ["--kv", kv]
     if a.vram_reserve_mib is not None:             # VRAM left free for other programs: the experts take that much less
         vram = gpu.get("vram_gb", 0.0)
         if vram > 0:
@@ -5983,7 +6045,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--family", choices=list(FAMILIES) + list(PREVIEW_FAMILIES),
                     help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5, qwen36 = Qwen3.6-35B-A3B (pictures with --vision, "
-                         "several requests at once with --parallel; docs/QWEN36.md)")
+                         "several requests at once with --parallel; docs/QWEN36.md), ornith = Ornith-1.5-122B (our own "
+                         "quantization, put in --gguf-dir or the models folder; YaRN and the q4 KV cache past 256K)")
     ap.add_argument("--model", choices=list(dict.fromkeys([*MODELS, *(m for f in PREVIEW_FAMILIES.values()
                                                                        for m in f["models"])])))
     ap.add_argument("--context", type=int)
@@ -6406,10 +6469,11 @@ def main() -> int:
             say(f"  {i}) {d['title']:20s} {d['by']} - {d['about']}" + ("   [experimental]" if d.get("experimental") else "")
                 + family_menu_note(f, hip, gpu, avx2, avx512)
                 + (f"   (recommended for Strix Halo: {STRIX_HALO_MODEL})" if f == rec_fam and rec_fam != fams[0] else ""))
-        for j, f in enumerate(OWN_PATH_FAMILIES, len(fams) + 1):   # families with an engine path of their own
+        menu_own = menu_own_path_families()
+        for j, f in enumerate(menu_own, len(fams) + 1):   # families with an engine path of their own
             d = OWN_PATH_FAMILIES[f]
             say(f"  {j}) {d['title']:20s} {d['by']} - {d['about']}   [new]")
-        allf = fams + list(OWN_PATH_FAMILIES)
+        allf = fams + menu_own
         family = allf[int(ask("Which model?", [str(i) for i in range(1, len(allf) + 1)],
                               str(allf.index(rec_fam) + 1), a.yes)) - 1]
     if family in OWN_PATH_FAMILIES:                    # Qwen3.6: its own engine path, its own steps 2-7

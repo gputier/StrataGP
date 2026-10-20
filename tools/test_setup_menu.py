@@ -19,8 +19,9 @@ import setup  # noqa: E402
 
 class FamilyOrder(unittest.TestCase):
     def test_the_menu_order_on_nvidia(self):
-        fams = setup.menu_families(False) + list(setup.OWN_PATH_FAMILIES)
+        fams = setup.menu_families(False) + setup.menu_own_path_families()
         self.assertEqual(fams, ["qwen", "swift", "coder", "unsloth", "nvfp4", "qwen36"])
+        self.assertIn("ornith", setup.OWN_PATH_FAMILIES)   # --family ornith installs it; the menu does not offer a file of our own
 
     def test_the_default_stays_the_first_family(self):
         self.assertEqual(setup.menu_families(False)[0], "qwen")
