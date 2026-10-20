@@ -14,7 +14,7 @@ namespace strata::kernels {
 // q = clamp(trunc(x / d + 8.5), 0, 15). Returns the scale bits; `byte` is lane t's packed byte for t < 16
 // (element t in the low nibble, t + 16 in the high one). Ties in |x| resolve to the larger value in EVERY lane,
 // so all lanes agree on d (a plain `a > amax` could leave lanes with opposite signs and one block two scales).
-__device__ __forceinline__ uint16_t q4_group(float x, int lane, uint8_t& byte) {
+__device__ __forceinline__ uint16_t q4_group(float x, uint8_t& byte) {
     float amax = fabsf(x), mval = x;
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
@@ -28,7 +28,6 @@ __device__ __forceinline__ uint16_t q4_group(float x, int lane, uint8_t& byte) {
     const uint8_t qc = (uint8_t) (q < 0 ? 0 : (q > 15 ? 15 : q));
     const uint8_t qhi = __shfl_down_sync(0xffffffffu, qc, 16);
     byte = (uint8_t) (qc | (qhi << 4));
-    (void) lane;
     return f16_from_f32(d);
 }
 

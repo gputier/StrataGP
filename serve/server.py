@@ -6771,25 +6771,24 @@ def check_request_sampling(req) -> None:
             raise ValueError(f"{key}: {'an integer' if integer else 'a number'}")
 
 
-# the API's model name per model family (the GGUF architecture, "arch" in the config, or "ornith" for a qwen35moe
-# config whose model_name says so, see model_family) when the config names none
-FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35b-a3b", "ornith": "ornith-1.5-122b"}
+# the API's model name per model family (the GGUF architecture, "arch" in the config) when the config names none
+FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35b-a3b"}
 
 
 # The sampling each model card recommends ("Best Practices"), used when neither the request, the Chat settings nor the
 # run config's `sampling` block says otherwise.  Greedy is only for a request or config that asks for temperature 0.
 # min_p 0, repetition_penalty 1 and presence_penalty 0 are the engine's own "off", so they are not listed.
+_CARD_GENERAL = {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5}   # the Qwen3.5 / 3.6 cards' general-task set
 MODEL_CARD_SAMPLING = {
     # Qwen3.8-Flash-Next (and Gyro, the same base model)
     "qwen4exp": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
                  "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
     # Qwen3.6-35B-A3B: the general-task sets (the card's precise-coding set is temperature 0.6, presence_penalty 0)
-    "qwen35moe": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5},
+    "qwen35moe": {"thinking": _CARD_GENERAL,
                   "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
     # Ornith-1.5-122B (a Qwen3.5-122B-A10B fine-tune, the same arch as Qwen3.6): the card's general-task set, for a
     # reasoning model; it gives no separate non-thinking set (its precise-coding set is temperature 0.6, presence_penalty 0)
-    "ornith": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5},
-               "instruct": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5}},
+    "ornith": {"thinking": _CARD_GENERAL, "instruct": _CARD_GENERAL},
 }
 
 
@@ -6809,7 +6808,7 @@ def model_family(cfg: dict) -> str:
 
 
 def default_model_name(cfg: dict) -> str:
-    """The config's "model_name", else its family's name (qwen4exp, qwen35moe, ornith), else Flash-Next's."""
+    """The config's "model_name", else its family's name (qwen4exp, qwen35moe), else Flash-Next's."""
     return cfg.get("model_name") or FAMILY_MODEL_NAMES.get(model_family(cfg), "qwen3.8-flash-next")
 
 

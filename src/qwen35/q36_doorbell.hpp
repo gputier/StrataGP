@@ -33,14 +33,15 @@ struct HyDoorbell {
     uint32_t* d_seq = nullptr;
     uint32_t* d_flag = nullptr;
 
-    static constexpr size_t kWords = 32;   // 128 bytes: seq at word 0, flag at word 16
+    static constexpr size_t kFlagWord = 16;           // the flag sits a cache line (64 bytes) after seq, which is word 0
+    static constexpr size_t kWords = 2 * kFlagWord;   // 128 bytes
 
     /// `words` / `d_words`: kWords zeroed words, as the host and as the device address them.
     void bind(uint32_t* words, uint32_t* d_words) {
         h_seq = words;
-        h_flag = words + 16;
+        h_flag = words + kFlagWord;
         d_seq = d_words;
-        d_flag = d_words + 16;
+        d_flag = d_words + kFlagWord;
     }
 
     /// Both words to 0: before a launch, with the previous launch's stream drained (no wait kernel can still be

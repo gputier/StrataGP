@@ -88,7 +88,7 @@ __global__ void kv_append_q4_kernel(uint8_t* __restrict__ k_q4, uint8_t* __restr
     const long long step_off = (long long) step_idx * kv_heads * head_dim;
     const float x = (is_v ? vcur : kcur)[step_off + h * head_dim + b * QK4_0 + t];
     uint8_t byte;
-    const uint16_t d = q4_group(x, t, byte);
+    const uint16_t d = q4_group(x, byte);
     const long long page = (long long) table[pos / page_size];
     if (page >= 0) q4_store(is_v ? v_q4 : k_q4, (page * kv_heads + h) * page_size + (pos % page_size), b, t, d, byte);
     if (host.k_q4 != nullptr)
@@ -108,7 +108,7 @@ __global__ void kv_append_q4_batch_kernel(uint8_t* __restrict__ k_q4, uint8_t* _
     const bool is_v = is_v_grid != 0;
     const float x = (is_v ? V : K)[t * (kv_heads * head_dim) + h * head_dim + b * QK4_0 + th];
     uint8_t byte;
-    const uint16_t d = q4_group(x, th, byte);
+    const uint16_t d = q4_group(x, byte);
     const long long page = (long long) table[pos / page_size];
     const long long row_id = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
     if (page >= 0) q4_store(is_v ? v_q4 : k_q4, (page * kv_heads + h) * page_size + (pos % page_size), b, th, d, byte);

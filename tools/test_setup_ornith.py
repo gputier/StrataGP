@@ -34,6 +34,11 @@ class OrnithEntry(unittest.TestCase):
         self.assertFalse(fam["vision"])
         self.assertTrue(fam["name"].startswith("ornith"))
 
+    def test_the_cache_is_counted_in_the_format_it_runs_in(self):
+        fam = setup.OWN_PATH_FAMILIES["ornith"]
+        self.assertEqual(setup.own_path_kv_bytes_per_token(fam), 13 * 2 * 2 * 144)       # q4: 144 bytes per head and cell
+        self.assertEqual(setup.own_path_kv_bytes_per_token(setup.OWN_PATH_FAMILIES["qwen36"]), 11 * 2 * 256 * 2 * 4)
+
     def test_the_tags_do_not_collide(self):
         tags = [d["tag"] for d in setup.OWN_PATH_FAMILIES.values()]
         self.assertEqual(len(set(tags)), len(tags))
@@ -131,6 +136,13 @@ class InstallOrnith(unittest.TestCase):
         a = self.cfg["args"]
         self.assertNotIn("--rope-scaling", a)
         self.assertEqual(a[a.index("--kv") + 1], "q4")               # the family's own default
+
+    def test_a_refused_rope_setting_stops_with_its_message(self):
+        self.put_file()
+        rc, out = self.install(model="IQ3XXS-IQ4XS", context=524288, rope_scaling="none")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("--rope-scaling none", out)
+        self.assertNotIn("Traceback", out)
 
     def test_an_asked_factor_wins(self):
         self.put_file()

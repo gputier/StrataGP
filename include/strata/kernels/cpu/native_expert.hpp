@@ -13,10 +13,12 @@
 
 namespace strata::kernels::cpu {
 
-/// Bytes of the largest quantized activation any native layer uses (2560 values as Q8_K: 10 x 292).
+/// Bytes of the largest quantized gate/up activation any native layer uses (3072 values as Q8_K: 12 x 292 = 3504).
 inline constexpr size_t kNativeActBytes = 4096;
 /// Bytes of the largest quantized down activation (1024 values as Q8_K: 4 x 292 = 1168, or Q8_0: 32 x 34 = 1088).
 inline constexpr size_t kNativeHBytes = 2048;
+/// The widest expert intermediate (n_ff) a native layer may have: the pool's gate/up row buffers are this wide.
+inline constexpr int64_t kNativeMaxFF = 1024;
 
 /// One layer's native expert geometry.
 struct NativeFmt {
@@ -38,7 +40,7 @@ constexpr size_t kNvfp4Tail = 16;
 
 /// Whether this build has the ggml-cpu path.
 bool native_experts_available() noexcept;
-/// Fills `f` for a layer; false (with a reason) when ggml-cpu has no dot product for a type.
+/// Fills `f` for a layer; false (with a reason) when ggml-cpu has no dot product for a type or n_ff is above kNativeMaxFF.
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err);
 
 /// x (n_embd floats) -> the gate/up activation (act_bytes).

@@ -473,7 +473,8 @@ OWN_PATH_FAMILIES = {
                "models": {"IQ3XXS-IQ4XS": {"about": "3-bit gate/up, 4-bit down experts, our own quantization",
                                            "ram_gb": 64}},
                "sha256": {}, "size_gb": {"IQ3XXS-IQ4XS": 54},    # the plan's estimate: the file is not pinned
-               # 12 attention layers + the MTP block, 2 KV heads x 256, K and V in fp32; 36 GDN layers of 64 x 128 x 128
+               # 12 attention layers + the MTP block, 2 KV heads x 256, K and V in fp32 (own_path_kv_bytes_per_token turns it into
+               # q4's 7,488 for the "kv" below); 36 GDN layers of 64 x 128 x 128
                "kv_bytes_per_token": 13 * 2 * 256 * 2 * 4, "mtp": 2, "vision": False, "state_gb": 0.16,
                "max_context": 524288, "rope_scale": 2.0, "kv": "q4"}
 }
@@ -5716,10 +5717,18 @@ def own_path_vision(a, fam: dict, gpu: dict, hip: bool) -> str:
     return asked
 
 
+KV_CELL_BYTES = {"fp32": 1024, "q4": 144}     # one KV head's cell at head_dim 256: fp32, or 8 q4_0 blocks of 18 bytes
+
+
+def own_path_kv_bytes_per_token(fam: dict) -> int:
+    """The engine's KV cache per context token in the family's own cache format (fam["kv"]; fp32 where it has none)."""
+    return fam["kv_bytes_per_token"] * KV_CELL_BYTES[fam.get("kv") or "fp32"] // KV_CELL_BYTES["fp32"]
+
+
 def own_path_parallel_slot_gb(fam: dict, ctx: int) -> float:
-    """The VRAM one batch slot's session takes: its KV cache (fp32 K and V of the attention layers and the MTP block) and
-    the recurrent state of the GDN layers."""
-    return ctx * fam["kv_bytes_per_token"] / 1e9 + fam["state_gb"]
+    """The VRAM one batch slot's session takes: its KV cache (K and V of the attention layers and the MTP block, in the
+    family's cache format) and the recurrent state of the GDN layers."""
+    return ctx * own_path_kv_bytes_per_token(fam) / 1e9 + fam["state_gb"]
 
 
 PARALLEL_SMALL_SHARE = 0.35     # a card that does not hold every expert: the slots' sessions may take this share of the room the
@@ -5832,15 +5841,18 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         ctxs = [c for c in CONTEXTS if c <= fam.get("max_context", 262144)]
         say()
         say("  Context length = how much text the model can see at once. Its cache takes "
-            f"{fam['kv_bytes_per_token'] * 32768 / 2**30:.1f} GB of VRAM per 32K tokens, room the experts would use:")
+            f"{own_path_kv_bytes_per_token(fam) * 32768 / 2**30:.1f} GB of VRAM per 32K tokens, room the experts would use:")
         for i, c in enumerate(ctxs, 1):
             say(f"  {i}) {c // 1024}K tokens" + ("   (recommended for your GPU)" if c == rec_ctx else ""))
         ctx = ctxs[int(ask("Context?", [str(i) for i in range(1, len(ctxs) + 1)], str(ctxs.index(rec_ctx) + 1),
                            a.yes)) - 1]
     rope = None
     if fam.get("rope_scale"):                          # YaRN past the trained range; the card's static factor
-        rope = resolve_rope(ctx, a.rope_scaling, a.rope_scale if a.rope_scale is not None
-                            else fam["rope_scale"] if ctx > 262144 else None)
+        try:
+            rope = resolve_rope(ctx, a.rope_scaling, a.rope_scale if a.rope_scale is not None
+                                else fam["rope_scale"] if ctx > 262144 else None)
+        except ValueError as e:
+            fail(str(e))
         if rope[0]:
             ok(f"rope scaling: {rope[0]}, factor {rope[1]:g}")
     elif ctx > 262144:
@@ -5870,14 +5882,13 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
                                       ("--resident-budget-gib", a.resident_budget_gib is not None),
                                       ("--low-ram", a.low_ram not in (None, "auto"))) if used]
     if unused:
-        warn(f"{' / '.join(unused)} {'is a' if len(unused) == 1 else 'are'} Flash-Next setting"
-             f"{'' if len(unused) == 1 else 's'}: {fam['title']} does not use "
+        warn(f"{' / '.join(unused)}: Flash-Next only, {fam['title']} does not use "
              f"{'it' if len(unused) == 1 else 'them'}")
     folder = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
     gguf = folder / fam["file"].format(q=model)
     size = own_path_file_bytes(fam, model)
     part = gguf.with_name(gguf.name + ".part")
-    left = 0 if fam.get("local") or gguf.exists() and done(gguf) else (
+    left = 0 if fam.get("local") or (gguf.exists() and done(gguf)) else (
         size - (part.stat().st_size if part.is_file() else 0)) / 1e9
     if left and free_gb(folder) < left + 1:
         fail(f"not enough free disk space in {folder}: need ~{left + 1:.0f} GB", "use --models-dir on a bigger drive")

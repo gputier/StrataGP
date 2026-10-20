@@ -67,6 +67,11 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
         err = "native experts: expert geometry is not whole blocks";
         return false;
     }
+    if (n_ff > kNativeMaxFF) {
+        err = "native experts: expert width " + std::to_string(n_ff) + " is above the pool's " +
+              std::to_string(kNativeMaxFF) + " row buffers";
+        return false;
+    }
     f.gu_type = gu_type;
     f.d_type = d_type;
     f.gu_act = (int) tg->vec_dot_type;

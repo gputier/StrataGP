@@ -278,7 +278,7 @@ __device__ float fwht256_block(float v, float* buf) {
 /// The q4_0 block of the 32 values held one per lane of a warp, stored at `blk` (kv_q4_group.cuh's quantizer, Flash-Next's).
 __device__ __forceinline__ void q4_store_group(block_q4_0* blk, float x, int lane) {
     uint8_t byte;
-    const uint16_t d = strata::kernels::q4_group(x, lane, byte);
+    const uint16_t d = strata::kernels::q4_group(x, byte);
     if (lane == 0) blk->d = d;
     if (lane < 16) blk->qs[lane] = byte;
 }
@@ -516,9 +516,10 @@ __global__ void k_merge_cpu(float* parts, const float* cpu, const int32_t* miss,
 }
 /// The hybrid mode's entry split inside a graph, from the device's own slot table (a rebalance rewrites the table, not
 /// the graph): miss[e] = the entry's expert has no VRAM slot; hit_rows[0, *n_hit) = the entries that have one.  One block.
+inline constexpr int kHySplitMax = 256;   // entries (tokens x top_k) one k_hy_split block serves
 __global__ void k_hy_split(const int32_t* ids, int n_ent, const int32_t* slot_of, int32_t* miss, int32_t* hit_rows,
                            int32_t* n_hit) {
-    __shared__ unsigned char hit[256];
+    __shared__ unsigned char hit[kHySplitMax];
     for (int e = threadIdx.x; e < n_ent; e += blockDim.x) {
         hit[e] = slot_of[ids[e]] >= 0;
         miss[e] = !hit[e];
@@ -1322,8 +1323,9 @@ struct Engine {
     unsigned long long* grp_ptr;
     float *pacc, *pm, *pl, *amv;
     int32_t* ami;
-    // attention partials: att_rows query rows x n_chunk chunks of chunk_tiles x kChunkCells cells.  The chunk grows with
-    // the context so the partials stay under kMaxChunks per row (256 MiB for a decode window of kGemmT tokens)
+    // attention partials: att_rows query rows x n_chunk chunks of chunk_tiles x kChunkCells cells.  With --kv q4 the chunk
+    // grows with the context so the partials stay under kMaxChunks per row: n_head x kGemmT x kMaxChunks x head_dim x 4 B
+    // at most for a decode window of kGemmT tokens (128 MiB at 16 heads of 256, 256 MiB at 32)
     int n_chunk = 0, att_rows = 0, chunk_tiles = 1;
     static constexpr int kMaxChunks = 1024;
     bool kv_q4 = false;   // --kv q4: the K / V caches are q4_0 cells (kv_q4.hpp's layout) under a Hadamard rotation, not fp32
@@ -1478,13 +1480,6 @@ struct Engine {
         }
     }
 
-    void* alloc_kv() const {
-        void* p = nullptr;
-        CK(cudaMalloc(&p, kv_plane_bytes()));
-        CK(cudaMemset(p, 0, kv_plane_bytes()));
-        return p;
-    }
-
     void alloc_session(Sess& ss) const {
         const auto& g = m->g;
         const size_t C = (size_t) g.ssm_conv_channels;
@@ -1492,8 +1487,8 @@ struct Engine {
             if (L.attn) {
                 ss.conv.push_back(nullptr);
                 ss.S.push_back(nullptr);
-                ss.kc.push_back(alloc_kv());
-                ss.vc.push_back(alloc_kv());
+                ss.kc.push_back(dalloc_t<uint8_t>(kv_plane_bytes()));
+                ss.vc.push_back(dalloc_t<uint8_t>(kv_plane_bytes()));
             } else {
                 ss.conv.push_back(dalloc(C * (g.ssm_d_conv - 1)));
                 ss.S.push_back(dalloc((size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size));
@@ -1504,8 +1499,8 @@ struct Engine {
         if (m->has_mtp) {   // the MTP block's own K / V (an attention layer at index n_layers)
             ss.conv.push_back(nullptr);
             ss.S.push_back(nullptr);
-            ss.kc.push_back(alloc_kv());
-            ss.vc.push_back(alloc_kv());
+            ss.kc.push_back(dalloc_t<uint8_t>(kv_plane_bytes()));
+            ss.vc.push_back(dalloc_t<uint8_t>(kv_plane_bytes()));
         }
         ss.hlast = dalloc((size_t) g.n_embd);
     }
@@ -1632,7 +1627,7 @@ struct Engine {
             std::exit(2);
         }
         const int tiles_total = (ctx + kChunkCells - 1) / kChunkCells;
-        chunk_tiles = (tiles_total + kMaxChunks - 1) / kMaxChunks;
+        chunk_tiles = kv_q4 ? (tiles_total + kMaxChunks - 1) / kMaxChunks : 1;   // fp32 keeps one tile per chunk at any context
         n_chunk = (tiles_total + chunk_tiles - 1) / chunk_tiles;
         att_rows = (int) (g.n_head * std::min<int64_t>((int64_t) T, kGemmT));   // the split-K attention only runs for T <= kGemmT
         pacc = dalloc((size_t) att_rows * n_chunk * g.head_dim);
@@ -1813,7 +1808,7 @@ struct Engine {
         if (!fast_k || w.type != 8 || T < 1 || T > 8 || w.n_in % 32 != 0) return false;
         if (K::native_q8_0_packed_eligible(w.n_in, w.n_out) && K::native_q8_0_packed_enabled()) return false;
         const int nb = w.n_in / 32;
-        if (nb > 96) return false;
+        if (nb > q36k::kQ8MaxBlocks) return false;
         const void* wp = w.d;
         const half* dpl = nullptr;
 #define Q36_Q8(NCV)                                                                                          \
@@ -1908,7 +1903,7 @@ struct Engine {
         const int FS = (int) m->g.n_ff_shexp;
         const Mat &a = L.sh_gate, &b = L.sh_up;
         if (!fast_k || T < 1 || T > 4 || a.type != 8 || b.type != 8 || a.n_in != b.n_in || a.n_out != FS || b.n_out != FS ||
-            a.n_in % 32 != 0 || a.n_in / 32 > 96 || a.n_in / 32 <= 32 || FS % 32 != 0 ||
+            a.n_in % 32 != 0 || a.n_in / 32 > q36k::kQ8MaxBlocks || a.n_in / 32 <= q36k::kQ8RowBlocks || FS % 32 != 0 ||
             (K::native_q8_0_packed_eligible(a.n_in, a.n_out) && K::native_q8_0_packed_enabled()))
             return false;
         const int nb = a.n_in / 32;
@@ -1923,7 +1918,7 @@ struct Engine {
         if (pkd)                                                                                             \
             q36k::k_sh_gu<NCV, 2, true><<<grid, 1024, 0, st>>>(wa, da, wb, db, (const q36k::QB*) xq,        \
                                                                (q36k::QB*) q8, nb, FS);                      \
-        else if (nb <= 64)                                                                                   \
+        else if (nb <= 2 * q36k::kQ8RowBlocks)                                                               \
             q36k::k_sh_gu<NCV, 2, false><<<grid, 1024, 0, st>>>(wa, nullptr, wb, nullptr, (const q36k::QB*) xq, \
                                                                 (q36k::QB*) q8, nb, FS);                     \
         else                                                                                                 \
@@ -2206,8 +2201,10 @@ struct Engine {
                         }
                     }
                 }
-                if (kv_q4) k_attn_win_norm<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(att, win_l, (int64_t) T * H * HD);
-                if (kv_q4) strata::kernels::fwht256_inplace_cuda(att, (int64_t) T * H, st);   // V was rotated: back before the gate
+                if (kv_q4) {
+                    k_attn_win_norm<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(att, win_l, (int64_t) T * H * HD);
+                    strata::kernels::fwht256_inplace_cuda(att, (int64_t) T * H, st);   // V was rotated: back before the gate
+                }
                 k_gate_mul<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(att, gate, (int64_t) T * H * HD);
             } else {
                 // split-K over 256-cell chunks; the chunk grid covers every cell a row can see (graph mode: the whole
@@ -2341,7 +2338,7 @@ struct Engine {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
         const Mat& hd = m->head;
-        if (!fast_k || draft_n <= 0 || draft_n >= g.n_vocab || draft_n % 8 != 0 || hd.type != 8 || hd.n_in != N || N / 32 <= 32 || N / 32 > 96) {
+        if (!fast_k || draft_n <= 0 || draft_n >= g.n_vocab || draft_n % 8 != 0 || hd.type != 8 || hd.n_in != N || N / 32 <= q36k::kQ8RowBlocks || N / 32 > q36k::kQ8MaxBlocks) {
             head_rows(hn, 1, logits_m, pick_m);
             return;
         }
@@ -2533,7 +2530,7 @@ struct Engine {
         const int N = (int) g.n_embd, Kp = (int) m->top_k;
         const int n_ent = T * Kp;
         if (cap_steps) {
-            if (n_ent > 256) {
+            if (n_ent > kHySplitMax) {
                 std::fprintf(stderr, "strata-q36: a hybrid layer of %d entries does not fit the graph's split kernel\n", n_ent);
                 std::exit(1);
             }
@@ -4056,8 +4053,17 @@ static bool resolve_rope(Model& m, const std::string& type_opt, double scale_opt
         std::fprintf(stderr, "strata-q36: the model carries rope.scaling.type '%s' - none, linear or yarn only\n", type.c_str());
         return false;
     }
+    if (type_opt == "none" && (scale_opt > 0 || orig_opt > 0)) {
+        std::fprintf(stderr, "strata-q36: --rope-scaling none cannot be combined with --rope-scale or --rope-orig-ctx\n");
+        return false;
+    }
     if (scale_opt > 0) cfg.factor = scale_opt;
     else if (m.rope_factor > 1.0) cfg.factor = m.rope_factor;
+    if (cfg.type != RST::None && cfg.factor <= 1.0) {
+        std::fprintf(stderr, "strata-q36: --rope-scaling %s needs --rope-scale > 1 or a rope.scaling.factor > 1 in the GGUF "
+                     "(the factor is 1: the angles would not change)\n", cfg.type == RST::YaRN ? "yarn" : "linear");
+        return false;
+    }
     if (orig_opt > 0) cfg.orig_ctx = orig_opt;
     else if (m.rope_orig_ctx >= 1) cfg.orig_ctx = m.rope_orig_ctx;
     cfg.ext_factor = cfg.type == RST::YaRN ? 1.0 : 0.0;
@@ -4198,8 +4204,8 @@ int strata::qwen35::run(int argc, char** argv) {
             const int ns = std::max(1, batch);
             size_t n_attn = m.has_mtp ? 1 : 0;
             for (const Layer& L : m.layers) n_attn += L.attn ? 1 : 0;
-            const double kv_one = kv_q4 ? (double) (n_attn * 2 * (size_t) m.g.n_head_kv * strata::kernels::kv_q4_bytes_per_head((int) m.g.head_dim))
-                                        : 45056.0;
+            const size_t kv_cell = kv_q4 ? strata::kernels::kv_q4_bytes_per_head((int) m.g.head_dim) : (size_t) m.g.head_dim * 4;
+            const double kv_one = (double) (n_attn * 2 * (size_t) m.g.n_head_kv * kv_cell);   // 45056 on Qwen3.6-35B (11 planes)
             // per cell: the fp16 copies the prompt attention keeps.  5120 B is what was measured on Qwen3.6-35B-A3B; the formula
             // 2 (K, V) x n_head_kv x head_dim x 2 B gives 2048 there, so the constant stays for fp32 and q4, whose k16 / v16
             // hold one key window whatever the context, drops that part

@@ -162,11 +162,15 @@ inline void launch_q8_rows(const void* w, const half* dpl, const void* x, float*
     launch_q8_rows_t<NC, NJ, PK>(w, dpl, x, y, nb, n_out, 8, 1024, s);
 }
 
-/// launch_q8_rows with NJ = ceil(nb / 32) for rows of up to 96 blocks (hidden 3072).
+/// Q8 blocks of one launch_q8_rows step (NJ = 1), and the widest row launch_q8_rows_nb serves (NJ = 3: hidden 3072).
+inline constexpr int kQ8RowBlocks = 32;
+inline constexpr int kQ8MaxBlocks = 3 * kQ8RowBlocks;
+
+/// launch_q8_rows with NJ = ceil(nb / kQ8RowBlocks) for rows of up to kQ8MaxBlocks blocks.
 template <int NC, bool PK>
 inline void launch_q8_rows_nb(const void* w, const half* dpl, const void* x, float* y, int nb, int n_out, cudaStream_t s) {
-    if (nb <= 32) launch_q8_rows<NC, 1, PK>(w, dpl, x, y, nb, n_out, s);
-    else if (nb <= 64) launch_q8_rows<NC, 2, PK>(w, dpl, x, y, nb, n_out, s);
+    if (nb <= kQ8RowBlocks) launch_q8_rows<NC, 1, PK>(w, dpl, x, y, nb, n_out, s);
+    else if (nb <= 2 * kQ8RowBlocks) launch_q8_rows<NC, 2, PK>(w, dpl, x, y, nb, n_out, s);
     else launch_q8_rows<NC, 3, PK>(w, dpl, x, y, nb, n_out, s);
 }
 
