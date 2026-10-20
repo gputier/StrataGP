@@ -286,6 +286,11 @@ if(STRATA_BUILD_TESTS)
   add_executable(q36_kv_q4_reference_test tests/core/q36_kv_q4_reference_test.cpp)
   target_include_directories(q36_kv_q4_reference_test PRIVATE include)
   add_test(NAME q36_kv_q4_reference_test COMMAND q36_kv_q4_reference_test)
+  # strata-q36's hybrid-mode doorbell (host side, header only): rings, answers and replays against a thread playing the graph
+  add_executable(q36_doorbell_test tests/core/q36_doorbell_test.cpp)
+  target_include_directories(q36_doorbell_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35")
+  target_link_libraries(q36_doorbell_test PRIVATE Threads::Threads)
+  add_test(NAME q36_doorbell_test COMMAND q36_doorbell_test)
 
   # the hipBLASLt tuning header's architecture gate: RDNA4 siblings share solution IDs, RDNA3 siblings share
   # theirs, cross-family pairs and version mismatches stay rejected (synthetic tables: no model, no GPU)

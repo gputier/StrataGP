@@ -18,6 +18,7 @@
 // [--force IDS] [--dump-full-logits F] (tools/qwen35/kl.py's reference interface), --bench-pp N / --bench-tg N.
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/family_layout.hpp"
+#include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/fused_gdn.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -30,6 +31,7 @@
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/qwen35/engine.hpp"
+#include "q36_doorbell.hpp"
 #include "q36_kernels.cuh"
 #if defined(STRATA_Q36_CPU_POOL)
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -511,6 +513,23 @@ __global__ void k_merge_cpu(float* parts, const float* cpu, const int32_t* miss,
     const int e = blockIdx.x;
     if (!miss[e]) return;
     for (int i = threadIdx.x; i < n; i += blockDim.x) parts[(size_t) e * n + i] = cpu[(size_t) e * n + i];
+}
+/// The hybrid mode's entry split inside a graph, from the device's own slot table (a rebalance rewrites the table, not
+/// the graph): miss[e] = the entry's expert has no VRAM slot; hit_rows[0, *n_hit) = the entries that have one.  One block.
+__global__ void k_hy_split(const int32_t* ids, int n_ent, const int32_t* slot_of, int32_t* miss, int32_t* hit_rows,
+                           int32_t* n_hit) {
+    __shared__ unsigned char hit[256];
+    for (int e = threadIdx.x; e < n_ent; e += blockDim.x) {
+        hit[e] = slot_of[ids[e]] >= 0;
+        miss[e] = !hit[e];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int n = 0;
+        for (int e = 0; e < n_ent; ++e)
+            if (hit[e]) hit_rows[n++] = e;
+        *n_hit = n;
+    }
 }
 /// The prompt attention's FP16 operands: cells [c0, c0 + P) of each KV head's K / V (cache rows ctx apart) into compact
 /// [kvh][P][HD] halves (Q4: the q4_0 cells dequantized, still rotated).  grid1(HKV * P * HD).
@@ -1405,8 +1424,7 @@ struct Engine {
     };
     std::vector<Hy> hy;
     int hybrid_t = 32;
-    bool main_hybrid = false;   // some main layer is hybrid (else only the MTP block is: the decode graph stays)
-    bool mtp_graph = true;      // the MTP draft step may be a graph (not when its layer is hybrid)
+    bool main_hybrid = false;   // some main layer is hybrid (else only the MTP block is)
     /// state index li's layer runs hybrid (its experts not all in VRAM)
     bool lhy(size_t li) const {
         if (!m->hybrid) return false;
@@ -1420,7 +1438,18 @@ struct Engine {
     float *h_h = nullptr, *cpu_out = nullptr, *ecpu = nullptr;
     int32_t *h_ids = nullptr, *h_miss = nullptr, *d_miss = nullptr, *h_cnt = nullptr;
     uint8_t* acts = nullptr;   // per token: its quantized activation (kNativeActBytes)
-    cudaEvent_t ev_route = nullptr;
+    cudaEvent_t ev_route = nullptr;   // the eager path's handshake (a record inside a capture is dropped: see the doorbell)
+    // inside a captured graph the host cannot be called between nodes: the layer's routing goes to the host with a
+    // doorbell kernel and the pool's rows come back behind a device-side wait (q36_doorbell.hpp).  The mapped pinned
+    // regions are h_h / h_ids / cpu_out seen from the device; each captured hybrid layer is a HyStep, served in order
+    // by the host after the graph's launch.
+    struct HyStep { size_t li; int T; };
+    strata::q36::HyDoorbell db;
+    float *d_h_h = nullptr, *d_cpu_out = nullptr;
+    int32_t *d_h_ids = nullptr, *d_hit_rows = nullptr, *d_n_hit = nullptr;
+    std::vector<HyStep>* cap_steps = nullptr;       // set while a graph is being captured
+    uint32_t cap_ring = 0;                          // the ring of the layer being captured (its place in cap_steps)
+    std::map<cudaGraphExec_t, std::vector<HyStep>> hy_steps;   // per graph with hybrid layers: what the host serves
     uint8_t* stage[2] = {};
     cudaStream_t cst = nullptr;
     cudaEvent_t ev_copy[2] = {}, ev_used[2] = {};
@@ -2425,17 +2454,24 @@ struct Engine {
         const auto& g = m->g;
         const int N = (int) g.n_embd, Kp = (int) m->top_k;
         const int64_t n_ent = (int64_t) T * Kp;
-        CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
-        CK(cudaMemcpyAsync(h_h, h, (size_t) T * N * 4, cudaMemcpyDeviceToHost, st));
-        CK(cudaEventRecord(ev_route, st));
+        if (cap_steps) {
+            cap_steps->push_back({li, T});
+            cap_ring = (uint32_t) cap_steps->size();
+            K::doorbell_publish(h, ids, nullptr, (int64_t) T * N, n_ent, d_h_h, d_h_ids, nullptr, db.d_seq, st);
+        } else {
+            CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
+            CK(cudaMemcpyAsync(h_h, h, (size_t) T * N * 4, cudaMemcpyDeviceToHost, st));
+            CK(cudaEventRecord(ev_route, st));
+        }
         group_entries(L, hy[li].slot_of_d, T);
         if (!xq_post) quant(h, N, T, xq);   // the experts' and the shared expert's input
         K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
                                  std::min<int64_t>(n_ent, g.n_expert), n_ent, xq, escr, eparts, st);
     }
-    /// The CPU half: the entries without a slot on the pool (ggml-cpu's arithmetic for the layer's formats), their
-    /// rows uploaded and merged into the entries' rows.
-    void moe_hybrid_cpu(size_t li, int T) {
+    /// The CPU half's arithmetic: the entries without a slot on the pool (ggml-cpu's arithmetic for the layer's
+    /// formats), from the routing and the hidden rows the GPU handed over (h_ids, h_h); their rows land in cpu_out.
+    /// Returns how many entries it computed.
+    int hy_cpu_compute(size_t li, int T) {
 #if defined(STRATA_Q36_CPU_POOL)
         namespace C = strata::kernels::cpu;
         const auto& g = m->g;
@@ -2443,8 +2479,6 @@ struct Engine {
         const int n_ent = T * Kp;
         Hy& H = hy[li];
         const Layer& L = layer_at((int) li);
-        while (cudaEventQuery(ev_route) == cudaErrorNotReady) {
-        }
         const auto t0 = Clock::now();
         // the missed entries per expert (up to MAXT tokens per job)
         jobs.clear();
@@ -2481,16 +2515,58 @@ struct Engine {
         }
         hy_cpu += n_miss;
         hy_gpu += n_ent - n_miss;
-        if (n_miss == 0) return;
+        if (n_miss == 0) return 0;
         pool->run_split_multi_native(H.fmt, jobs.data(), (int) jobs.size());
         hy_cpu_ms += ms_since(t0);
-        CK(cudaMemcpyAsync(ecpu, cpu_out, (size_t) n_ent * N * 4, cudaMemcpyHostToDevice, st));
-        CK(cudaMemcpyAsync(d_miss, h_miss, (size_t) n_ent * 4, cudaMemcpyHostToDevice, st));
-        k_merge_cpu<<<n_ent, kThreads, 0, st>>>(eparts, ecpu, d_miss, N);
+        return n_miss;
 #else
         (void) li;
         (void) T;
+        return 0;
 #endif
+    }
+    /// The CPU half: the entries without a slot on the pool computed, their rows uploaded and merged into the entries'
+    /// rows.  In a capture nothing runs on the host: the rows are copied from the mapped memory once the host has
+    /// answered the layer's ring (hy_serve), and the split into hit and miss entries is made on the device.
+    void moe_hybrid_cpu(size_t li, int T) {
+        const auto& g = m->g;
+        const int N = (int) g.n_embd, Kp = (int) m->top_k;
+        const int n_ent = T * Kp;
+        if (cap_steps) {
+            if (n_ent > 256) {
+                std::fprintf(stderr, "strata-q36: a hybrid layer of %d entries does not fit the graph's split kernel\n", n_ent);
+                std::exit(1);
+            }
+            k_hy_split<<<1, 128, 0, st>>>(ids, n_ent, hy[li].slot_of_d, d_miss, d_hit_rows, d_n_hit);
+            K::copy_rows_from_mapped_after(db.d_flag, cap_ring, ecpu, d_cpu_out, n_ent, N, d_hit_rows, d_n_hit, st);
+            k_merge_cpu<<<n_ent, kThreads, 0, st>>>(eparts, ecpu, d_miss, N);
+            return;
+        }
+        while (cudaEventQuery(ev_route) == cudaErrorNotReady) {
+        }
+        if (hy_cpu_compute(li, T) == 0) return;
+        CK(cudaMemcpyAsync(ecpu, cpu_out, (size_t) n_ent * N * 4, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(d_miss, h_miss, (size_t) n_ent * 4, cudaMemcpyHostToDevice, st));
+        k_merge_cpu<<<n_ent, kThreads, 0, st>>>(eparts, ecpu, d_miss, N);
+    }
+    /// After the launch: answers the graph's hybrid layers in capture order.  Ring k is the k-th layer's: the GPU has
+    /// published its routing when the sequence word reaches k, the pool's rows are in place when the flag is set to k.
+    void hy_serve(const std::vector<HyStep>& steps) {
+        (void) cudaStreamQuery(st);   // submits the launch to the GPU (on WDDM the driver batches until it is asked)
+        uint32_t ring = 0;
+        for (const HyStep& step : steps) {
+            ++ring;
+            const auto w = db.wait_ring(ring, [&] { return cudaStreamQuery(st) == cudaErrorNotReady; }, std::chrono::seconds(20));
+            if (w != strata::q36::RingWait::Rang) {
+                db.release();   // no wait kernel may outlive the engine
+                std::fprintf(stderr, "strata-q36: the hybrid layer %zu %s\n", step.li,
+                             w == strata::q36::RingWait::Ended ? "never rang (the graph ended)" : "did not ring in 20 s");
+                std::exit(1);
+            }
+            hy_cpu_compute(step.li, step.T);
+            db.answer(ring);
+        }
+        CK(cudaStreamSynchronize(st));
     }
 
     /// The slots to the experts the routing used most (the counts halved each time): at most max_swaps replacements
@@ -2563,19 +2639,33 @@ struct Engine {
         for (auto& kv : row_graphs)
             if (kv.second) CK(cudaGraphExecDestroy(kv.second));
         row_graphs.clear();
+        hy_steps.clear();
     }
 
+    /// The hybrid layers need no re-capture after a rebalance: the graph holds the slot tables' device pointers
+    /// (Hy::slot_of_d) and the slot blobs' addresses, and a rebalance only rewrites what they point to, between launches.
     template <class F> void graph_run(cudaGraphExec_t& gx, F body) {
         if (!use_graph) { body(); return; }
         if (!gx) {
+            std::vector<HyStep> steps;
             cudaGraph_t graph = nullptr;
+            cap_steps = &steps;
             CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
             body();
             CK(cudaStreamEndCapture(st, &graph));
+            cap_steps = nullptr;
             CK(cudaGraphInstantiate(&gx, graph, 0));
             CK(cudaGraphDestroy(graph));
+            if (!steps.empty()) hy_steps[gx] = std::move(steps);
         }
+        const auto served = hy_steps.find(gx);
+        if (served == hy_steps.end()) {
+            CK(cudaGraphLaunch(gx, st));
+            return;
+        }
+        db.arm();   // the previous launch has drained (hy_serve ends with a sync): no wait kernel still spins on the old flag
         CK(cudaGraphLaunch(gx, st));
+        hy_serve(served->second);
     }
 
     // ---- pictures (--vision).  A request with pictures hands the engine its rows (the encoder's, in prompt order), the
@@ -2920,8 +3010,7 @@ struct Engine {
             CK(cudaMemcpyAsync(pos0_m, hpin + 1, 4, cudaMemcpyHostToDevice, st));
             CK(cudaMemcpyAsync(seeds, hmtp + (size_t) last_row * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
             last_row = 0;
-            if (mtp_graph) graph_run(gs().gm1, [&] { forward_mtp(1, pos + d, seeds, true, use_graph); });
-            else forward_mtp(1, pos + d, seeds, true, false);
+            graph_run(gs().gm1, [&] { forward_mtp(1, pos + d, seeds, true, use_graph); });
             CK(cudaMemcpyAsync(hpin + 2, pick_m, 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
             drafts[(size_t) d] = hpin[2];
@@ -3088,10 +3177,11 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     namespace C = strata::kernels::cpu;
     m.hybrid = true;
     E.main_hybrid = !mtp_only;
-    if (E.main_hybrid) E.use_graph = false;   // the host takes part in every layer
-    E.mtp_graph = false;                      // the MTP block's layer is hybrid either way
     E.hybrid_t = std::max(1, std::min(hybrid_t, E.use_mmq ? E.tmax : E.tmax));
     if (!E.use_mmq) E.hybrid_t = E.tmax;   // no streamed prompt path: every batch on slots + the pool
+    // the graphs (a decode step, a verify window) run the hybrid layers through the doorbell; a window over hybrid_t
+    // rows would stream the layer's experts with host syncs in the middle, which a capture cannot hold
+    if (E.main_hybrid && E.hybrid_t < Engine::kVerify) E.use_graph = false;
     const size_t staging = E.use_mmq && E.main_hybrid ? 2 * (max_layer + kMmqTail) : 0;
     size_t slot_bytes = budget2 > staging ? budget2 - staging : 0;
     if (slot_bytes + staging + ((size_t) 256 << 20) > fr) slot_bytes = fr > staging + ((size_t) 512 << 20) ? fr - staging - ((size_t) 512 << 20) : 0;
@@ -3173,9 +3263,20 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         }
     }
     const size_t T = (size_t) E.tmax, N = (size_t) g.n_embd, Kp = (size_t) m.top_k;
-    CK(cudaHostAlloc((void**) &E.h_h, T * N * 4, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void**) &E.cpu_out, T * Kp * N * 4, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void**) &E.h_ids, T * Kp * 4, cudaHostAllocDefault));
+    // mapped pinned: the doorbell's payload and the pool's rows have one address for the host and another for the device
+    CK(cudaHostAlloc((void**) &E.h_h, T * N * 4, cudaHostAllocMapped));
+    CK(cudaHostAlloc((void**) &E.cpu_out, T * Kp * N * 4, cudaHostAllocMapped));
+    CK(cudaHostAlloc((void**) &E.h_ids, T * Kp * 4, cudaHostAllocMapped));
+    CK(cudaHostGetDevicePointer((void**) &E.d_h_h, E.h_h, 0));
+    CK(cudaHostGetDevicePointer((void**) &E.d_cpu_out, E.cpu_out, 0));
+    CK(cudaHostGetDevicePointer((void**) &E.d_h_ids, E.h_ids, 0));
+    uint32_t *db_words = nullptr, *d_db_words = nullptr;
+    CK(cudaHostAlloc((void**) &db_words, strata::q36::HyDoorbell::kWords * 4, cudaHostAllocMapped));
+    CK(cudaHostGetDevicePointer((void**) &d_db_words, db_words, 0));
+    std::memset(db_words, 0, strata::q36::HyDoorbell::kWords * 4);
+    E.db.bind(db_words, d_db_words);
+    CK(cudaMalloc(&E.d_hit_rows, T * Kp * 4));
+    CK(cudaMalloc(&E.d_n_hit, 4));
     CK(cudaHostAlloc((void**) &E.h_miss, T * Kp * 4, cudaHostAllocDefault));
     CK(cudaHostAlloc((void**) &E.h_cnt, all.size() * (size_t) ne * 4, cudaHostAllocDefault));
     CK(cudaMalloc(&E.ecpu, T * Kp * N * 4));
