@@ -1538,7 +1538,8 @@ struct Engine {
         const int Kp = (int) m->top_k;
         for (size_t li = 0; li < row_ids.size() && li < hy.size(); ++li)
             if (!row_ids[li].empty()) {
-                for (int e = 0; e < n * Kp; ++e) hy[li].count((size_t) row_ids[li][(size_t) e], 1.0);
+                for (int e = 0; e < n * Kp; ++e)
+                    if (strata::q36::first_of_row(row_ids[li].data(), e, Kp)) hy[li].count((size_t) row_ids[li][(size_t) e], 1.0);
                 if (stats_on)
                     for (int r = 0; r < n; ++r) stat_union.add(li, row_ids[li].data() + (size_t) r * Kp);
             }
@@ -1870,6 +1871,10 @@ struct Engine {
     void quant(const float* xin, int n, int T, void* q) { K::native_quantize_q8_1(xin, q, n * T, 1, st); }
     // ---- decode kernels of this engine (q36_kernels.cuh), each the old kernel's bits (STRATA_Q36_VERIFY=1 compares)
     bool fast_k = std::getenv("STRATA_Q36_OLD_KERNELS") == nullptr;
+    // routing options (--cache-prior, --ser), both off: they act in route_group's decode / verify windows (T <= 8) only
+    float cache_prior = 0.0f;   // the bias on resident experts' logits, in units of the token's logit range
+    int ser_kmin = 8;           // the picks of rank >= ser_kmin are kept only above ser_t * the top probability
+    float ser_t = 0.0f;
     bool verify_k = std::getenv("STRATA_Q36_VERIFY") != nullptr;
     float* vbuf = nullptr;                       // verify scratch
     long long v_calls = 0, v_bad = 0;
@@ -2090,14 +2095,18 @@ struct Engine {
         const int Kp = (int) m->top_k;
         grouped_by_route = false;
         if (!fast_k || T > 8 || m->g.n_expert != 256 || Kp != 8) return false;
-        if (slot_of)
-            q36k::k_route_group<true><<<1, dim3(32, 8), 0, st>>>(logits_r, ids, ewts, T, ld, slot_of, L.blobs, L.stride, grp_ptr,
-                                                                 grp_start, n_groups, ent_dst, ent_tok);
-        else
-            q36k::k_route_group<false><<<1, dim3(32, 8), 0, st>>>(logits_r, ids, ewts, T, ld, nullptr, L.blobs, L.stride, grp_ptr,
-                                                                  grp_start, n_groups, ent_dst, ent_tok);
+        const bool opt = cache_prior > 0.0f || ser_kmin < Kp;
+        if (slot_of) {
+            const auto kern = opt ? q36k::k_route_group<true, true> : q36k::k_route_group<true, false>;
+            kern<<<1, dim3(32, 8), 0, st>>>(logits_r, ids, ewts, T, ld, slot_of, L.blobs, L.stride, grp_ptr, grp_start, n_groups,
+                                            ent_dst, ent_tok, cache_prior, ser_kmin, ser_t);
+        } else {
+            const auto kern = opt ? q36k::k_route_group<false, true> : q36k::k_route_group<false, false>;
+            kern<<<1, dim3(32, 8), 0, st>>>(logits_r, ids, ewts, T, ld, nullptr, L.blobs, L.stride, grp_ptr, grp_start, n_groups,
+                                            ent_dst, ent_tok, cache_prior, ser_kmin, ser_t);
+        }
         grouped_by_route = true;
-        if (verify_k) {
+        if (verify_k && !opt) {
             // the old top-k into scratch, the ids / weights compared, then the old grouping of the new ids
             if (!vbuf) CK(cudaMalloc((void**) &vbuf, (size_t) 8 * 16384 * 4));
             int32_t* vid = (int32_t*) (vbuf + 8 * 8192);
@@ -2668,7 +2677,7 @@ struct Engine {
         int n_pcie_ent = 0;
         for (int e = 0; e < n_ent; ++e) {
             const int x = h_ids[e];
-            if (!defer) H.count((size_t) x, 1.0);
+            if (!defer && strata::q36::first_of_row(h_ids, e, Kp)) H.count((size_t) x, 1.0);
             h_miss[e] = H.slot_of[(size_t) x] < 0;
             if (!h_miss[e]) continue;
             ++n_miss;
@@ -4455,6 +4464,8 @@ int strata::qwen35::run(int argc, char** argv) {
     std::string model, tokens, force, dump_full, emb_file;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
     double expert_vram = -1.0;
+    float cache_prior = 0.0f, ser_t = 0.0f;   // routing options, off
+    int ser_kmin = 8;
     double pcie_frac = -1.0;   // the PCIe share of the missed experts: < 0 the probed one, 0 off
     bool warm = true;
     int expert_slots = 0, batch = 0, draft_vocab = -1;
@@ -4506,6 +4517,19 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--expert-profile-save") expert_profile_save = next();
         else if (a == "--hybrid-rows") hybrid_rows = std::atoi(next().c_str());
         else if (a == "--pcie-frac") pcie_frac = std::atof(next().c_str());
+        else if (a == "--cache-prior") cache_prior = (float) std::atof(next().c_str());   // 0 off, else in (0, 1]
+        else if (a == "--ser") {                                                          // Kmin,t
+            const std::string v = next();
+            char* end = nullptr;
+            const long k = std::strtol(v.c_str(), &end, 10);
+            const bool comma = end != nullptr && *end == ',';
+            ser_t = comma ? (float) std::atof(end + 1) : -1.0f;
+            if (!comma || k < 1 || k > 8 || !(ser_t >= 0.0f && ser_t <= 1.0f)) {
+                std::fprintf(stderr, "strata-q36: --ser must be Kmin,t with 1 <= Kmin <= 8 and 0 <= t <= 1 (got '%s')\n", v.c_str());
+                return 2;
+            }
+            ser_kmin = (int) k;
+        }
         else if (a == "--kv") {                                                    // fp32 (default) | q4, as setup writes it
             const std::string v = next();
             if (v != "fp32" && v != "q4") { std::fprintf(stderr, "strata-q36: --kv must be fp32 or q4 (got '%s')\n", v.c_str()); return 2; }
@@ -4526,12 +4550,17 @@ int strata::qwen35::run(int argc, char** argv) {
                          "usage: strata-q36 --model GGUF [--max-context 32768] [--chunk 512] [--no-graph] [--kv fp32|q4]\n"
                          "       [--rope-scaling none|linear|yarn [--rope-scale F] [--rope-orig-ctx N]]\n"
                          "       [--expert-profile FILE] [--expert-profile-save FILE] [--pcie-frac F]\n"
+                         "       [--cache-prior L] [--ser Kmin,t]\n"
                          "       (--serve | --tokens IDS [--n 64] [--force IDS] [--dump-full-logits F] | --bench-pp N "
                          "--bench-tg N)\n");
             return 2;
         }
     }
     if (model.empty()) { std::fprintf(stderr, "strata-q36: --model is required\n"); return 2; }
+    if (cache_prior < 0.0f || cache_prior > 1.0f) {
+        std::fprintf(stderr, "strata-q36: --cache-prior must be in [0, 1] (got %g)\n", (double) cache_prior);
+        return 2;
+    }
 #if !defined(_WIN32)
     setenv("CUDA_MODULE_LOADING", "EAGER", 0);   // every kernel loaded with the context, not in the first prompt
     setenv("STRATA_Q8_PACKED", "1", 0);   // the packed Q8_0 decode copy unless STRATA_Q8_PACKED is set otherwise
@@ -4640,6 +4669,12 @@ int strata::qwen35::run(int argc, char** argv) {
                          E.hy_pcie, E.hy_cpu, E.hy_cpu_ms, E.hy_swaps);
         }
     } report{E, expert_profile_save};
+    E.cache_prior = cache_prior;
+    E.ser_kmin = ser_kmin;
+    E.ser_t = ser_t;
+    if (cache_prior > 0.0f || ser_kmin < (int) m.top_k)
+        std::fprintf(stderr, "strata-q36: routing options on: cache prior %g, SER Kmin %d t %g (decode and verify windows of up to 8 rows)\n",
+                     (double) cache_prior, ser_kmin, (double) ser_t);
     E.reset();
     E.mtp_d = m.has_mtp ? mtp_d : 0;
     if (draft_vocab < 0 && std::getenv("STRATA_Q36_DRAFT_VOCAB") != nullptr) draft_vocab = std::atoi(std::getenv("STRATA_Q36_DRAFT_VOCAB"));

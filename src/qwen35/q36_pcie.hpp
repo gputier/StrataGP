@@ -40,6 +40,14 @@ inline constexpr int kPlanDst = kPlanStart + kPcieSlots + 1;
 inline constexpr int kPlanTok = kPlanDst + kPcieMaxEntries;
 inline constexpr int kPlanWords = kPlanTok + kPcieMaxEntries;
 
+/// False for entry `e` when an earlier entry of its row (top_k entries per row) names the same expert: a pick the SER option
+/// dropped is a copy of its row's first pick, and the usage counts of the slot rebalance count the expert once.
+inline bool first_of_row(const int32_t* ids, int e, int top_k) {
+    for (int q = e / top_k * top_k; q < e; ++q)
+        if (ids[q] == ids[e]) return false;
+    return true;
+}
+
 /// The experts of one layer step that go over PCIe: the distinct missed experts in routing order (first appearance),
 /// the last (misses * pcie_num) >> 8 of them, at most `cap` (kPcieSlots: the staging region's slots; the prefetch asks for fewer).  `slot_of[x] < 0`: expert x has no VRAM slot.  Writes them
 /// to `picked` (in routing order) and returns how many; `announced`, when given, gets the count the share asked for before

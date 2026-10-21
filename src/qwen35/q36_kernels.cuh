@@ -32,6 +32,11 @@ __device__ __forceinline__ float wmax(float x) {
     for (int o = 16; o > 0; o >>= 1) x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, o, 32));
     return x;
 }
+__device__ __forceinline__ float wmin(float x) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) x = fminf(x, __shfl_xor_sync(0xffffffffu, x, o, 32));
+    return x;
+}
 __device__ __forceinline__ float sigm(float v) { return 1.0f / (1.0f + expf(-v)); }
 
 // The shared CUDA kernels these ones replace (native_mmvq.cu, native_router.cu) are compiled with --use_fast_math (CMakeLists.txt);
@@ -318,12 +323,20 @@ __global__ void k_group_small(const int32_t* ids, int n_ent, int K_, const int32
 
 /// route_topk<256, 8> (native_router.cu, copied: the same expressions) for n_tok <= 8 tokens (one warp each) and, in the same
 /// launch, k_group_small's grouping of the picks.  block (32, 8).  HY as k_group_small.
-template <bool HY>
+/// OPT (routing options, off by default; OPT = false is the plain top-k, the arithmetic above untouched):
+///  - cache_prior (HY only): the experts with a VRAM slot get cache_prior * (max - min of the token's logits) added to the
+///    logit the ranking uses (arXiv 2412.00099, Eq. 9 with the token's own range as Delta); the weights stay the unbiased
+///    softmax's, renormalised over the picks.
+///  - SER (ser_kmin, ser_t; ik_llama.cpp PR 239): the pick of rank >= ser_kmin is kept only if its probability exceeds
+///    ser_t * the top probability.  A dropped pick becomes a copy of the first pick's id with weight 0 (the expert is read
+///    once, the weights of the kept picks renormalise as before).
+template <bool HY, bool OPT>
 __global__ void __launch_bounds__(256) k_route_group(const float* __restrict__ logits, int32_t* __restrict__ ids,
                                                      float* __restrict__ weights, int n_tok, int ld, const int32_t* slot_of,
                                                      const uint8_t* blobs, unsigned long long blob,
                                                      unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups,
-                                                     int32_t* ent_dst, int32_t* ent_tok) {
+                                                     int32_t* ent_dst, int32_t* ent_tok, float cache_prior, int ser_kmin,
+                                                     float ser_t) {
     constexpr int NE = 256, K = 8, V = NE / 32;
     __shared__ int sids[64], sid[64];
     const int tk = threadIdx.y;
@@ -333,10 +346,22 @@ __global__ void __launch_bounds__(256) k_route_group(const float* __restrict__ l
         float values[V];
 #pragma unroll
         for (int i = 0; i < V; ++i) values[i] = lg[lane + i * 32];
+        float key[V];   // OPT: the ranking's logits
         float maximum = -INFINITY;
 #pragma unroll
         for (int i = 0; i < V; ++i) maximum = max(maximum, values[i]);
         maximum = wmax(maximum);
+        if constexpr (OPT) {
+            float minimum = INFINITY;
+#pragma unroll
+            for (int i = 0; i < V; ++i) minimum = min(minimum, values[i]);
+            const float bias = HY ? cache_prior * (maximum - wmin(minimum)) : 0.0f;
+#pragma unroll
+            for (int i = 0; i < V; ++i) {
+                key[i] = values[i] + ((HY && slot_of[lane + i * 32] >= 0) ? bias : 0.0f);
+                if (__isnanf(key[i])) key[i] = -FLT_MAX;
+            }
+        }
         float sum = 0.0f;
 #pragma unroll
         for (int i = 0; i < V; ++i) {
@@ -350,12 +375,14 @@ __global__ void __launch_bounds__(256) k_route_group(const float* __restrict__ l
             if (__isnanf(values[i])) values[i] = -FLT_MAX;
         }
         float selected = 0.0f, selected_sum = 0.0f;
+        int first = 0;   // OPT: the first pick, the id a dropped pick takes
         for (int rank = 0; rank < K; ++rank) {
-            float best = values[0];
+            float* const rk = OPT ? key : values;
+            float best = rk[0];
             int expert = lane;
 #pragma unroll
             for (int i = 1; i < V; ++i) {
-                if (values[i] > best) { best = values[i]; expert = lane + i * 32; }
+                if (rk[i] > best) { best = rk[i]; expert = lane + i * 32; }
             }
 #pragma unroll
             for (int mask = 16; mask; mask >>= 1) {
@@ -363,10 +390,20 @@ __global__ void __launch_bounds__(256) k_route_group(const float* __restrict__ l
                 const int other_id = __shfl_xor_sync(0xffffffffu, expert, mask, 32);
                 if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
             }
+            int out_id = expert;
+            if constexpr (OPT) {
+                // the pick's probability to every lane; the top probability is 1 / sum (the max logit's exp is 1)
+                const float p = __shfl_sync(0xffffffffu, values[expert / 32], expert & 31, 32);
+                if (rank == 0) first = expert;
+                const bool keep = rank < ser_kmin || p > ser_t * reciprocal;
+                best = keep ? p : 0.0f;
+                if (!keep) out_id = first;
+            }
             if ((expert & 31) == lane) {
+                if constexpr (OPT) key[expert / 32] = -INFINITY;
                 values[expert / 32] = -INFINITY;
-                ids[(size_t) tk * K + rank] = expert;
-                sids[tk * K + rank] = expert;
+                ids[(size_t) tk * K + rank] = out_id;
+                sids[tk * K + rank] = out_id;
                 selected_sum += best;
             }
             if (rank == lane) selected = best;
