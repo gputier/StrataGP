@@ -291,6 +291,10 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(q36_doorbell_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35")
   target_link_libraries(q36_doorbell_test PRIVATE Threads::Threads)
   add_test(NAME q36_doorbell_test COMMAND q36_doorbell_test)
+  # strata-q36's sampled speculative decoding (host side, header only): a window's picks are the plain sampled text, drafts or not
+  add_executable(q36_spec_sampling_test tests/core/q36_spec_sampling_test.cpp)
+  target_include_directories(q36_spec_sampling_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35")
+  add_test(NAME q36_spec_sampling_test COMMAND q36_spec_sampling_test)
 
   # the hipBLASLt tuning header's architecture gate: RDNA4 siblings share solution IDs, RDNA3 siblings share
   # theirs, cross-family pairs and version mismatches stay rejected (synthetic tables: no model, no GPU)
@@ -1570,6 +1574,12 @@ if(STRATA_NATIVE_EXPERTS)
   target_link_libraries(native_expert_ff1024_test PRIVATE strata_kernels_cpu)
   if(STRATA_BUILD_TESTS)
     add_test(NAME native_expert_ff1024_test COMMAND native_expert_ff1024_test)
+  endif()
+  # a token's expert rows are the same alone (decode) and in a verify window's group (MTP): greedy MTP equals MTP 0
+  add_executable(native_expert_row_invariance_test src/kernels/cpu/native_expert_row_invariance_test.cpp)
+  target_link_libraries(native_expert_row_invariance_test PRIVATE strata_kernels_cpu)
+  if(STRATA_BUILD_TESTS)
+    add_test(NAME native_expert_row_invariance_test COMMAND native_expert_row_invariance_test)
   endif()
   set(_strata_mmq_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0)
   # #296: OrcaRouter Q4_K_S's Q5_0 experts (Q4_K and Q5_1 come with STRATA_MMQ_KQUANTS on CUDA, S5's branch)
