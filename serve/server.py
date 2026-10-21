@@ -2717,21 +2717,27 @@ def learned_profile_args(cfg: dict, args: list[str]) -> list[str]:
     tier learned there - on QUIT and every "expert_profile_save_every" minutes (10 by default, 0 = at QUIT only) -
     and the next start begins from it instead of the config's --expert-profile, when it is a profile of the same
     model (its header's layers and experts match); otherwise from the config's own, as before.  A relative path is
-    the engine's (the config's "cwd").  Without the key, the arguments are the config's, unchanged."""
+    the engine's (the config's "cwd").  Without the key, the arguments are the config's, unchanged.
+    The Qwen3.6 / Ornith engine (arch qwen35moe) saves at QUIT only (no periodic save) and starts from the saved file
+    even when the config names no --expert-profile of its own: its first run learns the profile, the next ones use it
+    (the engine refuses a file of another geometry with one log line and starts from the default order)."""
     save = cfg.get("expert_profile_save")
     if not isinstance(save, str) or not save.strip() or "--expert-profile-save" in args:
         return args
     args = args + ["--expert-profile-save", save]
+    q36 = cfg.get("arch") == "qwen35moe"
     every = cfg.get("expert_profile_save_every")
-    if isinstance(every, (int, float)) and not isinstance(every, bool) and every >= 0:
+    if isinstance(every, (int, float)) and not isinstance(every, bool) and every >= 0 and not q36:
         args += ["--expert-profile-save-every", str(every)]
+    here = cfg.get("cwd") or "."
+    learned = profile_shape(save if os.path.isabs(save) else os.path.join(here, save))
     if "--expert-profile" in args[:-1]:
         i = args.index("--expert-profile") + 1
-        here = cfg.get("cwd") or "."
-        learned = profile_shape(save if os.path.isabs(save) else os.path.join(here, save))
         base = profile_shape(args[i] if os.path.isabs(args[i]) else os.path.join(here, args[i]))
         if learned is not None and learned == base:
             args[i] = save
+    elif q36 and learned is not None:
+        args += ["--expert-profile", save]
     return args
 
 

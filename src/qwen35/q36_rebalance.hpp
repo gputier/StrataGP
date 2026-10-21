@@ -1,0 +1,83 @@
+// src/qwen35/q36_rebalance.hpp - the hybrid mode's choice of slot replacements (host side, header only).
+//
+// The routing counts of every hybrid layer decide which experts the VRAM slots should hold.  Flash-Next's adapt()
+// rules, applied across layers: in a layer, the most-routed expert outside the slots takes the place of the
+// least-routed one inside, while its count is at least kRebalanceMinCount and beats the one it replaces by at least
+// kRebalanceMinGain; the pairs of all layers are then ranked by gain and the best ones, up to the call's budget, are
+// swapped.  Every layer's counts decay by kRebalanceDecay afterwards (the caller's job).
+#pragma once
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <utility>
+#include <vector>
+
+namespace strata::q36 {
+
+inline constexpr double kRebalanceMinCount = 2.0;   // a candidate is routed at least this often (decayed count)
+inline constexpr double kRebalanceMinGain = 1.5;    // and beats the expert it replaces by at least this much
+inline constexpr double kRebalanceDecay = 0.7;      // the counts' factor after each rebalance, in every layer
+
+/// One hybrid layer as the rebalance sees it; null pointers: the layer has no slot table (all its experts in VRAM).
+struct LayerCounts {
+    const std::vector<double>* score = nullptr;   // routing count per expert
+    const std::vector<int>* slot_of = nullptr;    // expert -> its VRAM slot, or -1
+};
+
+struct SlotSwap {
+    int layer = 0, in = 0, out = 0;   // `in` takes the slot `out` holds
+    double gain = 0;                  // count(in) - count(out)
+};
+
+/// The experts of one layer's `S` slots at the start: the layer's first S experts in the profile's rank order, then, if
+/// the profile ranks fewer, the lowest-numbered ones left (the placement without a profile is that alone).
+inline std::vector<int> profile_slot_experts(const std::vector<std::pair<int32_t, int32_t>>& ranked, int layer, int S,
+                                             int n_expert) {
+    std::vector<int> out;
+    std::vector<char> used((size_t) n_expert, 0);
+    for (const auto& [l, e] : ranked) {
+        if ((int) out.size() >= S) break;
+        if (l != layer || e < 0 || e >= n_expert || used[(size_t) e]) continue;
+        used[(size_t) e] = 1;
+        out.push_back(e);
+    }
+    for (int e = 0; e < n_expert && (int) out.size() < S; ++e)
+        if (!used[(size_t) e]) out.push_back(e);
+    return out;
+}
+
+/// At most `budget` replacements over all layers, best gain first (ties: the lower layer, then the higher count).
+inline std::vector<SlotSwap> choose_swaps(const std::vector<LayerCounts>& layers, int budget) {
+    std::vector<SlotSwap> swaps;
+    std::vector<std::pair<double, int>> cand, vict;
+    for (size_t li = 0; li < layers.size(); ++li) {
+        if (layers[li].score == nullptr || layers[li].slot_of == nullptr) continue;
+        const std::vector<double>& score = *layers[li].score;
+        const std::vector<int>& slot_of = *layers[li].slot_of;
+        cand.clear();
+        vict.clear();
+        for (size_t x = 0; x < slot_of.size() && x < score.size(); ++x) {
+            if (slot_of[x] < 0) {
+                if (score[x] >= kRebalanceMinCount) cand.emplace_back(score[x], (int) x);
+            } else {
+                vict.emplace_back(score[x], (int) x);
+            }
+        }
+        std::sort(cand.begin(), cand.end(), [](const auto& a, const auto& b) {
+            return a.first != b.first ? a.first > b.first : a.second < b.second;
+        });
+        std::sort(vict.begin(), vict.end());   // lowest count first, ties by expert index
+        const size_t n = std::min(cand.size(), vict.size());
+        for (size_t i = 0; i < n; ++i) {
+            if (cand[i].first < vict[i].first + kRebalanceMinGain) break;
+            swaps.push_back({(int) li, cand[i].second, vict[i].second, cand[i].first - vict[i].first});
+        }
+    }
+    std::stable_sort(swaps.begin(), swaps.end(), [](const SlotSwap& a, const SlotSwap& b) { return a.gain > b.gain; });
+    if (budget < 0) budget = 0;
+    if (swaps.size() > (size_t) budget) swaps.resize((size_t) budget);
+    return swaps;
+}
+
+}  // namespace strata::q36

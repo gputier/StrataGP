@@ -19,6 +19,7 @@
 // Options: --kv fp32|q4 (the K / V cache format), --rope-scaling none|linear|yarn with --rope-scale F and
 // --rope-orig-ctx N (the GGUF's rope.scaling.* keys when absent).
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/core/expert_cache.hpp"
 #include "strata/core/family_layout.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -35,6 +36,7 @@
 #include "strata/qwen35/engine.hpp"
 #include "q36_doorbell.hpp"
 #include "q36_kernels.cuh"
+#include "q36_rebalance.hpp"
 #if defined(STRATA_Q36_CPU_POOL)
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -1423,8 +1425,10 @@ struct Engine {
     // side; a bigger prompt chunk streams each layer's experts into a staging buffer for MMQ (two, double-buffered)
     struct Hy {
         std::vector<int> slot_of, exp_in_slot;
-        std::vector<double> score;   // routing counts, halved at each rebalance
+        std::vector<double> score;   // routing counts, decayed at each rebalance
+        std::vector<double> heat;    // the routing counted since the start (--expert-profile-save), never decayed
         int32_t* slot_of_d = nullptr;
+        void count(size_t x, double n) { score[x] += n; heat[x] += n; }
 #if defined(STRATA_Q36_CPU_POOL)
         strata::kernels::cpu::NativeFmt fmt;
 #endif
@@ -1463,6 +1467,8 @@ struct Engine {
     std::vector<int> stream_seq;   // the state indices a streamed forward visits, in order
     int stream_pos = 0;
     long long hy_cpu = 0, hy_gpu = 0, hy_swaps = 0;   // entries computed on the CPU / GPU, slot replacements
+    /// --expert-profile: the profile the slots started from (main layers only; empty: none), kept for --expert-profile-save
+    std::vector<std::pair<int32_t, int32_t>> profile_prior;
     double hy_cpu_ms = 0;
     // decode / verify rows: their routing is counted once the rows are kept (commit), so a verify window's rejected
     // drafts never move the slots; the slots follow the counts at every kRebalanceEvery-th position exactly (a
@@ -1474,7 +1480,7 @@ struct Engine {
         const int Kp = (int) m->top_k;
         for (size_t li = 0; li < row_ids.size() && li < hy.size(); ++li)
             if (!row_ids[li].empty())
-                for (int e = 0; e < n * Kp; ++e) hy[li].score[(size_t) row_ids[li][(size_t) e]] += 1.0;
+                for (int e = 0; e < n * Kp; ++e) hy[li].count((size_t) row_ids[li][(size_t) e], 1.0);
     }
     void after_rows(int n) {   // a decode step / verify window kept n rows: count them, rebalance at the boundary
         if (!m->hybrid) return;
@@ -2260,7 +2266,7 @@ struct Engine {
             if (lhy(li)) CK(cudaMemcpyAsync(h_cnt + li * g.n_expert, rcnt, (size_t) ne * 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
             if (lhy(li))
-                for (int x = 0; x < ne; ++x) hy[li].score[(size_t) x] += h_cnt[li * g.n_expert + x];
+                for (int x = 0; x < ne; ++x) hy[li].count((size_t) x, h_cnt[li * g.n_expert + x]);
             const int64_t maxr = hpin[10];
             const uint8_t* wbase = lhy(li) ? stream_take((int) li) : L.blobs;
             MMQ::quantize(h, ent_tok, mq_x, L.L.gu_type, N, N, n_ent, st);
@@ -2494,7 +2500,7 @@ struct Engine {
         }
         for (int e = 0; e < n_ent; ++e) {
             const int x = h_ids[e];
-            if (!defer) H.score[(size_t) x] += 1.0;
+            if (!defer) H.count((size_t) x, 1.0);
             h_miss[e] = H.slot_of[(size_t) x] < 0;
             if (!h_miss[e]) continue;
             ++n_miss;
@@ -2574,55 +2580,72 @@ struct Engine {
         CK(cudaStreamSynchronize(st));
     }
 
-    /// The slots to the experts the routing used most (the counts halved each time): at most max_swaps replacements
-    /// over all layers, between forwards (the copies are on the engine's stream).
-    void rebalance(int max_swaps) {
+    /// The slots to the experts the routing used most: the replacements with the best gain over all layers (q36_rebalance.hpp),
+    /// at most max_swaps of them, between forwards (the copies are on the engine's stream).  Every layer's counts decay
+    /// afterwards, those of the layers it did not touch too.  Returns the replacements made.
+    int rebalance(int max_swaps) {
         static const bool off = std::getenv("STRATA_Q36_FIXED_SLOTS") != nullptr;   // the slots as placed (tests)
-        if (!m->hybrid || off || warming) return;
-        const int64_t ne = m->g.n_expert;
-        int left = max_swaps;
-        for (size_t li = 0; li < hy.size() && left > 0; ++li) {
-            Hy& H = hy[li];
-            const Layer& L = layer_at((int) li);
-            const int S = L.n_slots;
-            if (S <= 0 || S >= ne) continue;
-            std::vector<int> order((size_t) ne);
-            for (int x = 0; x < ne; ++x) order[(size_t) x] = x;
-            std::sort(order.begin(), order.end(), [&](int a, int b) { return H.score[(size_t) a] > H.score[(size_t) b]; });
-            // residents outside the top S, lowest score first: the slots to give away
-            std::vector<int> victims;
-            for (int s = 0; s < S; ++s) victims.push_back(s);
-            std::sort(victims.begin(), victims.end(), [&](int a, int b) {
-                return H.score[(size_t) H.exp_in_slot[(size_t) a]] < H.score[(size_t) H.exp_in_slot[(size_t) b]];
-            });
-            size_t vi = 0;
-            bool changed = false;
-            for (int i = 0; i < S && left > 0; ++i) {
-                const int x = order[(size_t) i];
-                if (H.slot_of[(size_t) x] >= 0) continue;
-                while (vi < victims.size()) {
-                    const int s = victims[vi];
-                    const int y = H.exp_in_slot[(size_t) s];
-                    if (H.score[(size_t) y] >= H.score[(size_t) x]) { vi = victims.size(); break; }
-                    // y must not be in the top S itself
-                    ++vi;
-                    H.slot_of[(size_t) y] = -1;
-                    H.slot_of[(size_t) x] = s;
-                    H.exp_in_slot[(size_t) s] = x;
-                    CK(cudaMemcpyAsync(L.blobs + (size_t) s * L.stride, L.hblobs + (size_t) x * L.stride, L.L.bytes,
-                                       cudaMemcpyHostToDevice, st));
-                    --left;
-                    ++hy_swaps;
-                    changed = true;
-                    break;
-                }
-                if (vi >= victims.size()) break;
-            }
-            if (changed)
-                CK(cudaMemcpyAsync(H.slot_of_d, H.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice, st));
-            for (double& v : H.score) v *= 0.5;
+        if (!m->hybrid || off || warming) return 0;
+        std::vector<strata::q36::LayerCounts> views(hy.size());
+        for (size_t li = 0; li < hy.size(); ++li) {
+            const int S = layer_at((int) li).n_slots;
+            if (S > 0 && S < m->g.n_expert) views[li] = {&hy[li].score, &hy[li].slot_of};
+        }
+        const std::vector<strata::q36::SlotSwap> swaps = strata::q36::choose_swaps(views, max_swaps);
+        std::vector<char> changed(hy.size(), 0);
+        for (const strata::q36::SlotSwap& w : swaps) {
+            Hy& H = hy[(size_t) w.layer];
+            const Layer& L = layer_at(w.layer);
+            const int s = H.slot_of[(size_t) w.out];
+            H.slot_of[(size_t) w.out] = -1;
+            H.slot_of[(size_t) w.in] = s;
+            H.exp_in_slot[(size_t) s] = w.in;
+            CK(cudaMemcpyAsync(L.blobs + (size_t) s * L.stride, L.hblobs + (size_t) w.in * L.stride, L.L.bytes,
+                               cudaMemcpyHostToDevice, st));
+            changed[(size_t) w.layer] = 1;
+            ++hy_swaps;
+        }
+        for (size_t li = 0; li < hy.size(); ++li) {
+            if (changed[li])
+                CK(cudaMemcpyAsync(hy[li].slot_of_d, hy[li].slot_of.data(), (size_t) m->g.n_expert * 4,
+                                   cudaMemcpyHostToDevice, st));
+            for (double& v : hy[li].score) v *= strata::q36::kRebalanceDecay;
         }
         CK(cudaStreamSynchronize(st));   // slot_of's host copy is pageable: the upload is done before it changes
+        return (int) swaps.size();
+    }
+
+    /// --expert-profile-save: what the run learned, as a profile of the main layers - the experts in the slots first, then
+    /// the rest by the routing counted since the start, then by the profile the run started from.  Nothing is written
+    /// when no routing was counted (the file on disk stays the best knowledge there is).
+    void save_profile(const std::string& path) {
+        if (!m->hybrid) {
+            std::fprintf(stderr, "strata-q36: --expert-profile-save %s: every expert is in VRAM, nothing to learn\n", path.c_str());
+            return;
+        }
+        const int64_t nl = (int64_t) m->layers.size(), ne = m->g.n_expert;
+        std::vector<uint8_t> resident((size_t) (nl * ne), 1);
+        std::vector<double> heat((size_t) (nl * ne), 0.0);
+        double total = 0;
+        for (size_t li = 0; li < (size_t) nl && li < hy.size(); ++li) {
+            const Hy& H = hy[li];
+            if (H.slot_of.empty()) continue;   // a layer with every expert in VRAM
+            for (int64_t e = 0; e < ne; ++e) {
+                resident[li * (size_t) ne + (size_t) e] = H.slot_of[(size_t) e] >= 0;
+                heat[li * (size_t) ne + (size_t) e] = H.heat[(size_t) e];
+                total += H.heat[(size_t) e];
+            }
+        }
+        if (total <= 0) {
+            std::fprintf(stderr, "strata-q36: --expert-profile-save %s: no routing was counted, not written\n", path.c_str());
+            return;
+        }
+        std::string err;
+        if (!strata::core::write_expert_profile(path, nl, ne, strata::core::rank_learned_profile(nl, ne, resident, heat, profile_prior), err))
+            std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
+        else
+            std::fprintf(stderr, "strata-q36: expert profile saved to %s (%lld layers x %lld experts, %lld slot replacements this run)\n",
+                         path.c_str(), (long long) nl, (long long) ne, hy_swaps);
     }
 
     void shrink_att(size_t floats) {
@@ -2778,11 +2801,11 @@ struct Engine {
             mtab_now = nullptr;
             map_on = false;
             if (!on_chunk(i + T)) {
-                if (m->hybrid) rebalance(hybrid_swaps_after_prompt);
+                if (m->hybrid) rebalance_after_prompt();
                 return i + T;
             }
         }
-        if (m->hybrid) rebalance(hybrid_swaps_after_prompt);
+        if (m->hybrid) rebalance_after_prompt();
         return n;
     }
 
@@ -2973,6 +2996,13 @@ struct Engine {
         if (dst == cur) load_cur();
     }
     int hybrid_swaps_after_prompt = 2048;
+    /// The prompt's routing moves the slots at once; the decode windows' rebalances add up in hy_swaps (the request's log line).
+    void rebalance_after_prompt() {
+        const int n = rebalance(hybrid_swaps_after_prompt);
+        if (!warming)
+            std::fprintf(stderr, "strata-q36: rebalance after the prompt: %d slot replacements (%lld since the start)\n", n,
+                         hy_swaps);
+    }
     /// the MTP seed rows of a prompt chunk: a buffer the block's own forward does not use (`moe_out`, [tmax][N])
     float* mtp_seed() { return moe_out; }
 
@@ -3063,7 +3093,10 @@ struct Engine {
         }
         CK(cudaStreamSynchronize(st));
         warming = false;
-        for (Hy& H : hy) std::fill(H.score.begin(), H.score.end(), 0.0);
+        for (Hy& H : hy) {
+            std::fill(H.score.begin(), H.score.end(), 0.0);
+            std::fill(H.heat.begin(), H.heat.end(), 0.0);
+        }
         hy_cpu = hy_gpu = hy_swaps = 0;
         hy_cpu_ms = 0;
         reset();
@@ -3246,19 +3279,25 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         std::memset(L.hblobs, 0, L.stride * (size_t) ne + kMmqTail);
         for (int64_t e = 0; e < ne; ++e) expert_blob(L, e, L.hblobs + (size_t) e * L.stride);
         L.n_slots = S;
+        // the slots hold the layer's best-ranked experts of the profile, else experts 0 .. S - 1 (the profile ranks the
+        // main layers only: the MTP block, past them, always takes the default order)
+        const std::vector<int> placed = strata::q36::profile_slot_experts(E.profile_prior, (int) li, S, (int) ne);
         if (S > 0) {
             CK(cudaMalloc(&L.blobs, L.stride * (size_t) S + kMmqTail));
             CK(cudaMemset(L.blobs, 0, L.stride * (size_t) S + kMmqTail));
-            CK(cudaMemcpy(L.blobs, L.hblobs, L.stride * (size_t) S, cudaMemcpyHostToDevice));
+            for (int s = 0; s < S; ++s)
+                CK(cudaMemcpy(L.blobs + (size_t) s * L.stride, L.hblobs + (size_t) placed[(size_t) s] * L.stride, L.stride,
+                              cudaMemcpyHostToDevice));
         }
         Engine::Hy& H = E.hy[li];
         H.slot_of.assign((size_t) ne, -1);
         H.exp_in_slot.assign((size_t) S, 0);
         for (int s = 0; s < S; ++s) {
-            H.slot_of[(size_t) s] = s;
-            H.exp_in_slot[(size_t) s] = s;
+            H.slot_of[(size_t) placed[(size_t) s]] = s;
+            H.exp_in_slot[(size_t) s] = placed[(size_t) s];
         }
         H.score.assign((size_t) ne, 0.0);
+        H.heat.assign((size_t) ne, 0.0);
         CK(cudaMalloc(&H.slot_of_d, (size_t) ne * 4));
         CK(cudaMemcpy(H.slot_of_d, H.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice));
         if (!C::native_fmt(L.L.gu_type, L.L.d_type, g.n_embd, g.n_ff, H.fmt, err)) return false;
@@ -3886,6 +3925,7 @@ struct Serve {
         std::mt19937_64 rng(smp.seed);
         std::vector<int32_t> hist = ids;
         const auto d0 = Clock::now();
+        const long long hc0 = E.hy_cpu, hg0 = E.hy_gpu, hs0 = E.hy_swaps;   // the hybrid counters at the start of the decode
         long long produced = 0, offered = 0, accepted = 0;
         const char* finish = "length";
         // greedy requests alone with the MTP block: speculative steps of mtp_d drafts (verified, so the text is the greedy
@@ -3979,6 +4019,11 @@ struct Serve {
                      "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld (%s)\n", s, ids.size(), reuse,
                      (long long) fresh, prompt_ms, prompt_ms > 0 ? 1000.0 * (double) fresh / prompt_ms : 0.0, produced,
                      decode_ms, decode_ms > 0 ? 1000.0 * (double) produced / decode_ms : 0.0, accepted, offered, finish);
+        if (E.m->hybrid) {   // the hit rate of the slots over this request's decode
+            const long long hg = E.hy_gpu - hg0, hn = hg + (E.hy_cpu - hc0);
+            std::fprintf(stderr, "strata serve: session %d: experts on the GPU %.1f%% (%lld of %lld rows), %lld slot replacements\n",
+                         s, hn ? 100.0 * (double) hg / (double) hn : 0.0, hg, hn, E.hy_swaps - hs0);
+        }
     }
 
     int run() {
@@ -3990,6 +4035,7 @@ struct Serve {
             while (std::getline(std::cin, l)) {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 if (l == "STOP") { stop.store(true); continue; }
+                if (l == "QUIT") break;   // the server ends the engine (an unload too): the run returns and saves the profile
                 std::lock_guard<std::mutex> lk(mu);
                 lines.push_back(l);
                 cv.notify_one();
@@ -4098,6 +4144,7 @@ int strata::qwen35::run(int argc, char** argv) {
     bool warm = true;
     int expert_slots = 0, batch = 0, draft_vocab = -1;
     std::string rope_scaling;
+    std::string expert_profile, expert_profile_save;   // the STRP profile the slots start from / is written to at the end
     double rope_scale = 0, rope_orig_ctx = 0;   // 0 = the option is absent (the GGUF's keys, else off)
     bool kv_q4 = false;                          // --kv q4: the 4-bit (Hadamard q4_0) K / V cache
     bool serve_mode = false, graph = true, vision = false, batch_mtp = false;
@@ -4140,6 +4187,8 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--expert-vram") expert_vram = std::atof(next().c_str());   // GiB for the routed experts
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
         else if (a == "--expert-slots") expert_slots = std::atoi(next().c_str());
+        else if (a == "--expert-profile") expert_profile = next();
+        else if (a == "--expert-profile-save") expert_profile_save = next();
         else if (a == "--hybrid-rows") hybrid_rows = std::atoi(next().c_str());
         else if (a == "--kv") {                                                    // fp32 (default) | q4, as setup writes it
             const std::string v = next();
@@ -4160,6 +4209,7 @@ int strata::qwen35::run(int argc, char** argv) {
             std::fprintf(stderr,
                          "usage: strata-q36 --model GGUF [--max-context 32768] [--chunk 512] [--no-graph] [--kv fp32|q4]\n"
                          "       [--rope-scaling none|linear|yarn [--rope-scale F] [--rope-orig-ctx N]]\n"
+                         "       [--expert-profile FILE] [--expert-profile-save FILE]\n"
                          "       (--serve | --tokens IDS [--n 64] [--force IDS] [--dump-full-logits F] | --bench-pp N "
                          "--bench-tg N)\n");
             return 2;
@@ -4242,13 +4292,27 @@ int strata::qwen35::run(int argc, char** argv) {
                          fr / 1073741824.0, fr_raw / 1073741824.0, packed / 1073741824.0, experts / 1073741824.0, chunk);
     }
     E.init(m, ctx, chunk, batch, vision);
+    if (!expert_profile.empty()) {
+        // a profile of another geometry, or one that cannot be read, is said once and the slots keep experts 0 .. S - 1
+        int64_t pslots = 0;
+        std::string perr;
+        if (strata::core::read_expert_profile(expert_profile, (int64_t) m.layers.size(), m.g.n_expert, E.profile_prior, pslots, perr))
+            std::fprintf(stderr, "strata-q36: expert profile %s: %zu ranked pairs, the slots start from it\n", expert_profile.c_str(),
+                         E.profile_prior.size());
+        else {
+            E.profile_prior.clear();
+            std::fprintf(stderr, "strata-q36: %s - the slots start with experts 0 .. S - 1\n", perr.c_str());
+        }
+    }
     if (!place_experts(m, E, expert_vram, cpu_threads, hybrid_rows, expert_slots, err)) {
         std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
         return 1;
     }
     struct Report {
         Engine& E;
+        const std::string& profile_save;
         ~Report() {
+            if (!profile_save.empty()) E.save_profile(profile_save);
             if (E.verify_k) std::fprintf(stderr, "strata-q36 VERIFY: %lld comparisons, %lld mismatches\n", E.v_calls, E.v_bad);
             if (E.verify_k)
                 for (const auto& kv : E.v_by)
@@ -4259,7 +4323,7 @@ int strata::qwen35::run(int argc, char** argv) {
                          "CPU pool in %.0f ms, %lld slot replacements\n", E.hy_gpu, n, n ? 100.0 * E.hy_gpu / n : 0.0,
                          E.hy_cpu, E.hy_cpu_ms, E.hy_swaps);
         }
-    } report{E};
+    } report{E, expert_profile_save};
     E.reset();
     E.mtp_d = m.has_mtp ? mtp_d : 0;
     if (draft_vocab < 0 && std::getenv("STRATA_Q36_DRAFT_VOCAB") != nullptr) draft_vocab = std::atoi(std::getenv("STRATA_Q36_DRAFT_VOCAB"));
