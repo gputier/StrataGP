@@ -187,6 +187,105 @@ int main() {
             check(std::abs(got - floor) < 1e-9, what);
         }
     }
+    std::printf("PcieAuto (q36: the CPU path's own time, the launch counted on the host's side):\n");
+    {
+        using strata::core::PcieAuto;
+        // a 54 GB/s link and a 4.08 MB expert: 75.6 us of wire per blob.  One first update after 48 windows of 100 jobs and
+        // 20 blobs, the CPU path at `us` per job, the host's launch at `launch_us` per blob.
+        const auto first = [](double us, double launch_us, double factor, double cap, PcieAuto* out = nullptr) {
+            PcieAuto a;
+            a.on = true;
+            a.link_gbps = 54.0;
+            a.blob_bytes = 4.08e6;
+            a.pool_factor = factor;
+            a.max_share = cap;
+            a.min_share = 0.0;
+            a.mark(0.0, 0, 0.0, 0);
+            double tc = 0.0, rate = 0.0, ms = 0.0, lms = 0.0, got = -1.0;
+            int64_t jobs = 0, blobs = 0;
+            for (int w = 1; w <= 48 && got < 0.0; ++w) {
+                ms += us / 10.0;
+                jobs += 100;
+                lms += launch_us * 20.0 / 1000.0;
+                blobs += 20;
+                got = a.window(ms, jobs, 0.55, &tc, &rate, lms, blobs);
+            }
+            if (out != nullptr) *out = a;
+            return got;
+        };
+        // c = 200 us per job, no launch: 200 / (200 + 75.6) = 0.726 -> 0.75 (the fitted 1.85 would say 54 / (54 + 37.7) = 0.59 -> 0.60)
+        check(std::abs(first(200.0, 0.0, 1.0, 0.95) - 0.75) < 1e-9, "a CPU path at 200 us per job against 75.6 us of wire: 0.75");
+        check(std::abs(first(200.0, 0.0, PcieAuto::kPoolFactor, 0.95) - 0.60) < 1e-9, "the fitted 1.85 on the same reading would say 0.60");
+        // the job build counts on the CPU path: 150 us of pool rows alone say 150 / 225.6 = 0.665 -> 0.65, and 50 us of job
+        // build on top make the 200 us above (0.75)
+        check(std::abs(first(150.0, 0.0, 1.0, 0.95) - 0.65) < 1e-9, "150 us of pool rows alone, no job build counted: 0.65");
+        // 40 us of host launch per blob is host time: c / (c + w - l) = 200 / 235.6 = 0.849 -> 0.85
+        {
+            PcieAuto a;
+            check(std::abs(first(200.0, 40.0, 1.0, 0.95, &a) - 0.85) < 1e-9, "40 us of launch per blob moves the balance to 0.85");
+            check(std::abs(a.launch_us - 40.0) < 1e-6, "the reading's launch time is 40 us per blob");
+        }
+        check(std::abs(first(200.0, 80.0, 1.0, 0.95) - 0.95) < 1e-9, "a launch dearer than the wire leaves only the cap: 0.95");
+        check(std::abs(first(200.0, 80.0, 1.0, 0.80) - 0.80) < 1e-9, "the cap holds");
+        check(std::abs(first(1000.0, 0.0, 1.0, 0.95) - 0.95) < 1e-9, "a CPU path at 1000 us per job: 1000 / 1075.6 = 0.93 -> 0.95");
+        // launch time with no blob counted (a window where nothing went over PCIe) is read as none
+        {
+            PcieAuto a;
+            a.on = true;
+            a.link_gbps = 54.0;
+            a.blob_bytes = 4.08e6;
+            a.pool_factor = 1.0;
+            a.max_share = 0.95;
+            a.mark(0.0, 0, 0.0, 0);
+            double tc = 0.0, rate = 0.0, ms = 0.0, got = -1.0;
+            int64_t jobs = 0;
+            for (int w = 1; w <= 48 && got < 0.0; ++w) {
+                ms += 20.0;
+                jobs += 100;
+                got = a.window(ms, jobs, 0.55, &tc, &rate, 5.0 * w, 0);
+            }
+            check(std::abs(got - 0.75) < 1e-9 && a.launch_us == 0.0, "a launch time without blobs counts as none");
+        }
+    }
+    std::printf("PcieAuto (Flash-Next unchanged):\n");
+    {
+        using strata::core::PcieAuto;
+        // the arithmetic of the rule before the launch time and the pool factor existed, written out, against the struct on a
+        // grid of links, experts and pool times: the same share (bit for bit: the same double) on every one
+        PcieAuto probe;
+        check(probe.pool_factor == PcieAuto::kPoolFactor && PcieAuto::kPoolFactor == 1.85, "the default factor is Flash-Next's 1.85");
+        bool same = true;
+        int n = 0;
+        for (const double link : {2.0, 6.0, 12.0, 26.0, 28.0, 54.0}) {
+            for (const double blob : {2.0e6, 4.08e6, 5.2e6}) {
+                for (const double us : {50.0, 100.0, 250.0, 400.0, 625.0, 1200.0, 2500.0}) {
+                    for (const double cap : {0.60, 0.95}) {
+                        PcieAuto a;
+                        a.on = true;
+                        a.link_gbps = link;
+                        a.blob_bytes = blob;
+                        a.max_share = cap;
+                        a.mark(0.0, 0);
+                        double tc = 0.0, rate = 0.0, ms = 0.0, got = -1.0;
+                        int64_t jobs = 0;
+                        for (int w = 1; w <= 48 && got < 0.0; ++w) {
+                            ms += us / 10.0;
+                            jobs += 100;
+                            got = a.window(ms, jobs, 0.55, &tc, &rate);
+                        }
+                        const double r = blob / (tc * 1e-6) / 1e9;
+                        const double f = std::min(cap, std::max(0.10, std::round(link / (link + PcieAuto::kPoolFactor * r) * 20.0) / 20.0));
+                        const double want = std::fabs(f - 0.55) < 0.025 ? -1.0 : f;
+                        same = same && got == want && a.launch_us == 0.0;
+                        ++n;
+                    }
+                }
+            }
+        }
+        char what[120];
+        std::snprintf(what, sizeof what, "%d readings: the share is the old formula's, bit for bit, and no launch time is read", n);
+        check(same, what);
+    }
     std::printf("%s\n", g_fail ? "FAILED" : "all passed");
     return g_fail ? 1 : 0;
 }

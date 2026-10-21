@@ -1486,6 +1486,11 @@ struct Engine {
     /// --expert-profile: the profile the slots started from (main layers only; empty: none), kept for --expert-profile-save
     std::vector<std::pair<int32_t, int32_t>> profile_prior;
     double hy_cpu_ms = 0;
+    // what PcieAuto reads (the clocks behind them run only while it is on): pa_cpu_ms = the CPU path's own time, the pool's row
+    // phases plus the jobs' build (not the PCIe launches the same host loop makes), pa_launch_ms / pa_blobs = the host time
+    // spent picking, launching and planning the PCIe copies, and how many
+    double pa_cpu_ms = 0, pa_launch_ms = 0;
+    long long pa_blobs = 0;
     // STRATA_Q36_STATS=1 (q36_stats.hpp): the bytes each path reads, the host's wait on the doorbell, the experts' union over
     // consecutive tokens; every use below is behind stats_on, so a run without the switch reads no clock and adds no sync
     const bool stats_on = strata::q36::stats_enabled();
@@ -1526,11 +1531,12 @@ struct Engine {
     void pcie_window() {
         if (!pcie_auto.on || warming) return;
         double tc_us = 0.0, rate = 0.0;
-        const double nf = pcie_auto.window(hy_cpu_ms, hy_cpu_jobs, pcie_num / 256.0, &tc_us, &rate);
+        const double nf = pcie_auto.window(pa_cpu_ms, hy_cpu_jobs, pcie_num / 256.0, &tc_us, &rate, pa_launch_ms, pa_blobs);
         if (nf < 0.0) return;
-        std::fprintf(stderr, "strata-q36: PCIe share: the CPU pool takes %.0f us per missed expert (%.1f GB/s of expert bytes), "
-                     "the link %.1f GB/s -> %.2f (was %.2f; --pcie-frac N fixes it); since the last update %lld of %lld announced "
-                     "groups went over PCIe (the staging region holds %d per layer step)\n", tc_us, rate, pcie_auto.link_gbps, nf,
+        std::fprintf(stderr, "strata-q36: PCIe share: the CPU path takes %.0f us per missed expert (%.1f GB/s of expert bytes; the "
+                     "pool's rows and the jobs' build), the link %.1f GB/s with %.0f us of host launch per blob -> %.2f (was %.2f; "
+                     "--pcie-frac N fixes it); since the last update %lld of %lld announced groups went over PCIe (the staging "
+                     "region holds %d per layer step)\n", tc_us, rate, pcie_auto.link_gbps, pcie_auto.launch_us, nf,
                      pcie_num / 256.0, pc_sent, pc_want, strata::q36::kPcieSlots);
         pc_want = pc_sent = 0;
         pcie_num = strata::core::pcie_num_of(nf);
@@ -2542,6 +2548,7 @@ struct Engine {
         Hy& H = hy[li];
         const Layer& L = layer_at((int) li);
         const auto t0 = Clock::now();
+        const bool pa_on = pcie_auto.on && !warming;   // PcieAuto's clocks: none once it has settled
         // the missed entries per expert (up to MAXT tokens per job)
         jobs.clear();
         std::vector<char> quantized((size_t) T, 0);
@@ -2554,6 +2561,7 @@ struct Engine {
         }
         // the PCIe share: its experts leave the pool's jobs; their copies start now and run beside the pool, and the
         // plan the graph's PCIe call reads is written before the layer is answered (no share: an empty plan)
+        const auto l0 = pa_on ? Clock::now() : Clock::time_point();
         int32_t picked[strata::q36::kPcieSlots];
         int want = 0;
         const int n_pcie = pcie_on ? strata::q36::pcie_pick(h_ids, n_ent, H.slot_of, pcie_num, picked, &want) : 0;
@@ -2568,6 +2576,12 @@ struct Engine {
         if (n_pcie > 0) (void) cudaStreamQuery(pcs);   // submits the copies to the GPU (on WDDM the driver batches until asked)
         if (pcie_on) strata::q36::pcie_plan(h_ids, n_ent, Kp, picked, n_pcie, (unsigned long long) (uintptr_t) pc_stage,
                                             (unsigned long long) pc_blob, pc_plan);
+        double launch_ms = 0.0;
+        if (pa_on) {
+            launch_ms = ms_since(l0);
+            pa_launch_ms += launch_ms;
+            pa_blobs += n_pcie;
+        }
         int n_pcie_ent = 0;
         for (int e = 0; e < n_ent; ++e) {
             const int x = h_ids[e];
@@ -2610,9 +2624,12 @@ struct Engine {
         }
         if (n_miss == 0) return 0;
         if (!jobs.empty()) {
+            const double built_ms = pa_on ? ms_since(t0) - launch_ms : 0.0;
+            const double rows_ms = pa_on ? pool->ms_multi_gu + pool->ms_multi_q + pool->ms_multi_down : 0.0;
             pool->run_split_multi_native(H.fmt, jobs.data(), (int) jobs.size());
             hy_cpu_ms += ms_since(t0);
             hy_cpu_jobs += (long long) jobs.size();
+            if (pa_on) pa_cpu_ms += built_ms + pool->ms_multi_gu + pool->ms_multi_q + pool->ms_multi_down - rows_ms;
         }
         if (n_pcie > 0) CK(cudaStreamSynchronize(pcs));   // the share is in staging before the layer is answered
         return n_miss;
@@ -3225,7 +3242,8 @@ struct Engine {
             std::fill(H.heat.begin(), H.heat.end(), 0.0);
         }
         hy_cpu = hy_gpu = hy_swaps = hy_pcie = hy_cpu_jobs = pc_want = pc_sent = 0;
-        hy_cpu_ms = 0;
+        hy_cpu_ms = pa_cpu_ms = pa_launch_ms = 0;
+        pa_blobs = 0;
         pcie_auto.mark(0.0, 0);
         reset();
         std::fprintf(stderr, "strata-q36: warmed up in %.1f s (one prompt chunk, a decode step%s)\n",
@@ -3541,6 +3559,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             E.pcie_auto.on = true;
             E.pcie_auto.min_share = 0.0;   // (Flash-Next's 0.10 floor would keep sending a share a slow link cannot carry)
             E.pcie_auto.max_share = 0.95;  // (Flash-Next's 0.60 cap would leave a large part of Ornith's experts to the CPU pool)
+            E.pcie_auto.pool_factor = 1.0; // (Flash-Next's 1.85 is fitted to a pool time that holds the launches and the job build; here they are counted apart)
             E.pcie_auto.link_gbps = link_gbps;
             E.pcie_auto.blob_bytes = sum / (double) m.layers.size();
         }

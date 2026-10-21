@@ -104,24 +104,42 @@ inline int pcie_num_of(double frac) { return std::max(0, std::min(256, (int) (fr
 // A4000 flat from 0.15 to 0.40; the 0.1.41 rule gave 0.55, 0.29, 0.30) lie within one 0.05 step of link / (link + 1.85 x pool rate).
 // Three updates at most (after 48, then 96 and 96 more windows), each rounded to 0.05, so a noisy window cannot move
 // the share by less than a step and it stops moving after the third.  STRATA_PCIE_FRAC_DEFAULT=old keeps the 0.1.41 rule.
+//
+// The q36 engine feeds it the CPU path's own cost per job (the pool's row phases plus the job build, not the PCIe copies
+// the same host loop launches) and the host's launch cost per PCIe blob, and sets pool_factor to 1: share = c / (c + w - l)
+// for c the CPU path's us per job, w = blob / link the PCIe us per blob, l the host us the launch of a blob takes.  The host
+// serves one layer as launches, job build, pool, so a launch is host time on the CPU path's side of the balance (the wire
+// time w of the blobs runs beside it): n w = J c + n l.  Flash-Next passes no launch time and keeps pool_factor 1.85, and
+// its arithmetic is the one above (k = 1.85 - 0.0).
 struct PcieAuto {
     static constexpr double kPoolFactor = 1.85;
     bool on = false;
     double link_gbps = 0.0, blob_bytes = 0.0;
     double min_share = 0.10;       ///< the lowest share a refinement may set (Flash-Next's 0.10; an engine that can do without the share passes 0)
     double max_share = 0.60;       ///< the highest share a refinement may set (Flash-Next's 0.60; an engine whose CPU pool is slow passes more)
-    double mark_ms = 0.0;
-    int64_t mark_jobs = 0;
-    double acc_ms = 0.0;
-    int64_t acc_jobs = 0;
+    double pool_factor = kPoolFactor;   ///< what multiplies the pool's rate against the link's (an engine that times only the CPU path's own work passes 1)
+    double mark_ms = 0.0, mark_launch_ms = 0.0;
+    int64_t mark_jobs = 0, mark_blobs = 0;
+    double acc_ms = 0.0, acc_launch_ms = 0.0;
+    int64_t acc_jobs = 0, acc_blobs = 0;
     int acc_win = 0, updates = 0;
-    void mark(double ms_run, int64_t jobs) { mark_ms = ms_run; mark_jobs = jobs; }
+    double launch_us = 0.0;        ///< the last reading: the host's us per PCIe blob launched (0 when the engine passes no launch time)
+    void mark(double ms_run, int64_t jobs, double launch_ms = 0.0, int64_t blobs = 0) {
+        mark_ms = ms_run;
+        mark_jobs = jobs;
+        mark_launch_ms = launch_ms;
+        mark_blobs = blobs;
+    }
     /// After a decode window: the new share, or -1 while there is nothing to change.  `tc_us`/`rate` get the reading.
-    double window(double ms_run, int64_t jobs, double cur, double* tc_us, double* rate) {
+    /// `launch_ms`/`blobs`: the host time spent launching PCIe copies and how many, cumulative like `ms_run` (none: 0).
+    double window(double ms_run, int64_t jobs, double cur, double* tc_us, double* rate, double launch_ms = 0.0,
+                  int64_t blobs = 0) {
         if (!on) return -1.0;
         acc_ms += ms_run - mark_ms;
         acc_jobs += jobs - mark_jobs;
-        mark(ms_run, jobs);
+        acc_launch_ms += launch_ms - mark_launch_ms;
+        acc_blobs += blobs - mark_blobs;
+        mark(ms_run, jobs, launch_ms, blobs);
         ++acc_win;
         if (acc_win < (updates == 0 ? 48 : 96)) return -1.0;
         if (acc_jobs < 300) {          // too few missed experts to read the pool's speed (everything hits): look again
@@ -129,15 +147,21 @@ struct PcieAuto {
             return -1.0;
         }
         const double tc = acc_ms * 1000.0 / (double) acc_jobs;
+        const double launch = acc_blobs > 0 ? acc_launch_ms * 1000.0 / (double) acc_blobs : 0.0;
         acc_ms = 0.0;
         acc_jobs = 0;
+        acc_launch_ms = 0.0;
+        acc_blobs = 0;
         acc_win = 0;
         if (++updates >= 3) on = false;
         if (!(tc > 1.0) || !(blob_bytes > 0.0) || !(link_gbps > 0.0)) return -1.0;
         const double r = blob_bytes / (tc * 1e-6) / 1e9;
-        const double f = std::min(max_share, std::max(min_share, std::round(link_gbps / (link_gbps + kPoolFactor * r) * 20.0) / 20.0));
+        const double wire_us = blob_bytes / (link_gbps * 1e3);
+        const double k = std::max(0.0, pool_factor - launch / wire_us);   // launch 0: pool_factor, the same double
+        const double f = std::min(max_share, std::max(min_share, std::round(link_gbps / (link_gbps + k * r) * 20.0) / 20.0));
         *tc_us = tc;
         *rate = r;
+        launch_us = launch;
         return std::fabs(f - cur) < 0.025 ? -1.0 : f;
     }
 };
