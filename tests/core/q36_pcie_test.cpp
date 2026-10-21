@@ -187,6 +187,15 @@ int main() {
             check(std::abs(got - floor) < 1e-9, what);
         }
     }
+    std::printf("first_of_row:\n");
+    {
+        // two rows of 4: the second row's picks 2 and 3 repeat its first (a dropped pick), 7 also sits in the first row
+        const int32_t row_ids[8] = {7, 3, 5, 9, 7, 2, 7, 7};
+        const bool want[8] = {true, true, true, true, true, true, false, false};
+        bool same = true;
+        for (int e = 0; e < 8; ++e) same = same && first_of_row(row_ids, e, 4) == want[e];
+        check(same, "an entry repeating an earlier entry of its own row is not the first; another row's does not count");
+    }
     std::printf("%s\n", g_fail ? "FAILED" : "all passed");
     return g_fail ? 1 : 0;
 }
