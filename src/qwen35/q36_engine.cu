@@ -35,6 +35,7 @@
 #include "strata/qwen35/engine.hpp"
 #include "q36_doorbell.hpp"
 #include "q36_kernels.cuh"
+#include "q36_sampling.hpp"
 #if defined(STRATA_Q36_CPU_POOL)
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -2983,8 +2984,11 @@ struct Engine {
     /// `cancel`: a stop asked for before the state moves keeps only x (the caller then emits no draft), so that a request
     /// stopped mid-answer leaves the state at the tokens it has shown: a conversation that continues from them (the server's
     /// hand-over of a stopped request to a batch slot) reuses it instead of reading them again.
+    /// `sample_row` (a sampled request): the token plain decoding would pick after the window's row t, from that row's
+    /// logits (host_logits_row) and the drafts before it; a draft is kept when it equals the pick of the row before it.
     int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks,
-                  const std::atomic<bool>* cancel = nullptr) {
+                  const std::atomic<bool>* cancel = nullptr,
+                  const std::function<int32_t(int, const int32_t*)>& sample_row = nullptr) {
         const int N = (int) m->g.n_embd;
         if (main_hybrid) D = std::min<int>(D, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
         const int T0 = (int) fix.size() + 1;   // the redo rows and the row of x
@@ -3032,10 +3036,16 @@ struct Engine {
         rows_deferred = false;
         CK(cudaMemcpyAsync(hpin + 2, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
-        int a = 0;
-        while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
-        if (cancel != nullptr && cancel->load()) a = 0;
-        for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
+        int a;
+        if (sample_row) {   // sampled: row t's pick is the draw of its position over its own history (q36_sampling.hpp)
+            a = strata::q36::spec_accept(drafts.data(), D, picks, [&](int t) { return sample_row(t, drafts.data()); });
+            if (cancel != nullptr && cancel->load()) a = 0;
+        } else {
+            a = 0;
+            while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
+            if (cancel != nullptr && cancel->load()) a = 0;
+            for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
+        }
         commit(a + 1);
         CK(cudaMemcpyAsync(hlast, hmain + (size_t) a * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
         pos += a + 1;
@@ -3315,51 +3325,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
 }
 
 // ------------------------------------------------------------------------------------------------ sampling
-struct Sampling {
-    float temperature = 0.f, top_p = 1.f, min_p = 0.f, repeat = 1.f, freq = 0.f, present = 0.f;
-    int top_k = 20, last_n = 0;
-    unsigned long long seed = 0;
-    bool needs_logits() const { return temperature > 0.f || repeat != 1.f || freq != 0.f || present != 0.f; }
-};
-
-int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>& hist, std::mt19937_64& rng) {
-    if (s.last_n != 0 && (s.repeat != 1.f || s.freq != 0.f || s.present != 0.f)) {
-        std::map<int, int> cnt;
-        const size_t from = s.last_n < 0 || (size_t) s.last_n >= hist.size() ? 0 : hist.size() - (size_t) s.last_n;
-        for (size_t i = from; i < hist.size(); ++i) ++cnt[hist[i]];
-        for (const auto& [id, c] : cnt) {
-            float& v = lg[(size_t) id];
-            if (s.repeat != 1.f) v = v > 0 ? v / s.repeat : v * s.repeat;
-            v -= (float) c * s.freq + s.present;
-        }
-    }
-    if (s.temperature <= 0.f) return (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
-    const int kk = std::max(1, std::min(s.top_k > 0 ? s.top_k : 64, (int) lg.size()));
-    std::vector<int> idx(lg.size());
-    for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int) i;
-    std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&](int a, int b) { return lg[a] > lg[b]; });
-    idx.resize((size_t) kk);
-    std::vector<double> p(idx.size());
-    const double mx = lg[(size_t) idx[0]];
-    double sum = 0;
-    for (size_t i = 0; i < idx.size(); ++i) sum += (p[i] = std::exp((lg[(size_t) idx[i]] - mx) / s.temperature));
-    size_t keep = idx.size();
-    double cum = 0;
-    for (size_t i = 0; i < idx.size(); ++i) {
-        if (p[i] / sum < s.min_p * (p[0] / sum)) { keep = i; break; }
-        cum += p[i] / sum;
-        if (cum >= s.top_p) { keep = i + 1; break; }
-    }
-    keep = std::max<size_t>(1, keep);
-    double tot = 0;
-    for (size_t i = 0; i < keep; ++i) tot += p[i];
-    std::uniform_real_distribution<double> u(0.0, tot);
-    double r = u(rng);
-    for (size_t i = 0; i < keep; ++i) {
-        if ((r -= p[i]) <= 0) return idx[i];
-    }
-    return idx[keep - 1];
-}
+using strata::q36::Sampling;
+using strata::q36::draw_rng;
+using strata::q36::sample;
 
 std::vector<int32_t> parse_ids(const char* s) {
     std::vector<int32_t> v;
@@ -3888,9 +3856,10 @@ struct Serve {
         const auto d0 = Clock::now();
         long long produced = 0, offered = 0, accepted = 0;
         const char* finish = "length";
-        // greedy requests alone with the MTP block: speculative steps of mtp_d drafts (verified, so the text is the greedy
-        // text); sampled ones, and requests beside others, one token at a time
-        const bool spec = E.mtp_d > 0 && !smp.needs_logits() && !adm;
+        // requests alone with the MTP block: speculative steps of mtp_d drafts, verified (greedy: the greedy text; sampled:
+        // each position's own draw, so the text is the one plain sampling gives for the seed); requests beside others,
+        // one token at a time
+        const bool spec = E.mtp_d > 0 && !adm;
         std::vector<int32_t> fix, drafts;
         int32_t picks[16];
         int nx = smp.needs_logits() ? -1 : E.greedy();
@@ -3928,11 +3897,21 @@ struct Serve {
                          prompt_ms > 0 ? 1000.0 * (double) fresh / prompt_ms : 0.0, cont ? "" : ", done at once");
             return;
         }
+        // the draw after the token at position p is draw_rng(seed, p): a sampled step's pick, and a verify window's row t
+        // (the token fed at E.pos + t, the penalty history running on through the drafts before it)
+        const std::function<int32_t(int, const int32_t*)> sample_row = [&](int t, const int32_t* dr) {
+            E.host_logits_row(t, lg);
+            std::mt19937_64 r = draw_rng(smp.seed, (uint64_t) (E.pos + t));
+            return (int32_t) sample(lg, smp, hist, r, dr, (size_t) t);
+        };
+        bool known = false;   // nx came out of a verify window already
         for (;;) {
-            if (smp.needs_logits()) {
+            if (smp.needs_logits() && !known) {
                 E.host_logits(lg);
-                nx = sample(lg, smp, hist, rng);
+                std::mt19937_64 r = draw_rng(smp.seed, (uint64_t) (E.pos - 1));
+                nx = sample(lg, smp, hist, r);
             }
+            known = false;
             auto emit = [&](int t) {   // false: the answer ends here
                 std::printf("T %d\n", t);
                 std::fflush(stdout);
@@ -3946,7 +3925,8 @@ struct Serve {
             if (!emit(nx)) break;
             if (n_active > 0) window();
             if (spec && n_active == 0 && E.pos + E.mtp_d + 1 <= E.ctx) {
-                const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks, &stop);
+                const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks, &stop,
+                                          smp.needs_logits() ? sample_row : std::function<int32_t(int, const int32_t*)>());
                 offered += E.mtp_d;
                 accepted += a;
                 // the state now holds x and every accepted draft, whether or not the answer ends inside them (an end of
@@ -3961,6 +3941,7 @@ struct Serve {
                     if (!emit(drafts[(size_t) i])) ended = true;
                 if (ended) break;
                 nx = picks[a];
+                known = true;
                 continue;
             }
             if (E.pos + 1 > E.ctx) break;
