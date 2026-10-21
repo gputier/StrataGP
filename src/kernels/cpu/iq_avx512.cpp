@@ -6,8 +6,9 @@
 // `maddubs` and a `madd`.  The arithmetic is ggml's (ggml-cpu/quants.c, the `_generic` references): integer sums
 // per block, times d_x * d_y * the format's constant - only the order of the float additions differs.
 //
-// Formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22).  IQ1_M stays on ggml-cpu (no shipped
-// model has IQ1_M expert rows: the 'Coder IQ1_M' pack's gate/up are IQ2_S / IQ3_XXS / IQ3_S).
+// Formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22), and IQ4_XS (23) in iq512_rows only (a down
+// projection: an IQ4_XS gate/up stays on ggml-cpu here).  IQ1_M stays on ggml-cpu (no shipped model has IQ1_M expert
+// rows: the 'Coder IQ1_M' pack's gate/up are IQ2_S / IQ3_XXS / IQ3_S).
 #include "strata/kernels/cpu/iq_avx512.hpp"
 
 #define GGML_COMMON_DECL_CPP
@@ -152,6 +153,32 @@ template <> struct Fmt<21> {   // IQ3_S: d, qs[64], qh[8], signs[32], scales[4]
     }
 };
 
+template <> struct Fmt<23> {   // IQ4_XS: d, scales_h, scales_l[4], qs[128] - 136 B, 8 signed sub-scales
+    // ggml's ggml_vec_dot_iq4_xs_q8_K, and iq_avx2.cpp's Fmt32<23>: a 16-entry codebook (kvalues_iq4nl)
+    // read from nibbles (|w| <= 127), one 6-bit scale per 32-value sub-block used SIGNED as (ls - 32) and folded into the int16
+    // operand of madd.  A 64-value chunk j is sub-blocks 2j and 2j+1, whose 16 bytes each hold the low nibbles
+    // (values 0-15) and the high nibbles (values 16-31) of the sub-block: lanes [lo(2j), hi(2j), lo(2j+1), hi(2j+1)],
+    // the order of the activation bytes.  The codebook sign goes to the activation (the mask), |w| to maddubs.
+    // Every sum is an integer below 2^24 (|maddubs pair| <= 2*127*128, |ls - 32| <= 32, four chunks), so the float
+    // conversion in row_dot is exact: the row differs from ggml-cpu's dot only in the order of the float additions.
+    static constexpr int bytes = 136;
+    static constexpr float K = 1.0f;
+    static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
+        const __m512i two = _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i*) (b + 8 + 32 * j)));
+        const __m512i dup = _mm512_shuffle_i64x2(two, two, 0x50);   // 128-bit lanes [sub 2j, sub 2j, sub 2j+1, sub 2j+1]
+        const __m512i nib = _mm512_and_si512(_mm512_srlv_epi16(dup, _mm512_set_epi64(0x0004000400040004, 0x0004000400040004,
+                                                                                  0, 0, 0x0004000400040004,
+                                                                                  0x0004000400040004, 0, 0)),
+                                             _mm512_set1_epi8(0x0f));
+        const __m512i q4 = _mm512_shuffle_epi8(_mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i*) kvalues_iq4nl)), nib);
+        g = _mm512_abs_epi8(q4);
+        m = _mm512_movepi8_mask(q4);
+        const int la = ((b[4 + j] & 0xf) | (((u16(b + 2) >> (4 * j)) & 3) << 4)) - 32;
+        const int lb = ((b[4 + j] >> 4) | (((u16(b + 2) >> (4 * j + 2)) & 3) << 4)) - 32;
+        sc = scales4(la, la, lb, lb);
+    }
+};
+
 template <int TY, int NT>
 inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
     __m512 accf[NT];
@@ -262,6 +289,7 @@ void iq512_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void*
         case 18: dot_rows_nt<18>(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 21: dot_rows_nt<21>(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 22: dot_rows_nt<22>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 23: dot_rows_nt<23>(nt, w, row_bytes, n, act, out, r0, r1); break;
         default: break;
     }
 }

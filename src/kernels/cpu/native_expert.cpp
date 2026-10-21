@@ -46,6 +46,8 @@ bool iq256_supported(int type) noexcept {
     return type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 23;
 }
 
+bool iq512_down_supported(int type) noexcept { return type == 23; }
+
 bool kq256_supported(int type) noexcept { return type == 12 || type == 7 || type == 8; }
 
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err) {
@@ -113,6 +115,11 @@ bool q8k_avx1(int type) {
     static const bool on = !cpu_avx2_ok() && cpu_avx1_ok() && std::getenv("STRATA_NO_Q8K_AVX1") == nullptr;
     return on && type == (int) GGML_TYPE_Q8_K;
 }
+// the AVX-512 i-quant kernels (iq_avx512.cpp) are on: an AVX-512 CPU, and STRATA_NO_IQ512 unset
+bool iq512_on() {
+    static const bool on = cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr;
+    return on;
+}
 }  // namespace
 
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
@@ -127,7 +134,7 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
     traits(f.d_act)->from_float(h, dst, f.n_ff);
 }
 
-int native_gu_mt_min(int gu_type) {
+int native_gu_mt_min(int gu_type, bool one_token_512) {
     // #152: from how many tokens the multi-token kernels run (ggml's vec_dot below that).  The default 2 is the
     // measured-fastest rule, but a token's expert rows then round differently alone than in a group, so greedy output
     // can depend on how many drafts a verify window held.  STRATA_IQ_MT_MIN=1 (opt-in, 0.1.30) uses the multi-token
@@ -143,6 +150,13 @@ int native_gu_mt_min(int gu_type) {
     // Opt-in (STRATA_IQ3S_MT1=1): it changes a lone token's IQ3_S rounding on those CPUs, so the default stays 0.1.39's.
     static const bool iq3s_one = env == nullptr && std::getenv("STRATA_IQ3S_MT1") != nullptr && cpu_avx2_ok() && std::getenv("STRATA_NO_IQ256") == nullptr &&
                                  !cpu_avx512_ok() && iq256_gather_setting() != 0 && cpu_gather_fast();
+    // IQ3_XXS on the AVX-512 kernel, for the engines that ask (NativeFmt::one_token_512, the Ornith q36 engine): a token's
+    // sums in that kernel do not depend on how many tokens share the decode, so a lone token's rows are the same as in a
+    // verify window.  Speed at one token is NOT established for IQ3_XXS: the one measurement this file has (IQ3_S, Zen 4,
+    // #152) has the multi-token kernel 1-3% slower than ggml-cpu's dot for a lone token, so the host decides with
+    // native_expert_ff1024_test's timing.  STRATA_IQ_MT_MIN set keeps its rule; STRATA_NO_IQ512 leaves the kernel, and the
+    // rule stays 2 (a lone token goes to ggml-cpu, as without the flag).
+    if (one_token_512 && env == nullptr && gu_type == 18 && iq512_on()) return 1;
     return iq3s_one && gu_type == 21 ? 1 : mt_min;
 }
 
@@ -153,7 +167,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // first, then the AVX-2 one (Zen 2/3, Intel 12th-14th gen).  STRATA_NO_IQ512 drops an AVX-512 CPU to the
     // AVX-2 kernel, STRATA_NO_IQ256 drops the AVX-2 kernel; ggml-cpu's single-token vec_dot is reached only with
     // both set (and on a CPU without AVX-512, STRATA_NO_IQ512 changes nothing).
-    static const bool avx512 = cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr;
+    static const bool avx512 = iq512_on();
     // STRATA_NO_IQ256 drops the AVX-2 kernel.  cpu_avx2_ok() is ALSO required: iq_avx2.cpp and kq_avx2.cpp
     // are compiled /arch:AVX2 and use AVX2 and FMA3, so calling them on a CPU without either is an
     // illegal instruction, not a slow path.  The gate sat next to `avx512` above, which does test
@@ -179,14 +193,14 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     }();
     // only where ggml's dot runs today (below the #152 multi-token rule): with STRATA_IQ_MT_MIN=1 a lone token keeps the
     // multi-token kernel, so a token's rows still do not depend on how many tokens share its expert
-    if (exact_one && nt == 1 && nt < native_gu_mt_min(f.gu_type) && avx2 && !cpu_avx512_ok() &&
+    if (exact_one && nt == 1 && nt < native_gu_mt_min(f.gu_type, f.one_token_512) && avx2 && !cpu_avx512_ok() &&
         (f.gu_type == 16 || f.gu_type == 17 || f.gu_type == 18 || f.gu_type == 21 || f.gu_type == 22)) {
         static std::once_flag announced;
         std::call_once(announced, [] { std::fprintf(stderr, "strata ab: GATE=STRATA_CPU_IQ_ALL_EXACT1 active=1\n"); });
         iq256_gu_rows_exact_one(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act[0], ff[0], r0, r1);
         return;
     }
-    const int mt_min = native_gu_mt_min(f.gu_type);   // #152
+    const int mt_min = native_gu_mt_min(f.gu_type, f.one_token_512);   // #152
     // Unsloth UD-Q4_K_XL's Q4_K gate/up: the multi-token kernel is bit-exact against ggml's per-token dot (any group
     // size, no #152 rule).  Opt-in, STRATA_KQ256=1: measured no faster in the engine (a window's expert groups hold
     // ~1.4 tokens and the weights stay in L1 across ggml's per-token calls; 1.01-1.13x in native_expert_parity).
@@ -195,8 +209,8 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         kq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
         return;
     }
-    // A format with only an AVX-2 kernel (IQ4_XS, #415) takes it on AVX-2 CPUs only: an AVX-512 CPU keeps ggml-cpu for
-    // it, as before (its rows would round differently).  Each kernel only for the formats it implements: falling
+    // A format with only an AVX-2 gate/up kernel (IQ4_XS, #415) takes it on AVX-2 CPUs only: an AVX-512 CPU keeps ggml-cpu
+    // for it, as before (its rows would round differently).  Each kernel only for the formats it implements: falling
     // through an empty switch would leave ff unwritten instead of falling back to ggml-cpu.
     static const bool cpu512 = cpu_avx512_ok();
     if (nt >= mt_min && (iq512_supported(f.gu_type) || (!cpu512 && iq256_supported(f.gu_type)))) {
@@ -259,6 +273,16 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     static const bool iq4nl_mt = std::getenv("STRATA_NO_IQ4NL") == nullptr;
     static const int mt_min = [] { const char* e = std::getenv("STRATA_IQ_MT_MIN"); return e ? std::atoi(e) : 2; }();
     static const bool kq = [] { const char* v = std::getenv("STRATA_KQ256"); return v != nullptr && std::atoi(v) != 0; }();
+    // IQ4_XS down rows on AVX-512, for the engines that ask (NativeFmt::one_token_512): iq512_rows decodes the nibbles and
+    // the signed sub-scales once for all tokens, for any token count including one, so a token's rows are the same alone
+    // and in a verify window.  The integer sums are ggml-cpu's dot's exactly; only the order of the float additions
+    // differs (native_expert_ff1024_test bounds it).  ggml-cpu's dot otherwise, as before; STRATA_IQ_MT_MIN set is the
+    // first token count served, STRATA_NO_IQ512 drops the kernel.
+    static const int mt_min512 = [] { const char* e = std::getenv("STRATA_IQ_MT_MIN"); return e ? std::atoi(e) : 1; }();
+    if (f.one_token_512 && iq512_on() && nt >= mt_min512 && iq512_down_supported(f.d_type)) {
+        iq512_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
     // Both multi-token kernels below are /arch:AVX2 translation units (kq_avx2.cpp and iq_avx2.cpp),
     // so a CPU without AVX2 has to reach ggml-cpu's vec_dot instead - same reasoning as the gate/up
     // rows above, where `avx512` tested cpu_avx512_ok() and `avx2` did not.
@@ -266,7 +290,10 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
         kq256_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
-    if (cpu_avx2_ok() && nt >= mt_min && f.d_type == 20 && iq4nl_mt) {   // #152: the same rule as the gate/up rows
+    // #152: the same rule as the gate/up rows; NativeFmt::one_token_512 serves a lone token too (the kernel's rows do not
+    // depend on the token count), STRATA_IQ_MT_MIN set keeping its rule
+    const int nl_min = f.one_token_512 && std::getenv("STRATA_IQ_MT_MIN") == nullptr ? 1 : mt_min;
+    if (cpu_avx2_ok() && nt >= nl_min && f.d_type == 20 && iq4nl_mt) {
         iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
