@@ -109,6 +109,7 @@ struct PcieAuto {
     bool on = false;
     double link_gbps = 0.0, blob_bytes = 0.0;
     double min_share = 0.10;       ///< the lowest share a refinement may set (Flash-Next's 0.10; an engine that can do without the share passes 0)
+    double max_share = 0.60;       ///< the highest share a refinement may set (Flash-Next's 0.60; an engine whose CPU pool is slow passes more)
     double mark_ms = 0.0;
     int64_t mark_jobs = 0;
     double acc_ms = 0.0;
@@ -134,7 +135,7 @@ struct PcieAuto {
         if (++updates >= 3) on = false;
         if (!(tc > 1.0) || !(blob_bytes > 0.0) || !(link_gbps > 0.0)) return -1.0;
         const double r = blob_bytes / (tc * 1e-6) / 1e9;
-        const double f = std::min(0.60, std::max(min_share, std::round(link_gbps / (link_gbps + kPoolFactor * r) * 20.0) / 20.0));
+        const double f = std::min(max_share, std::max(min_share, std::round(link_gbps / (link_gbps + kPoolFactor * r) * 20.0) / 20.0));
         *tc_us = tc;
         *rate = r;
         return std::fabs(f - cur) < 0.025 ? -1.0 : f;

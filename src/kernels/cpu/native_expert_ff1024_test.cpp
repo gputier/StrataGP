@@ -7,7 +7,7 @@
 // kNativeMaxFF wide (they were FF = 640, so rows 640..1023 landed in the next token's buffer).  native_fmt refuses
 // an expert wider than kNativeMaxFF.
 //
-// NativeFmt::one_token_512 (the q36 engine sets it): on an AVX-512 CPU IQ3_XXS gate/up serve a lone token with the
+// NativeFmt::one_token_512 (the q36 engine sets it under STRATA_Q36_ONE_TOKEN_CPU): on an AVX-512 CPU IQ3_XXS gate/up serve a lone token with the
 // AVX-512 kernel and an IQ4_XS down is served by it for any token count.  Those rows share ggml-cpu's integer sums and
 // differ only in the order of the float additions, so the test bounds them against ggml's dot (kMaxRatio, max abs
 // error over the largest reference value) and requires a token's rows to be the same alone and in a group.  Where the

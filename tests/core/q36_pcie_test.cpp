@@ -51,6 +51,17 @@ int main() {
         check(got.size() == (size_t) kPcieSlots && got.front() == 24 && got.back() == 39 && announced == 20,
               "the staging region's slots cap the count and keep the last ones; the share asked for 20");
     }
+    {
+        // Ornith at one token: top-8, every expert missed, a share of 0.95 (243 / 256): 7 of the 8 go over PCIe, well under
+        // the staging region's kPcieSlots, and a 32-row window (256 entries) is the widest step that carries a share
+        std::vector<int32_t> top8;
+        for (int i = 0; i < 8; ++i) top8.push_back(100 + i);
+        int announced = 0;
+        const std::vector<int32_t> got = pick(top8, strata::core::pcie_num_of(0.95), std::vector<int>(256, -1), &announced);
+        check(strata::core::pcie_num_of(0.95) == 243 && got.size() == 7 && announced == 7 && 8 < kPcieSlots,
+              "a share of 0.95 at one token of top-8 is not cut by the staging region");
+        check(kPcieMaxEntries / 8 == 32, "kPcieMaxEntries holds 32 rows of top-8");
+    }
     check(pick(ids, 85, s16) == std::vector<int32_t>({14}), "the count rounds down: 5 misses x 85 / 256 = 1.66 is 1");
     check(pick({5, 0, 7}, 85, s16).empty(), "two misses at a third: 0.66 is none");
     // two tokens routing the same experts: a miss counts once, at its first appearance
@@ -126,6 +137,32 @@ int main() {
         }
         check(got < 0.0 && !a.on, "the reading is within one step of the share: no change, and the third update ends it");
         check(a.window(ms + 1.0, jobs + 1000, 0.25, &tc, &rate) < 0.0, "after the third update it stays put");
+    }
+    {
+        // Ornith on a 54 GB/s link, a 4.08 MB expert, the pool at 625 us per expert = 6.5 GB/s: 54 / (54 + 12.1) = 0.82 -> 0.80,
+        // which Flash-Next's 0.60 cap would cut; a pool at 2500 us balances at 0.95, the q36 cap
+        using strata::core::PcieAuto;
+        for (const double cap : {0.60, 0.95}) {
+            for (const double us : {625.0, 2500.0}) {
+                PcieAuto a;
+                a.on = true;
+                a.link_gbps = 54.0;
+                a.blob_bytes = 4.08e6;
+                if (cap != 0.60) a.max_share = cap;   // (the default is Flash-Next's 0.60)
+                a.mark(0.0, 0);
+                double tc = 0.0, rate = 0.0, ms = 0.0, got = -1.0;
+                int64_t jobs = 0;
+                for (int w = 1; w <= 48 && got < 0.0; ++w) {
+                    ms += us / 10.0;   // 100 experts a window
+                    jobs += 100;
+                    got = a.window(ms, jobs, 0.55, &tc, &rate);
+                }
+                const double want = cap == 0.60 ? 0.60 : (us == 625.0 ? 0.80 : 0.95);
+                char what[120];
+                std::snprintf(what, sizeof what, "a pool at %.0f us per expert under a cap of %.2f refines to %.2f", us, cap, want);
+                check(std::abs(got - want) < 1e-9, what);
+            }
+        }
     }
     {
         // a 0.25 GB/s link against a pool at 10.2 GB/s balances at 0.013: Flash-Next's floor keeps 0.10, min_share 0 follows it

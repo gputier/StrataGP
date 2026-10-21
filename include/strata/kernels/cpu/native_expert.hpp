@@ -38,10 +38,13 @@ struct NativeFmt {
     /// too, an IQ4_XS down served by iq512_rows for any token count, and an IQ4_NL down served by iq4nl256_down_rows (AVX-2)
     /// for a lone token too.  Off (the default) keeps the selection the Flash-Next path has always had: ggml-cpu's dot
     /// for one token, and for an IQ4_XS down always.  Their rows round differently from ggml-cpu's (only the order of the
-    /// float additions), so it is a choice of the engine, per layer.  STRATA_IQ_MT_MIN set takes all three back: the gate/up
-    /// and IQ4_NL rows go by that variable's token threshold as before, and an IQ4_XS down (which never had another kernel)
-    /// goes back to ggml-cpu's dot for any token count.  STRATA_NO_IQ512=1 alone takes back the two AVX-512 kernels
-    /// (IQ3_XXS gate/up, IQ4_XS down), STRATA_NO_IQ4NL=1 alone the IQ4_NL down.
+    /// float additions), so it is a choice of the engine, per layer; the q36 engine sets it only under
+    /// STRATA_Q36_ONE_TOKEN_CPU, since on an AVX-512 CPU the one-token kernels measure slower than ggml-cpu's dots.  Once
+    /// set, STRATA_IQ_MT_MIN takes all three back: the gate/up and IQ4_NL rows go by that variable's token threshold as
+    /// before, and an IQ4_XS down goes back to ggml-cpu's dot for any token count.  STRATA_NO_IQ512=1 takes back the two
+    /// AVX-512 kernels (IQ3_XXS gate/up, IQ4_XS down) but NOT the old selection: the gate/up rows then run on the AVX-2
+    /// multi-token kernel instead of the AVX-512 one, and STRATA_NO_IQ4NL=1 removes the AVX-2 IQ4_NL down kernel, so
+    /// neither reproduces a build without the flag; only STRATA_IQ_MT_MIN (or leaving the flag off) does.
     bool one_token_512 = false;
 };
 constexpr int kNvfp4Type = 40;

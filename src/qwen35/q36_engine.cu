@@ -1485,6 +1485,32 @@ struct Engine {
     /// --expert-profile: the profile the slots started from (main layers only; empty: none), kept for --expert-profile-save
     std::vector<std::pair<int32_t, int32_t>> profile_prior;
     double hy_cpu_ms = 0;
+    /// STRATA_Q36_PHASE_TIMING=1: where a speculative step's time goes, from host timers on the syncs the step already makes
+    /// (the one added sync ends the accept part), with the pool's time split between the main layers and the MTP block; one
+    /// log line per kPhaseSteps steps
+    static constexpr int kPhaseSteps = 32;
+    const bool phase_timing = std::getenv("STRATA_Q36_PHASE_TIMING") != nullptr;
+    /// hy_serve's time in a graph step, split: ring = the wait for the GPU to reach each hybrid layer, answer = the host's reply
+    /// to a layer (routing, PCIe copies, pool), staging = the part of the answer spent waiting for the PCIe copies, tail = the
+    /// wait for the graph to drain after the last layer
+    struct ServeTimes {
+        double ring = 0, answer = 0, staging = 0, tail = 0;
+        long long rings = 0;
+        void add(const ServeTimes& o) {
+            ring += o.ring;
+            answer += o.answer;
+            staging += o.staging;
+            tail += o.tail;
+            rings += o.rings;
+        }
+    };
+    ServeTimes sv;   // the graph step running now
+    struct PhaseTimes {
+        double draft1 = 0, draft_n = 0, verify = 0, accept = 0;   // ms: the first MTP call, the chained ones, the window, the rest
+        double pool_ms[2] = {0, 0};                               // the CPU pool's wall time: [main layers, MTP block]
+        long long pool_jobs[2] = {0, 0}, pool_calls[2] = {0, 0}, steps = 0, rows = 0, kept = 0;
+        ServeTimes serve;                                         // the verify window's (and the MTP block's graph calls')
+    } ph, ph_plain;   // speculative steps / plain decode windows (run_rows)
     // decode / verify rows: their routing is counted once the rows are kept (commit), so a verify window's rejected
     // drafts never move the slots; a single session's slots follow the counts at every kRebalanceEvery-th position
     // exactly (a window never steps over one), so plain and speculative decoding see the same slot tables at every
@@ -2579,10 +2605,21 @@ struct Engine {
         if (n_miss == 0) return 0;
         if (!jobs.empty()) {
             pool->run_split_multi_native(H.fmt, jobs.data(), (int) jobs.size());
-            hy_cpu_ms += ms_since(t0);
+            const double pool_ms = ms_since(t0);
+            hy_cpu_ms += pool_ms;
             hy_cpu_jobs += (long long) jobs.size();
+            if (phase_timing) {
+                const int part = li >= m->layers.size() ? 1 : 0;
+                for (PhaseTimes* t : {&ph, &ph_plain}) {   // (each is logged by its own kind of step; a run holds mostly one)
+                    t->pool_ms[part] += pool_ms;
+                    t->pool_jobs[part] += (long long) jobs.size();
+                    ++t->pool_calls[part];
+                }
+            }
         }
+        const auto ts = Clock::now();
         if (n_pcie > 0) CK(cudaStreamSynchronize(pcs));   // the share is in staging before the layer is answered
+        if (phase_timing) sv.staging += ms_since(ts);
         return n_miss;
 #else
         (void) li;
@@ -2633,6 +2670,7 @@ struct Engine {
     void hy_serve(const std::vector<HyStep>& steps) {
         (void) cudaStreamQuery(st);   // submits the launch to the GPU (on WDDM the driver batches until it is asked)
         uint32_t ring = 0;
+        auto tl = Clock::now();
         for (const HyStep& step : steps) {
             ++ring;
             const auto w = db.wait_ring(ring, [&] { return cudaStreamQuery(st) == cudaErrorNotReady; }, std::chrono::seconds(20));
@@ -2645,10 +2683,20 @@ struct Engine {
                                  : "did not ring in 20 s");
                 std::exit(1);
             }
+            if (phase_timing) {
+                sv.ring += ms_since(tl);
+                tl = Clock::now();
+            }
             hy_cpu_compute(step.li, step.T);
             db.answer(ring);
+            if (phase_timing) {
+                sv.answer += ms_since(tl);
+                ++sv.rings;
+                tl = Clock::now();
+            }
         }
         CK(cudaStreamSynchronize(st));
+        if (phase_timing) sv.tail += ms_since(tl);
     }
 
     /// The slots to the experts the routing used most: the replacements with the best gain over all layers (q36_rebalance.hpp),
@@ -2837,8 +2885,11 @@ struct Engine {
             chunk_pictures(pos, 1);
             rows_deferred = true;
             // a prompt cell of a picture request (its rotary position is in the table, its row a picture's) runs eagerly
+            const auto tw = Clock::now();
+            sv = ServeTimes{};
             if (mtab_now || map_on) forward(1, pos, 1, false, false);
             else graph_run(gs().g1, [&] { forward(1, pos, 1, use_graph, false); });
+            if (phase_timing && !warming && main_hybrid && use_graph) phase_window(tw, 1);
             mtab_now = nullptr;
             map_on = false;
             rows_deferred = false;
@@ -2928,11 +2979,14 @@ struct Engine {
         rows_mode = true;
         rows_G = G;
         rows_deferred = true;
+        const auto tw = Clock::now();
+        sv = ServeTimes{};
         run_graph_key((verify ? 1000 : 0) + G * 10 + (T - G), [&] { forward(T, pmax, T, use_graph, verify); });
         rows_deferred = false;
         rows_mode = false;
         CK(cudaMemcpyAsync(hrow + 32, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
+        if (phase_timing && !verify && !warming) phase_window(tw, T);
         for (int r = 0; r < T; ++r) rows_pick[r] = hrow[32 + r];
         if (!verify)
             for (int g = 0; g < G; ++g) sess[(size_t) gr[g].slot].pos += gr[g].n;
@@ -3104,12 +3158,18 @@ struct Engine {
         if (!fix.empty())
             CK(cudaMemcpyAsync(seeds, hmain, fix.size() * (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
         CK(cudaMemcpyAsync(seeds + fix.size() * (size_t) N, hlast, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
+        auto tp = Clock::now();
+        sv = ServeTimes{};
         forward_mtp(T0, pos - (int64_t) fix.size(), seeds, D > 0, false);
         drafts.assign((size_t) D, 0);
         if (D > 0) {
             CK(cudaMemcpyAsync(hpin + 2, pick_m, 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
             drafts[0] = hpin[2];
+        }
+        if (phase_timing) {
+            ph.draft1 += ms_since(tp);
+            tp = Clock::now();
         }
         int last_row = T0 - 1;   // the row of the previous MTP call whose output seeds the next draft
         for (int d = 1; d < D; ++d) {   // chained: (the block's own output, the last draft) at the next position
@@ -3124,6 +3184,10 @@ struct Engine {
             CK(cudaStreamSynchronize(st));
             drafts[(size_t) d] = hpin[2];
         }
+        if (phase_timing) {
+            ph.draft_n += ms_since(tp);
+            tp = Clock::now();
+        }
         // the verify window
         const int T = D + 1;
         hpin[16] = x_tok;
@@ -3136,6 +3200,10 @@ struct Engine {
         rows_deferred = false;
         CK(cudaMemcpyAsync(hpin + 2, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
+        if (phase_timing) {
+            ph.verify += ms_since(tp);
+            tp = Clock::now();
+        }
         int a;
         if (sample_row) {   // sampled: row t's pick is the draw of its position over its own history (q36_sampling.hpp)
             a = strata::q36::spec_accept(drafts.data(), D, picks, [&](int t) { return sample_row(t, drafts.data()); });
@@ -3149,7 +3217,43 @@ struct Engine {
         CK(cudaMemcpyAsync(hlast, hmain + (size_t) a * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
         pos += a + 1;
         after_rows(a + 1);
+        if (phase_timing && !warming) phase_step(tp, T, a);
         return a;
+    }
+    /// The accept part of a speculative step ended (commit, the kept row's state, the rebalance): add it up, and every
+    /// kPhaseSteps steps log the averages per step with what the step ran on (graph or eager).
+    void phase_step(Clock::time_point tp, int T, int kept) {
+        CK(cudaStreamSynchronize(st));
+        ph.accept += ms_since(tp);
+        ph.serve.add(sv);
+        ph.rows += T;
+        ph.kept += kept;
+        if (++ph.steps < kPhaseSteps) return;
+        const double n = (double) ph.steps;
+        std::fprintf(stderr, "strata-q36: phase timing over %lld steps (ms per step): draft 1 %.1f, chained drafts %.1f, verify window "
+                     "of %.1f rows %.1f, accept %.1f, drafts kept %.2f; CPU pool: main layers %.1f ms in %.0f calls with %.0f experts, "
+                     "MTP block %.1f ms in %.0f calls with %.0f experts; graph steps wait %.1f ms for the GPU, answer %.1f ms (PCIe "
+                     "staging %.1f), drain %.1f, in %.0f rings; graphs: use_graph %d, decode %d, MTP %d, verify window %d\n",
+                     ph.steps, ph.draft1 / n, ph.draft_n / n, (double) ph.rows / n, ph.verify / n, ph.accept / n, (double) ph.kept / n,
+                     ph.pool_ms[0] / n, (double) ph.pool_calls[0] / n, (double) ph.pool_jobs[0] / n, ph.pool_ms[1] / n,
+                     (double) ph.pool_calls[1] / n, (double) ph.pool_jobs[1] / n, ph.serve.ring / n, ph.serve.answer / n,
+                     ph.serve.staging / n, ph.serve.tail / n, (double) ph.serve.rings / n, (int) use_graph, gs().g1 != nullptr,
+                     gs().gm1 != nullptr, gs().gv[T] != nullptr);
+        ph = PhaseTimes{};
+    }
+    /// A plain decode window (run_rows) ended: the same split as phase_step's, for the step to compare a speculative one with.
+    void phase_window(Clock::time_point tp, int T) {
+        ph_plain.verify += ms_since(tp);
+        ph_plain.serve.add(sv);
+        ph_plain.rows += T;
+        if (++ph_plain.steps < kPhaseSteps) return;
+        const double n = (double) ph_plain.steps;
+        std::fprintf(stderr, "strata-q36: phase timing over %lld plain windows (ms per window): window of %.1f rows %.1f; CPU pool: "
+                     "%.1f ms in %.0f calls with %.0f experts; waits %.1f ms for the GPU, answers %.1f ms (PCIe staging %.1f), "
+                     "drains %.1f, in %.0f rings\n", ph_plain.steps, (double) ph_plain.rows / n, ph_plain.verify / n, ph_plain.pool_ms[0] / n,
+                     (double) ph_plain.pool_calls[0] / n, (double) ph_plain.pool_jobs[0] / n, ph_plain.serve.ring / n, ph_plain.serve.answer / n,
+                     ph_plain.serve.staging / n, ph_plain.serve.tail / n, (double) ph_plain.serve.rings / n);
+        ph_plain = PhaseTimes{};
     }
 
     /// The first prompt after load ran at about half speed (pp4096 rep 0: ~1770 tok/s against ~3290): the GPU's code
@@ -3420,7 +3524,11 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         CK(cudaMalloc(&H.slot_of_d, (size_t) ne * 4));
         CK(cudaMemcpy(H.slot_of_d, H.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice));
         if (!C::native_fmt(L.L.gu_type, L.L.d_type, g.n_embd, g.n_ff, H.fmt, err)) return false;
-        H.fmt.one_token_512 = true;   // IQ3_XXS gate/up for a lone token and IQ4_XS down on AVX-512: the same rows alone and in a window
+        // IQ3_XXS gate/up for a lone token and IQ4_XS down on AVX-512: the same rows alone and in a window.  Opt-in: on the
+        // real AVX-512 CPU of the Ornith box they run slower than ggml-cpu's dots (native_expert_ff1024_test --bench: gate/up
+        // 416 ns per row against 327, IQ4_XS down 138 against 29), so the default is the Flash-Next selection
+        static const bool one_token = std::getenv("STRATA_Q36_ONE_TOKEN_CPU") != nullptr;
+        H.fmt.one_token_512 = one_token;
         if (H.fmt.up_off != L.L.up_off || H.fmt.down_off != L.L.down_off || H.fmt.bytes != L.L.bytes) {
             err = "the CPU and GPU expert layouts differ";
             return false;
@@ -3484,6 +3592,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             for (const Layer& L : m.layers) sum += (double) L.L.bytes;
             E.pcie_auto.on = true;
             E.pcie_auto.min_share = 0.0;   // (Flash-Next's 0.10 floor would keep sending a share a slow link cannot carry)
+            E.pcie_auto.max_share = 0.95;  // (Flash-Next's 0.60 cap leaves 18 to 25% of Ornith's experts on a CPU pool at ~625 us each)
             E.pcie_auto.link_gbps = link_gbps;
             E.pcie_auto.blob_bytes = sum / (double) m.layers.size();
         }
