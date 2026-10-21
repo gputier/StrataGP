@@ -40,6 +40,7 @@
 #include "q36_pcie.hpp"
 #include "q36_rebalance.hpp"
 #include "q36_sampling.hpp"
+#include "q36_stats.hpp"
 #if defined(STRATA_Q36_CPU_POOL)
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -1485,6 +1486,25 @@ struct Engine {
     /// --expert-profile: the profile the slots started from (main layers only; empty: none), kept for --expert-profile-save
     std::vector<std::pair<int32_t, int32_t>> profile_prior;
     double hy_cpu_ms = 0;
+    // STRATA_Q36_STATS=1 (q36_stats.hpp): the bytes each path reads, the host's wait on the doorbell, the experts' union over
+    // consecutive tokens; every use below is behind stats_on, so a run without the switch reads no clock and adds no sync
+    const bool stats_on = strata::q36::stats_enabled();
+    strata::q36::DecodeStats stat_acc;
+    strata::q36::ExpertUnion stat_union;
+    std::vector<char> stat_hit_mark;   // per expert: counted as a resident expert read by this layer step
+    /// The accumulated counters now, the pool's included (the request's figures are the difference of two snapshots).
+    strata::q36::DecodeStats stat_snapshot() const {
+        strata::q36::DecodeStats d = stat_acc;
+#if defined(STRATA_Q36_CPU_POOL)
+        if (pool) {
+            d.cpu_bytes = pool->multi_bytes;
+            d.pool_gu_ms = pool->ms_multi_gu;
+            d.pool_q_ms = pool->ms_multi_q;
+            d.pool_down_ms = pool->ms_multi_down;
+        }
+#endif
+        return d;
+    }
     // decode / verify rows: their routing is counted once the rows are kept (commit), so a verify window's rejected
     // drafts never move the slots; a single session's slots follow the counts at every kRebalanceEvery-th position
     // exactly (a window never steps over one), so plain and speculative decoding see the same slot tables at every
@@ -1495,8 +1515,11 @@ struct Engine {
     void count_rows(int n) {
         const int Kp = (int) m->top_k;
         for (size_t li = 0; li < row_ids.size() && li < hy.size(); ++li)
-            if (!row_ids[li].empty())
+            if (!row_ids[li].empty()) {
                 for (int e = 0; e < n * Kp; ++e) hy[li].count((size_t) row_ids[li][(size_t) e], 1.0);
+                if (stats_on)
+                    for (int r = 0; r < n; ++r) stat_union.add(li, row_ids[li].data() + (size_t) r * Kp);
+            }
     }
     /// After a decode step / verify window: the PCIe share refined from the pool's speed (PcieAuto, Flash-Next's rule: three
     /// updates at most, after 48 then 96 and 96 more windows).
@@ -2576,6 +2599,15 @@ struct Engine {
         hy_cpu += n_miss - n_pcie_ent;
         hy_pcie += n_pcie_ent;
         hy_gpu += n_ent - n_miss;
+        if (stats_on) {   // the resident experts read once per layer step (the grouped kernel), the staged blobs; the pool counts its own
+            stat_hit_mark.assign((size_t) g.n_expert, 0);
+            for (int e = 0; e < n_ent; ++e)
+                if (!h_miss[e] && !stat_hit_mark[(size_t) h_ids[e]]) {
+                    stat_hit_mark[(size_t) h_ids[e]] = 1;
+                    stat_acc.gpu_bytes += (long long) L.stride;
+                }
+            stat_acc.pcie_bytes += (long long) n_pcie * (long long) L.stride;
+        }
         if (n_miss == 0) return 0;
         if (!jobs.empty()) {
             pool->run_split_multi_native(H.fmt, jobs.data(), (int) jobs.size());
@@ -2608,9 +2640,14 @@ struct Engine {
             if (pcie_on) pcie_call(layer_at((int) li), n_ent);
             return;
         }
+        const auto w0 = stats_on ? Clock::now() : Clock::time_point();
         while (cudaEventQuery(ev_route) == cudaErrorNotReady) {
         }
-        if (hy_cpu_compute(li, T) == 0) return;
+        if (stats_on) stat_wait(li, ms_since(w0));
+        const auto s0 = stats_on ? Clock::now() : Clock::time_point();
+        const int served = hy_cpu_compute(li, T);
+        if (stats_on) stat_acc.serve_ms += ms_since(s0);
+        if (served == 0) return;
         CK(cudaMemcpyAsync(ecpu, cpu_out, (size_t) n_ent * N * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(d_miss, h_miss, (size_t) n_ent * 4, cudaMemcpyHostToDevice, st));
         k_merge_cpu<<<n_ent, kThreads, 0, st>>>(eparts, ecpu, d_miss, N);
@@ -2628,6 +2665,13 @@ struct Engine {
                                  d_pc + kPlanGroups, d_pc + kPlanDst, d_pc + kPlanTok, kPcieSlots, n_ent, xq, escr, eparts,
                                  st, kPcieGroupRows);
     }
+    /// The host waited `ms` for the GPU to publish layer `li`'s routing (stats only).
+    void stat_wait(size_t li, double ms) {
+        if (stat_acc.wait_layer_ms.size() <= li) stat_acc.wait_layer_ms.resize(li + 1, 0.0);
+        stat_acc.wait_layer_ms[li] += ms;
+        stat_acc.wait_ms += ms;
+        ++stat_acc.steps;
+    }
     /// After the launch: answers the graph's hybrid layers in capture order.  Ring k is the k-th layer's: the GPU has
     /// published its routing when the sequence word reaches k, the pool's rows are in place when the flag is set to k.
     void hy_serve(const std::vector<HyStep>& steps) {
@@ -2635,7 +2679,9 @@ struct Engine {
         uint32_t ring = 0;
         for (const HyStep& step : steps) {
             ++ring;
+            const auto w0 = stats_on ? Clock::now() : Clock::time_point();
             const auto w = db.wait_ring(ring, [&] { return cudaStreamQuery(st) == cudaErrorNotReady; }, std::chrono::seconds(20));
+            if (stats_on) stat_wait(step.li, ms_since(w0));
             if (w != strata::q36::RingWait::Rang) {
                 db.release();   // no wait kernel may outlive the engine
                 const cudaError_t qe = cudaStreamQuery(st);   // a stream in error ends the wait too: say the CUDA error
@@ -2645,7 +2691,9 @@ struct Engine {
                                  : "did not ring in 20 s");
                 std::exit(1);
             }
+            const auto s0 = stats_on ? Clock::now() : Clock::time_point();
             hy_cpu_compute(step.li, step.T);
+            if (stats_on) stat_acc.serve_ms += ms_since(s0);
             db.answer(ring);
         }
         CK(cudaStreamSynchronize(st));
@@ -3382,6 +3430,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             return false;
         }
     }
+    if (E.stats_on)
+        std::fprintf(stderr, "strata-q36: stats: the expert arena (%.2f GiB) is %s\n", (double) host / (1024.0 * 1024.0 * 1024.0),
+                     pinned ? "cudaHostAlloc memory (pinned, default flags, no large pages)"
+                            : "malloc memory (cudaHostAlloc failed, not pinned)");
     size_t off = 0;
     E.hy.resize(all.size());
     for (size_t li = 0; li < all.size(); ++li) {
@@ -4049,6 +4101,8 @@ struct Serve {
         std::vector<int32_t> hist = ids;
         const auto d0 = Clock::now();
         const long long hc0 = E.hy_cpu, hg0 = E.hy_gpu, hs0 = E.hy_swaps, hp0 = E.hy_pcie;   // the hybrid counters at the start of the decode
+        const strata::q36::DecodeStats stat0 = E.stats_on ? E.stat_snapshot() : strata::q36::DecodeStats();
+        if (E.stats_on) E.stat_union.reset(E.m->layers.size(),(int) E.m->top_k);
         long long produced = 0, offered = 0, accepted = 0;
         const char* finish = "length";
         // requests alone with the MTP block: speculative steps of mtp_d drafts, verified (greedy: the greedy text; sampled:
@@ -4161,6 +4215,11 @@ struct Serve {
             std::fprintf(stderr, "strata serve: session %d: experts on the GPU %.1f%% (%lld of %lld rows), over PCIe %.1f%% "
                          "(%lld), on the CPU %.1f%% (%lld), %lld slot replacements, PCIe share %.2f\n", s, pct(hg), hg, hn,
                          pct(hp), hp, pct(hcpu), hcpu, E.hy_swaps - hs0, E.pcie_num / 256.0);
+            if (E.stats_on) {
+                const strata::q36::DecodeStats d = E.stat_snapshot() - stat0;
+                std::fprintf(stderr, "%s\n%s\n%s\n", strata::q36::format_decode_stats(s, d, produced).c_str(),
+                             strata::q36::format_wait_layers(s, d).c_str(), strata::q36::format_union(s, E.stat_union).c_str());
+            }
         }
     }
 
