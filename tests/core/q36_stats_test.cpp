@@ -54,6 +54,9 @@ int main() {
         a.pool_gu_ms = 700;
         a.pool_q_ms = 100;
         a.pool_down_ms = 300;
+        a.pcie_demand = 250;
+        a.pf_issued = 400;
+        a.pf_hits = 300;
         a.wait_layer_ms = {10, 20};
         b.wait_ms = 10;
         b.serve_ms = 20;
@@ -64,6 +67,9 @@ int main() {
         b.pool_gu_ms = 200;
         b.pool_q_ms = 50;
         b.pool_down_ms = 100;
+        b.pcie_demand = 50;
+        b.pf_issued = 200;
+        b.pf_hits = 120;
         b.wait_layer_ms = {4, 5};
         const DecodeStats d = a - b;
         check(near(d.wait_ms, 20) && near(d.serve_ms, 30) && d.steps == 100, "the difference of the waits and steps");
@@ -74,6 +80,8 @@ int main() {
         check(has(line, "session 3: stats: pool 750 ms (gate/up 500, quantize 50, down 200)"), "the pool ms by phase");
         check(has(line, "6.00 GB read, 8.57 GB/s over the row phases (8.00 over all three)"), "the bytes read and the pool GB/s");
         check(has(line, "GPU 0.0 MB, PCIe 0.0 MB, CPU 60.0 MB (100 tokens)"), "the bytes per token by path");
+        check(has(line, "PCIe blobs per token: on demand 2.00, prefetched 2.00, prefetch hits 1.80 (90.0% of the prefetched)"),
+              "the PCIe blobs by token: on demand, prefetched, hits and the hit rate");
         check(has(line, "host wait on the doorbell 20 ms over 100 layer steps (200.0 us each)"), "the doorbell wait");
         check(has(format_decode_stats(0, DecodeStats(), 0), "(0 tokens)"), "no token, no division by zero");
         check(has(format_wait_layers(3, d), "by layer (ms): 6.0 15.0"), "the wait by layer line");

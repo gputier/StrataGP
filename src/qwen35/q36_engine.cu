@@ -19,6 +19,7 @@
 // Options: --kv fp32|q4 (the K / V cache format), --rope-scaling none|linear|yarn with --rope-scale F and
 // --rope-orig-ctx N (the GGUF's rope.scaling.* keys when absent).
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/core/dma_batch.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/family_layout.hpp"
 #include "strata/core/pcie_share.hpp"
@@ -631,6 +632,12 @@ __global__ void k_put_rows(float* x, const float* img, const int32_t* map, int n
     const int m = map[r];
     if (m < 0) return;
     for (int i = threadIdx.x; i < n; i += blockDim.x) x[(size_t) r * n + i] = img[(size_t) m * n + i];
+}
+
+/// The prefetch's predicted ids to the host's mapped memory; the fence orders them before the doorbell the next launch rings.
+__global__ void k_publish_ids(const int32_t* __restrict__ ids, volatile int32_t* out, int n) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) out[i] = ids[i];
+    __threadfence_system();
 }
 
 /// The prompt's routed entries sorted by expert for MMQ: bounds[x] .. bounds[x + 1] are expert x's rows; sorted row r
@@ -1481,6 +1488,16 @@ struct Engine {
     uint8_t* pc_stage = nullptr;   // kPcieSlots blobs of pc_blob bytes
     size_t pc_blob = 0;
     cudaStream_t pcs = nullptr;    // the staging copies (the host issues them, the graph never waits for them)
+    // the prefetch (q36_pcie.hpp): while layer L - 1 is served, the blobs layer L is predicted to send over PCIe are copied on
+    // pfs into the staging area's region of L's parity (pf_ids: its experts in slot order, pf_layer: the layer they are for),
+    // ev_pf[par] marks the region's last copy; the predicted ids come from the router of L applied to L - 1's input
+    bool pf_on = false;
+    cudaStream_t pfs = nullptr;
+    cudaEvent_t ev_pf[2] = {};
+    int32_t pf_ids[2][strata::q36::kPrefetchSlots] = {};
+    int pf_n[2] = {0, 0}, pf_layer[2] = {-1, -1};
+    float *logits_pf = nullptr, *pred_w = nullptr;
+    int32_t *d_pred = nullptr, *h_pred = nullptr, *d_h_pred = nullptr;
     int32_t *pc_plan = nullptr, *d_pc_plan = nullptr, *d_pc = nullptr;   // the plan: mapped (host, device) and its device copy
     std::vector<char> pc_mark;     // per expert: sent over PCIe by this call
     /// --expert-profile: the profile the slots started from (main layers only; empty: none), kept for --expert-profile-save
@@ -2312,6 +2329,7 @@ struct Engine {
         const int64_t n_ent = (int64_t) T * Kp;
         const int32_t* prow = nullptr;
         if (hy_rows) {
+            if (pf_predicts(li, T)) pf_predict(li, T);
             moe_hybrid_gpu(L, li, T);
         } else if (T > kGemmT && use_mmq) {
             // a prompt chunk: the experts on llama.cpp's MMQ (int8, the weights read once per expert): the entries
@@ -2517,6 +2535,54 @@ struct Engine {
         ++stream_pos;
     }
 
+    /// The PCIe copies as q36 submits them: one cudaMemcpyBatchAsync per group (Flash-Next's STRATA_DMA_BATCH path,
+    /// core/dma_batch.hpp), on unless STRATA_DMA_BATCH=0.  Flash-Next's own default stays its own (a copy of the same
+    /// blobs, the same destinations, one submission).
+    static int dma_mode() {
+        static const int mode = [] {
+            const char* e = std::getenv("STRATA_DMA_BATCH");
+            return e != nullptr && e[0] != '\0' ? std::atoi(e) : 1;
+        }();
+        return mode;
+    }
+    uint8_t* pf_region(int par) const { return pc_stage + (size_t) (strata::q36::kPcieSlots + par * strata::q36::kPrefetchSlots) * pc_blob; }
+    /// Layer li + 1's picks are predicted at layer li: the layer ahead is a hybrid main layer and a step this wide has a share.
+    bool pf_predicts(size_t li, int T) const {
+        return pf_on && li + 1 < m->layers.size() && lhy(li + 1) && (int64_t) T * m->top_k <= strata::q36::kPcieMaxEntries;
+    }
+    /// The graph's part of the prefetch: layer li + 1's router on layer li's input, the top-k of it to the host's mapped memory
+    /// (before the routing of li rings the doorbell, so the host finds both when it serves li).
+    void pf_predict(size_t li, int T) {
+        const int N = (int) m->g.n_embd, Kp = (int) m->top_k;
+        f32mm(m->layers[li + 1].router, h, logits_pf, N, (int) m->g.n_expert, T);
+        K::native_router_topk(logits_pf, d_pred, pred_w, (int) m->g.n_expert, Kp, T, st);
+        k_publish_ids<<<1, 256, 0, st>>>(d_pred, d_h_pred, T * Kp);
+    }
+    /// The host's part, while it serves layer li: the predicted picks of li + 1 (the real rule on the predicted routing, at
+    /// most kPrefetchSlots) start copying into li + 1's region.  That region was last read by the PCIe call of li - 1,
+    /// which ran before the routing of li was published.  Returns the blobs issued.
+    int pf_issue(size_t li, int n_ent) {
+        const size_t nx = li + 1;
+        const int par = (int) (nx & 1);
+        const Layer& Ln = m->layers[nx];
+        const int n = strata::q36::pcie_pick(h_pred, n_ent, hy[nx].slot_of, pcie_num, pf_ids[par], nullptr, strata::q36::kPrefetchSlots);
+        pf_n[par] = n;
+        pf_layer[par] = (int) nx;
+        if (n == 0) return 0;
+        void* dst[strata::q36::kPrefetchSlots];
+        const void* src[strata::q36::kPrefetchSlots];
+        size_t bytes[strata::q36::kPrefetchSlots];
+        for (int j = 0; j < n; ++j) {
+            dst[j] = pf_region(par) + (size_t) j * pc_blob;
+            src[j] = Ln.hblobs + (size_t) pf_ids[par][j] * Ln.stride;
+            bytes[j] = Ln.stride;
+        }
+        CK(strata::core::copy_blobs(dst, src, bytes, (size_t) n, pfs, dma_mode()));
+        CK(cudaEventRecord(ev_pf[par], pfs));
+        (void) cudaStreamQuery(pfs);   // submits the copies to the GPU (on WDDM the driver batches until asked)
+        return n;
+    }
+
     /// The GPU half of a hybrid MoE: the routing to the host, the resident experts' entries grouped and run.
     void moe_hybrid_gpu(const Layer& L, size_t li, int T) {
         const auto& g = m->g;
@@ -2568,19 +2634,36 @@ struct Engine {
         pc_want += want;
         pc_sent += n_pcie;
         std::fill(pc_mark.begin(), pc_mark.end(), 0);
+        // a pick whose blob the prefetch already put in this layer's region is not copied again: the plan's group points at it
+        const int par = (int) (li & 1);
+        int pf_slot[strata::q36::kPcieSlots];
+        const int hits = strata::q36::pcie_prefetch_match(picked, n_pcie, pf_ids[par], pf_layer[par] == (int) li ? pf_n[par] : 0, pf_slot);
+        void* cdst[strata::q36::kPcieSlots];
+        const void* csrc[strata::q36::kPcieSlots];
+        size_t cbytes[strata::q36::kPcieSlots];
+        unsigned long long blob_ptr[strata::q36::kPcieSlots];
+        int n_copy = 0;
         for (int q = 0; q < n_pcie; ++q) {
             pc_mark[(size_t) picked[q]] = 1;
-            CK(cudaMemcpyAsync(pc_stage + (size_t) q * pc_blob, L.hblobs + (size_t) picked[q] * L.stride, L.stride,
-                               cudaMemcpyHostToDevice, pcs));
+            const uint8_t* at = pf_slot[q] >= 0 ? pf_region(par) + (size_t) pf_slot[q] * pc_blob : pc_stage + (size_t) q * pc_blob;
+            blob_ptr[q] = (unsigned long long) (uintptr_t) at;
+            if (pf_slot[q] >= 0) continue;
+            cdst[n_copy] = pc_stage + (size_t) q * pc_blob;
+            csrc[n_copy] = L.hblobs + (size_t) picked[q] * L.stride;
+            cbytes[n_copy] = L.stride;
+            ++n_copy;
         }
-        if (n_pcie > 0) (void) cudaStreamQuery(pcs);   // submits the copies to the GPU (on WDDM the driver batches until asked)
-        if (pcie_on) strata::q36::pcie_plan(h_ids, n_ent, Kp, picked, n_pcie, (unsigned long long) (uintptr_t) pc_stage,
-                                            (unsigned long long) pc_blob, pc_plan);
+        if (n_copy > 0) {
+            CK(strata::core::copy_blobs(cdst, csrc, cbytes, (size_t) n_copy, pcs, dma_mode()));
+            (void) cudaStreamQuery(pcs);   // submits the copies to the GPU (on WDDM the driver batches until asked)
+        }
+        const int n_pf = pf_predicts(li, T) ? pf_issue(li, n_ent) : 0;
+        if (pcie_on) strata::q36::pcie_plan(h_ids, n_ent, Kp, picked, n_pcie, blob_ptr, pc_plan);
         double launch_ms = 0.0;
         if (pa_on) {
             launch_ms = ms_since(l0);
             pa_launch_ms += launch_ms;
-            pa_blobs += n_pcie;
+            pa_blobs += n_copy + n_pf;
         }
         int n_pcie_ent = 0;
         for (int e = 0; e < n_ent; ++e) {
@@ -2621,6 +2704,9 @@ struct Engine {
                     stat_acc.gpu_bytes += (long long) L.stride;
                 }
             stat_acc.pcie_bytes += (long long) n_pcie * (long long) L.stride;
+            stat_acc.pcie_demand += n_copy;
+            stat_acc.pf_issued += n_pf;
+            stat_acc.pf_hits += hits;
         }
         if (n_miss == 0) return 0;
         if (!jobs.empty()) {
@@ -2631,7 +2717,8 @@ struct Engine {
             hy_cpu_jobs += (long long) jobs.size();
             if (pa_on) pa_cpu_ms += built_ms + pool->ms_multi_gu + pool->ms_multi_q + pool->ms_multi_down - rows_ms;
         }
-        if (n_pcie > 0) CK(cudaStreamSynchronize(pcs));   // the share is in staging before the layer is answered
+        if (n_copy > 0) CK(cudaStreamSynchronize(pcs));   // the share is in staging before the layer is answered
+        if (hits > 0) CK(cudaEventSynchronize(ev_pf[par]));
         return n_miss;
 #else
         (void) li;
@@ -3305,9 +3392,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     // copies go when even so the slots win.  Ornith (IQ3_XXS / IQ4_XS, 13.55 GiB free): 3.80 GiB of copies = 55 -> 76 slots
     // per layer of 256, 10.4% fewer missed experts against 2.3%.  No profile or timing: a fixed rule from the two numbers.
     constexpr double kPackedGain = 0.023;   // arch_defaults.cpp: STRATA_Q8_PACKED, "+2.3% (S26)"
-    // the PCIe share's staging region (q36_pcie.hpp): kPcieSlots blobs of the widest layer's stride; --pcie-frac 0 is off.  The
+    // the PCIe share's staging area (q36_pcie.hpp): kPcieStageBlobs blobs of the widest layer's stride (the layer's own slots and the
+    // prefetch's two regions); --pcie-frac 0 is off.  The
     // estimate counts it before main_hybrid is known; the real size (pcie_bytes) drops it when only the MTP block is hybrid
-    const size_t pcie_stage = pcie_frac != 0.0 ? (size_t) strata::q36::kPcieSlots * pc_blob + kMmqTail : 0;
+    const size_t pcie_stage = pcie_frac != 0.0 ? (size_t) strata::q36::kPcieStageBlobs * pc_blob + kMmqTail : 0;
     const size_t fixed_est = (E.use_mmq ? max_layer + max_main + 2 * kMmqTail : 0) + pcie_stage;
     const auto slots_in = [&](size_t room) {
         return room > reserve + fixed_est ? std::min<size_t>((size_t) ne, (room - reserve - fixed_est) / per_slot) : (size_t) 0;
@@ -3543,6 +3631,16 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         CK(cudaMalloc(&E.pc_stage, pcie_bytes));
         CK(cudaMemset(E.pc_stage, 0, pcie_bytes));
         CK(cudaStreamCreateWithFlags(&E.pcs, cudaStreamNonBlocking));
+        E.pf_on = std::getenv("STRATA_Q36_NO_PREFETCH") == nullptr && m.layers.size() > 1;   // the staging area is the same size without it
+        if (E.pf_on) {
+            CK(cudaStreamCreateWithFlags(&E.pfs, cudaStreamNonBlocking));
+            for (cudaEvent_t& ev : E.ev_pf) CK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+            CK(cudaMalloc(&E.logits_pf, T * (size_t) ne * 4));
+            CK(cudaMalloc(&E.pred_w, T * Kp * 4));
+            CK(cudaMalloc(&E.d_pred, T * Kp * 4));
+            CK(cudaHostAlloc((void**) &E.h_pred, T * Kp * 4, cudaHostAllocMapped));
+            CK(cudaHostGetDevicePointer((void**) &E.d_h_pred, E.h_pred, 0));
+        }
         CK(cudaHostAlloc((void**) &E.pc_plan, (size_t) strata::q36::kPlanWords * 4, cudaHostAllocMapped));
         CK(cudaHostGetDevicePointer((void**) &E.d_pc_plan, E.pc_plan, 0));
         std::memset(E.pc_plan, 0, (size_t) strata::q36::kPlanWords * 4);

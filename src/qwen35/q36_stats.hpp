@@ -95,6 +95,9 @@ struct DecodeStats {
     std::vector<double> wait_layer_ms;   // wait_ms by layer
     long long gpu_bytes = 0, pcie_bytes = 0, cpu_bytes = 0;
     double pool_gu_ms = 0, pool_q_ms = 0, pool_down_ms = 0;   // the pool's gate/up rows, intermediate quantization, down rows
+    long long pcie_demand = 0;   // PCIe blobs copied when their layer asked (the layer's picks the prefetch did not hold)
+    long long pf_issued = 0;     // blobs the prefetch copied ahead (the next layer's predicted picks)
+    long long pf_hits = 0;       // picks of a layer step served from the prefetch (no copy)
 };
 
 inline DecodeStats operator-(const DecodeStats& a, const DecodeStats& b) {
@@ -110,26 +113,32 @@ inline DecodeStats operator-(const DecodeStats& a, const DecodeStats& b) {
     d.pool_gu_ms = a.pool_gu_ms - b.pool_gu_ms;
     d.pool_q_ms = a.pool_q_ms - b.pool_q_ms;
     d.pool_down_ms = a.pool_down_ms - b.pool_down_ms;
+    d.pcie_demand = a.pcie_demand - b.pcie_demand;
+    d.pf_issued = a.pf_issued - b.pf_issued;
+    d.pf_hits = a.pf_hits - b.pf_hits;
     return d;
 }
 
 /// GB/s of `bytes` over `ms` (0 with no time).
 inline double gbps(long long bytes, double ms) { return ms > 0 ? (double) bytes / 1e9 / (ms / 1e3) : 0.0; }
 
-/// The pool, bytes and doorbell line of a request that produced `tokens` tokens.
+/// The pool, bytes and doorbell line of a request that produced `tokens` tokens, then the PCIe blobs by token: copied on
+/// demand, prefetched ahead, and the picks the prefetch served (the hit rate is over the prefetched blobs).
 inline std::string format_decode_stats(int session, const DecodeStats& d, long long tokens) {
     const double t = tokens > 0 ? (double) tokens : 1.0;
-    char b[1024];
+    char b[1280];
     std::snprintf(b, sizeof b,
                   "strata serve: session %d: stats: pool %.0f ms (gate/up %.0f, quantize %.0f, down %.0f), %.2f GB read, "
                   "%.2f GB/s over the row phases (%.2f over all three); bytes per token: GPU %.1f MB, PCIe %.1f MB, CPU %.1f MB "
                   "(%lld tokens); host wait on the doorbell %.0f ms over %lld layer steps (%.1f us each), host serving %.0f ms "
-                  "(%.1f us each)",
+                  "(%.1f us each); PCIe blobs per token: on demand %.2f, prefetched %.2f, prefetch hits %.2f (%.1f%% of the prefetched)",
                   session, d.pool_gu_ms + d.pool_q_ms + d.pool_down_ms, d.pool_gu_ms, d.pool_q_ms, d.pool_down_ms,
                   (double) d.cpu_bytes / 1e9, gbps(d.cpu_bytes, d.pool_gu_ms + d.pool_down_ms),
                   gbps(d.cpu_bytes, d.pool_gu_ms + d.pool_q_ms + d.pool_down_ms), (double) d.gpu_bytes / 1e6 / t,
                   (double) d.pcie_bytes / 1e6 / t, (double) d.cpu_bytes / 1e6 / t, tokens, d.wait_ms, d.steps,
-                  d.steps ? 1e3 * d.wait_ms / (double) d.steps : 0.0, d.serve_ms, d.steps ? 1e3 * d.serve_ms / (double) d.steps : 0.0);
+                  d.steps ? 1e3 * d.wait_ms / (double) d.steps : 0.0, d.serve_ms,
+                  d.steps ? 1e3 * d.serve_ms / (double) d.steps : 0.0, (double) d.pcie_demand / t, (double) d.pf_issued / t,
+                  (double) d.pf_hits / t, d.pf_issued ? 100.0 * (double) d.pf_hits / (double) d.pf_issued : 0.0);
     return b;
 }
 

@@ -22,9 +22,10 @@ std::vector<int> slots16() {
     return v;
 }
 
-std::vector<int32_t> pick(const std::vector<int32_t>& ids, int num, const std::vector<int>& slot_of, int* announced = nullptr) {
+std::vector<int32_t> pick(const std::vector<int32_t>& ids, int num, const std::vector<int>& slot_of, int* announced = nullptr,
+                          int cap = kPcieSlots) {
     int32_t out[kPcieSlots] = {};
-    const int m = strata::q36::pcie_pick(ids.data(), (int) ids.size(), slot_of, num, out, announced);
+    const int m = strata::q36::pcie_pick(ids.data(), (int) ids.size(), slot_of, num, out, announced, cap);
     return std::vector<int32_t>(out, out + m);
 }
 }  // namespace
@@ -82,19 +83,49 @@ int main() {
         const std::vector<int32_t> t = {5, 9, 12, 0, 12, 14, 5, 1};
         const int32_t picked[2] = {12, 14};
         std::vector<int32_t> plan((size_t) kPlanWords, -7);
-        strata::q36::pcie_plan(t.data(), (int) t.size(), 4, picked, 2, 0x7000000000ull, 5210112ull, plan.data());
+        const unsigned long long ptr[2] = {0x7000000000ull, 0x7000000000ull + 5210112ull};
+        strata::q36::pcie_plan(t.data(), (int) t.size(), 4, picked, 2, ptr, plan.data());
         unsigned long long p0 = 0, p1 = 0;
         std::memcpy(&p0, plan.data() + kPlanPtr, 8);
         std::memcpy(&p1, plan.data() + kPlanPtr + 2, 8);
         check(plan[kPlanGroups] == 2, "two groups");
-        check(p0 == 0x7000000000ull && p1 == 0x7000000000ull + 5210112ull, "group q's blob is the staging region's slot q");
+        check(p0 == ptr[0] && p1 == ptr[1], "group q's blob is the address given for q");
         check(plan[kPlanStart] == 0 && plan[kPlanStart + 1] == 2 && plan[kPlanStart + 2] == 3,
               "expert 12 has entries 0 and 1, expert 14 entry 2 (starts 0, 2, 3)");
         check(plan[kPlanDst] == 2 && plan[kPlanDst + 1] == 4 && plan[kPlanDst + 2] == 5,
               "the entries' rows: token * top_k + k (2, 4 and 5)");
         check(plan[kPlanTok] == 0 && plan[kPlanTok + 1] == 1 && plan[kPlanTok + 2] == 1, "the entries' tokens (0, 1, 1)");
-        strata::q36::pcie_plan(t.data(), (int) t.size(), 4, picked, 0, 0x7000000000ull, 5210112ull, plan.data());
+        strata::q36::pcie_plan(t.data(), (int) t.size(), 4, picked, 0, ptr, plan.data());
         check(plan[kPlanGroups] == 0 && plan[kPlanStart] == 0, "no share: an empty plan the graph's call passes over");
+    }
+
+    std::printf("prefetch:\n");
+    {
+        static_assert(kPcieStageBlobs == kPcieSlots + 2 * kPrefetchSlots, "the staging area holds the layer's slots and two regions");
+        static_assert(kPrefetchSlots <= kPcieSlots, "a region is no wider than the layer's own slots");
+        // layer L-1 predicts layer L's picks 7, 9, 12; layer L then picks 9, 12, 14
+        const std::vector<int> s16 = slots16();
+        const std::vector<int32_t> predicted = {5, 7, 9, 12, 5, 1};
+        int32_t pf[kPrefetchSlots] = {};
+        const int pf_n = strata::q36::pcie_pick(predicted.data(), (int) predicted.size(), s16, 192, pf, nullptr, kPrefetchSlots);
+        check(pf_n == 3 && pf[0] == 7 && pf[1] == 9 && pf[2] == 12, "the prefetch takes the last 3 of the 4 predicted misses (192 / 256)");
+        check(pick({5, 7, 9, 12, 5, 9, 12, 14}, 256, s16, nullptr, 2) == std::vector<int32_t>({12, 14}), "a cap of 2 keeps the last two");
+        const int32_t real[3] = {9, 12, 14};
+        int slot[3] = {};
+        check(strata::q36::pcie_prefetch_match(real, 3, pf, pf_n, slot) == 2 && slot[0] == 1 && slot[1] == 2 && slot[2] == -1,
+              "9 and 12 are in the region at slots 1 and 2, 14 is not: one copy on demand");
+        check(strata::q36::pcie_prefetch_match(real, 3, pf, 0, slot) == 0 && slot[0] == -1 && slot[1] == -1 && slot[2] == -1,
+              "an empty region matches nothing");
+        const int32_t other[2] = {3, 8};
+        check(strata::q36::pcie_prefetch_match(other, 2, pf, pf_n, slot) == 0, "a wrong prediction matches nothing and costs only its copy");
+        // the plan points the prefetched groups at the region, the on-demand group at its own slot
+        const std::vector<int32_t> t = {9, 12, 14, 0};
+        const unsigned long long ptr[3] = {0x7000000000ull + 1 * 100, 0x7000000000ull + 2 * 100, 0x6000000000ull};
+        std::vector<int32_t> plan((size_t) kPlanWords, -7);
+        strata::q36::pcie_plan(t.data(), (int) t.size(), 4, real, 3, ptr, plan.data());
+        unsigned long long p2 = 0;
+        std::memcpy(&p2, plan.data() + kPlanPtr + 4, 8);
+        check(p2 == ptr[2] && plan[kPlanGroups] == 3 && plan[kPlanStart + 3] == 3, "the on-demand group keeps its own slot's address");
     }
 
     std::printf("PcieAuto (Flash-Next's rule):\n");
