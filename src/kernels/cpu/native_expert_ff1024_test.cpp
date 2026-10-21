@@ -7,13 +7,15 @@
 // kNativeMaxFF wide (they were FF = 640, so rows 640..1023 landed in the next token's buffer).  native_fmt refuses
 // an expert wider than kNativeMaxFF.
 //
-// NativeFmt::one_token_512 (the q36 engine sets it under STRATA_Q36_ONE_TOKEN_CPU): on an AVX-512 CPU IQ3_XXS gate/up serve a lone token with the
-// AVX-512 kernel and an IQ4_XS down is served by it for any token count.  Those rows share ggml-cpu's integer sums and
-// differ only in the order of the float additions, so the test bounds them against ggml's dot (kMaxRatio, max abs
-// error over the largest reference value) and requires a token's rows to be the same alone and in a group.  Where the
-// CPU has no AVX-512 (or STRATA_NO_IQ512 / STRATA_IQ_MT_MIN is set) the flag changes nothing and the rows are ggml's or
-// the AVX-2 kernels'; the test prints which path it took.  `--bench` adds ns per row, ggml's dot against the rows with
-// the flag off and on, one token, over more expert bytes than a last-level cache holds.
+// NativeFmt::one_token_512 (the q36 engine sets it under STRATA_Q36_ONE_TOKEN_CPU): on an AVX-512 CPU IQ3_XXS gate/up
+// serve a lone token with the AVX-512 kernel and an IQ4_XS down is served by it for any token count.  Those rows share
+// ggml-cpu's integer sums and differ only in the order of the float additions, so the test bounds them against ggml's
+// dot (kMaxRatio, max abs error over the largest reference value) and requires a token's rows to be the same alone and
+// in a group.  Where the CPU has no AVX-512 (or STRATA_NO_IQ512 / STRATA_IQ_MT_MIN is set) the flag changes nothing for
+// IQ3_XXS gate/up and IQ4_XS down: their rows are ggml's.  An IQ4_NL down is different: with the flag, and without
+// STRATA_IQ_MT_MIN or STRATA_NO_IQ4NL, a lone token goes to the AVX-2 kernel instead of ggml (native_expert.cpp, nl_min).
+// The test prints which path it took.  `--bench` adds ns per row, ggml's dot
+// against the rows with the flag off and on, one token, over more expert bytes than a last-level cache holds.
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -283,7 +285,7 @@ void bench_pair(int gu_type, int d_type) {
     f.one_token_512 = true;
     const double dn_on = ns_per_row([&](int e) { cpu::native_down_rows(f, blob[(size_t) e].data(), hp, 1, op, 0, (int) kH); }, (int) kH);
     std::printf("  %-14s one token, ns per row (gate+up pair / down row), %d experts x %d passes, AVX-512 rows %s:\n", name.c_str(), kBenchExperts, kBenchReps,
-                path_512() ? "available" : "NOT available here (the flag changes nothing)");
+                path_512() ? "available" : "NOT available here (IQ3_XXS and IQ4_XS rows stay ggml's; an IQ4_NL down still takes the AVX-2 kernel)");
     std::printf("  %-14s   gate/up: ggml %.0f, flag off %.0f, flag on %.0f  (on / ggml %.2f)\n", name.c_str(), gu_ggml, gu_off, gu_on, gu_on / gu_ggml);
     std::printf("  %-14s   down:    ggml %.0f, flag off %.0f, flag on %.0f  (on / ggml %.2f)\n", name.c_str(), dn_ggml, dn_off, dn_on, dn_on / dn_ggml);
 }

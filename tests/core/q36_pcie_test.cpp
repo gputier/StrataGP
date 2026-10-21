@@ -58,8 +58,9 @@ int main() {
         for (int i = 0; i < 8; ++i) top8.push_back(100 + i);
         int announced = 0;
         const std::vector<int32_t> got = pick(top8, strata::core::pcie_num_of(0.95), std::vector<int>(256, -1), &announced);
-        check(strata::core::pcie_num_of(0.95) == 243 && got.size() == 7 && announced == 7 && 8 < kPcieSlots,
+        check(strata::core::pcie_num_of(0.95) == 243 && got.size() == 7 && announced == 7,
               "a share of 0.95 at one token of top-8 is not cut by the staging region");
+        static_assert(8 < kPcieSlots, "the eight experts of a token fit the staging region");
         check(kPcieMaxEntries / 8 == 32, "kPcieMaxEntries holds 32 rows of top-8");
     }
     check(pick(ids, 85, s16) == std::vector<int32_t>({14}), "the count rounds down: 5 misses x 85 / 256 = 1.66 is 1");
@@ -148,7 +149,7 @@ int main() {
                 a.on = true;
                 a.link_gbps = 54.0;
                 a.blob_bytes = 4.08e6;
-                if (cap != 0.60) a.max_share = cap;   // (the default is Flash-Next's 0.60)
+                a.max_share = cap;
                 a.mark(0.0, 0);
                 double tc = 0.0, rate = 0.0, ms = 0.0, got = -1.0;
                 int64_t jobs = 0;
