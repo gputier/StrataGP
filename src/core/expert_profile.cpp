@@ -56,6 +56,12 @@ bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_ex
         err = "read_expert_profile: the header claims more ranked pairs than slots";
         return false;
     }
+    // a ranking holds each (layer, expert) pair at most once: a larger count is a damaged header, refused before it sizes an allocation
+    if ((int64_t) want > n_layers * n_expert) {
+        std::fclose(f);
+        err = "read_expert_profile: the header claims more slots than the model has experts";
+        return false;
+    }
     ranked.assign(n_ranked, {0, 0});
     std::vector<uint16_t> raw((size_t) n_ranked * 2);
     if (n_ranked > 0 && std::fread(raw.data(), 2, (size_t) n_ranked * 2, f) != (size_t) n_ranked * 2) {

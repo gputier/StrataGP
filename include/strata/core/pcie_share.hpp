@@ -94,6 +94,9 @@ inline double pcie_frac_for_gbps(double gbps, double base) {
     return gbps <= 0.0 ? base : base * std::min(1.0, gbps / 20.0);
 }
 
+// A share as the 256ths the expert dispatch carries (rounded, clamped to 0 .. 256).
+inline int pcie_num_of(double frac) { return std::max(0, std::min(256, (int) (frac * 256.0 + 0.5))); }
+
 // 0.1.42, CUDA single-GPU serve, no --pcie-frac: the share refined from what the CPU pool measures in the first decode
 // windows.  The balance share of the missed experts is link / (link + CPU rate).  The link is the start-up probe; the CPU
 // rate is the expert bytes over the pool's wall time per missed expert (ExpertDispatch::ms_run / multi_misses), which the
@@ -105,6 +108,7 @@ struct PcieAuto {
     static constexpr double kPoolFactor = 1.85;
     bool on = false;
     double link_gbps = 0.0, blob_bytes = 0.0;
+    double min_share = 0.10;       ///< the lowest share a refinement may set (Flash-Next's 0.10; an engine that can do without the share passes 0)
     double mark_ms = 0.0;
     int64_t mark_jobs = 0;
     double acc_ms = 0.0;
@@ -130,7 +134,7 @@ struct PcieAuto {
         if (++updates >= 3) on = false;
         if (!(tc > 1.0) || !(blob_bytes > 0.0) || !(link_gbps > 0.0)) return -1.0;
         const double r = blob_bytes / (tc * 1e-6) / 1e9;
-        const double f = std::min(0.60, std::max(0.10, std::round(link_gbps / (link_gbps + kPoolFactor * r) * 20.0) / 20.0));
+        const double f = std::min(0.60, std::max(min_share, std::round(link_gbps / (link_gbps + kPoolFactor * r) * 20.0) / 20.0));
         *tc_us = tc;
         *rate = r;
         return std::fabs(f - cur) < 0.025 ? -1.0 : f;

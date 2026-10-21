@@ -14,9 +14,12 @@
 // CPU has no AVX-512 (or STRATA_NO_IQ512 / STRATA_IQ_MT_MIN is set) the flag changes nothing and the rows are ggml's or
 // the AVX-2 kernels'; the test prints which path it took.  `--bench` adds ns per row, ggml's dot against the rows with
 // the flag off and on, one token, over more expert bytes than a last-level cache holds.
+#include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
+
+#include "native_expert_test_util.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -36,22 +39,12 @@ namespace cpu = strata::kernels::cpu;
 
 namespace {
 constexpr int64_t kH = 3072, kFF = 1024;   // n_embd, expert width
-constexpr int kMaxT = 3;
+constexpr int kMaxT = cpu::MAXT;   // the widest group an expert serves: every token count the kernels split on
 constexpr double kMaxRatio = 1e-6;   // max |row - ggml row| / max |ggml row|: float addition order only (see above)
 
 // whether native_gu_rows / native_down_rows take the AVX-512 rows for a flagged layer on this CPU and environment
 bool path_512() {
     return cpu::cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr && std::getenv("STRATA_IQ_MT_MIN") == nullptr;
-}
-
-// random bytes, then a sane fp16 scale at the front of every block (the i-quants and Q8_0 start their block with it)
-void fill_blocks(uint8_t* p, size_t bytes, int type, std::mt19937_64& rng) {
-    for (size_t i = 0; i < bytes; ++i) p[i] = (uint8_t) rng();
-    const size_t bs = ggml_type_size((ggml_type) type);
-    for (size_t o = 0; o + bs <= bytes; o += bs) {
-        const ggml_fp16_t h = ggml_fp32_to_fp16((0.5f + (float) (rng() >> 40) * (1.f / 16777216.f)) * 1e-3f);
-        std::memcpy(p + o, &h, 2);
-    }
 }
 
 double rel(const std::vector<float>& a, const std::vector<float>& b) {

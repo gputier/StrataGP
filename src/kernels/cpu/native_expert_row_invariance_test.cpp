@@ -3,7 +3,7 @@
 // of several rows, where an expert chosen by two or more rows is one multi-token job; if the two take different kernels,
 // the same row rounds differently in the two paths and a near-tie greedy pick flips between MTP 0 and MTP 2.
 // The format is set the way the q36 engine sets it (NativeFmt::one_token_512), at Ornith's layer pairs and geometry
-// (n_embd 3072, width 1024): each row of an nt = 2 or 3 call against the same token alone, bit for bit, for gate/up and
+// (n_embd 3072, width 1024): each row of an nt = 2 .. MAXT call against the same token alone, bit for bit, for gate/up and
 // for down.  On an AVX-512 CPU that proves the q36 rows are the same alone and in a group (IQ3_XXS gate/up, IQ4_XS down
 // and IQ4_NL down all take the one-token kernels).  On a CPU without AVX-512 the IQ3_XXS gate/up is ggml-cpu's dot for one
 // token and the AVX-2 kernel from two tokens on, so the test is expected to fail there: it only exercises the q36 rows
@@ -11,7 +11,10 @@
 // exercising a kernel choice.
 // It prints which kernels the CPU offers.
 // No GPU, no model: random blocks with sane scales and random activations quantized the way the engine quantizes them.
+#include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+
+#include "native_expert_test_util.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -27,18 +30,8 @@ namespace cpu = strata::kernels::cpu;
 
 namespace {
 constexpr int64_t kH = 3072, kFF = 1024;   // n_embd, expert width
-constexpr int kMaxT = 3;                   // a verify window of three rows
+constexpr int kMaxT = cpu::MAXT;           // every group size an expert serves (a verify window holds three rows today)
 constexpr int kExperts = 6;
-
-// random bytes, then a sane fp16 scale at the front of every block (the i-quants and Q8_0 start their block with it)
-void fill_blocks(uint8_t* p, size_t bytes, int type, std::mt19937_64& rng) {
-    for (size_t i = 0; i < bytes; ++i) p[i] = (uint8_t) rng();
-    const size_t bs = ggml_type_size((ggml_type) type);
-    for (size_t o = 0; o + bs <= bytes; o += bs) {
-        const ggml_fp16_t h = ggml_fp32_to_fp16((0.5f + (float) (rng() >> 40) * (1.f / 16777216.f)) * 1e-3f);
-        std::memcpy(p + o, &h, 2);
-    }
-}
 
 // how many floats differ at all (bit patterns) between a group's row and the same token alone
 size_t differing(const float* a, const float* b, size_t n) {

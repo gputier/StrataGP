@@ -3,8 +3,9 @@
 // ggml-cpu's x86 dot products for these formats are AVX2 and single-token: every token re-decodes the weights
 // and a sign is applied with five instructions per 32 values.  Here 64 values are decoded once (8 or 16 grid
 // lookups, one 64-bit sign mask, one vector of scales) and every token applies them with a masked subtract, a
-// `maddubs` and a `madd`.  The arithmetic is ggml's (ggml-cpu/quants.c, the `_generic` references): integer sums
-// per block, times d_x * d_y * the format's constant - only the order of the float additions differs.
+// `maddubs` and a `madd`.  The arithmetic is that of ggml's x86 dot products (ggml-cpu/arch/x86/quants.c, not the
+// `_generic` references, which round each sub-block): integer sums per block, times d_x * d_y * the format's
+// constant - only the order of the float additions differs.
 //
 // Formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22), and IQ4_XS (23) in iq512_rows only (a down
 // projection: an IQ4_XS gate/up stays on ggml-cpu here).  IQ1_M stays on ggml-cpu (no shipped model has IQ1_M expert
@@ -160,7 +161,7 @@ template <> struct Fmt<23> {   // IQ4_XS: d, scales_h, scales_l[4], qs[128] - 13
     // (values 0-15) and the high nibbles (values 16-31) of the sub-block: lanes [lo(2j), hi(2j), lo(2j+1), hi(2j+1)],
     // the order of the activation bytes.  The codebook sign goes to the activation (the mask), |w| to maddubs.
     // Every sum is an integer below 2^24 (|maddubs pair| <= 2*127*128, |ls - 32| <= 32, four chunks), so the float
-    // conversion in row_dot is exact: the row differs from ggml-cpu's dot only in the order of the float additions.
+    // conversion in row_dot is exact: the row differs from ggml's x86 dot (arch/x86/quants.c) only in the order of the float additions.
     static constexpr int bytes = 136;
     static constexpr float K = 1.0f;
     static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {

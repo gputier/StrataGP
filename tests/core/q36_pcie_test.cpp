@@ -1,6 +1,7 @@
 // tests/core/q36_pcie_test.cpp - the PCIe share of strata-q36's hybrid mode, no GPU: which missed experts go over PCIe
 // (src/qwen35/q36_pcie.hpp), the plan the graph's PCIe call reads, and the share's start and refinement
 // (include/strata/core/pcie_share.hpp, shared with Flash-Next).
+#include "check.hpp"
 #include "q36_pcie.hpp"
 
 #include "strata/core/pcie_share.hpp"
@@ -11,12 +12,6 @@
 #include <vector>
 
 namespace {
-int g_fail = 0;
-void check(bool ok, const char* what) {
-    std::printf("  %-100s %s\n", what, ok ? "ok" : "FAIL");
-    if (!ok) ++g_fail;
-}
-
 using strata::q36::kPcieMaxEntries;
 using strata::q36::kPcieSlots;
 
@@ -27,9 +22,9 @@ std::vector<int> slots16() {
     return v;
 }
 
-std::vector<int32_t> pick(const std::vector<int32_t>& ids, int num, int cap, const std::vector<int>& slot_of) {
+std::vector<int32_t> pick(const std::vector<int32_t>& ids, int num, const std::vector<int>& slot_of, int* announced = nullptr) {
     int32_t out[kPcieSlots] = {};
-    const int m = strata::q36::pcie_pick(ids.data(), (int) ids.size(), slot_of, num, cap, out);
+    const int m = strata::q36::pcie_pick(ids.data(), (int) ids.size(), slot_of, num, out, announced);
     return std::vector<int32_t>(out, out + m);
 }
 }  // namespace
@@ -43,23 +38,31 @@ int main() {
     const std::vector<int> s16 = slots16();
     // misses in routing order: 5, 7, 9, 12, 14 (0, 2 and 3 are resident)
     const std::vector<int32_t> ids = {5, 0, 7, 9, 2, 12, 14, 3};
-    check(pick(ids, 0, kPcieSlots, s16).empty(), "a share of 0 sends nothing");
-    check(pick(ids, 128, kPcieSlots, s16) == std::vector<int32_t>({12, 14}),
+    check(pick(ids, 0, s16).empty(), "a share of 0 sends nothing");
+    check(pick(ids, 128, s16) == std::vector<int32_t>({12, 14}),
           "half of 5 misses is 2: the LAST two in routing order");
-    check(pick(ids, 256, kPcieSlots, s16) == std::vector<int32_t>({5, 7, 9, 12, 14}), "a share of 1 sends every miss");
-    check(pick(ids, 256, 3, s16) == std::vector<int32_t>({9, 12, 14}), "the cap keeps the last ones");
-    check(pick(ids, 85, kPcieSlots, s16) == std::vector<int32_t>({14}), "the count rounds down: 5 misses x 85 / 256 = 1.66 is 1");
-    check(pick({5, 0, 7}, 85, kPcieSlots, s16).empty(), "two misses at a third: 0.66 is none");
+    check(pick(ids, 256, s16) == std::vector<int32_t>({5, 7, 9, 12, 14}), "a share of 1 sends every miss");
+    {
+        // 20 distinct misses at a share of 1: the staging region holds kPcieSlots, the LAST ones, and the share asked for 20
+        std::vector<int32_t> twenty;
+        for (int i = 0; i < 20; ++i) twenty.push_back(20 + i);
+        int announced = 0;
+        const std::vector<int32_t> got = pick(twenty, 256, std::vector<int>(64, -1), &announced);
+        check(got.size() == (size_t) kPcieSlots && got.front() == 24 && got.back() == 39 && announced == 20,
+              "the staging region's slots cap the count and keep the last ones; the share asked for 20");
+    }
+    check(pick(ids, 85, s16) == std::vector<int32_t>({14}), "the count rounds down: 5 misses x 85 / 256 = 1.66 is 1");
+    check(pick({5, 0, 7}, 85, s16).empty(), "two misses at a third: 0.66 is none");
     // two tokens routing the same experts: a miss counts once, at its first appearance
     const std::vector<int32_t> twice = {5, 7, 9, 12, 5, 9, 12, 14};
-    check(pick(twice, 128, kPcieSlots, s16) == std::vector<int32_t>({12, 14}),
+    check(pick(twice, 128, s16) == std::vector<int32_t>({12, 14}),
           "an expert routed twice is one miss, ordered by its first appearance (misses 5, 7, 9, 12, 14)");
-    check(pick({0, 1, 2, 3}, 256, kPcieSlots, s16).empty(), "resident experts are never sent");
+    check(pick({0, 1, 2, 3}, 256, s16).empty(), "resident experts are never sent");
     {
         std::vector<int32_t> many((size_t) kPcieMaxEntries + 1, 5);
-        check(pick(many, 256, kPcieSlots, s16).empty(), "more entries than the plan holds: no share");
+        check(pick(many, 256, s16).empty(), "more entries than the plan holds: no share");
     }
-    check(pick({99, -1, 5}, 256, kPcieSlots, s16) == std::vector<int32_t>({5}), "ids outside the experts are ignored");
+    check(pick({99, -1, 5}, 256, s16) == std::vector<int32_t>({5}), "ids outside the experts are ignored");
 
     std::printf("pcie_plan:\n");
     {
@@ -123,6 +126,28 @@ int main() {
         }
         check(got < 0.0 && !a.on, "the reading is within one step of the share: no change, and the third update ends it");
         check(a.window(ms + 1.0, jobs + 1000, 0.25, &tc, &rate) < 0.0, "after the third update it stays put");
+    }
+    {
+        // a 0.25 GB/s link against a pool at 10.2 GB/s balances at 0.013: Flash-Next's floor keeps 0.10, min_share 0 follows it
+        using strata::core::PcieAuto;
+        for (const double floor : {0.10, 0.0}) {
+            PcieAuto a;
+            a.on = true;
+            a.link_gbps = 0.25;
+            a.blob_bytes = 4.08e6;
+            if (floor == 0.0) a.min_share = 0.0;   // (the default is Flash-Next's 0.10)
+            a.mark(0.0, 0);
+            double tc = 0.0, rate = 0.0, ms = 0.0, got = -1.0;
+            int64_t jobs = 0;
+            for (int w = 1; w <= 48 && got < 0.0; ++w) {
+                ms += 40.0;
+                jobs += 100;
+                got = a.window(ms, jobs, 0.55, &tc, &rate);
+            }
+            char what[120];
+            std::snprintf(what, sizeof what, "a slow link's refined share is %.2f with a floor of %.2f", floor, floor);
+            check(std::abs(got - floor) < 1e-9, what);
+        }
     }
     std::printf("%s\n", g_fail ? "FAILED" : "all passed");
     return g_fail ? 1 : 0;

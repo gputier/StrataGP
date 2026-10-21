@@ -271,15 +271,16 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles and absolutises the weights once per
     // block instead of once per token; ggml-cpu's dot is single-token.  STRATA_NO_IQ4NL falls back to it.
     static const bool iq4nl_mt = std::getenv("STRATA_NO_IQ4NL") == nullptr;
-    static const int mt_min = [] { const char* e = std::getenv("STRATA_IQ_MT_MIN"); return e ? std::atoi(e) : 2; }();
+    static const bool mt_env = std::getenv("STRATA_IQ_MT_MIN") != nullptr;
+    static const int mt_min = mt_env ? std::atoi(std::getenv("STRATA_IQ_MT_MIN")) : 2;
     static const bool kq = [] { const char* v = std::getenv("STRATA_KQ256"); return v != nullptr && std::atoi(v) != 0; }();
     // IQ4_XS down rows on AVX-512, for the engines that ask (NativeFmt::one_token_512): iq512_rows decodes the nibbles and
     // the signed sub-scales once for all tokens, for any token count including one, so a token's rows are the same alone
-    // and in a verify window.  The integer sums are ggml-cpu's dot's exactly; only the order of the float additions
-    // differs (native_expert_ff1024_test bounds it).  ggml-cpu's dot otherwise, as before; STRATA_IQ_MT_MIN set is the
-    // first token count served, STRATA_NO_IQ512 drops the kernel.
-    static const int mt_min512 = [] { const char* e = std::getenv("STRATA_IQ_MT_MIN"); return e ? std::atoi(e) : 1; }();
-    if (f.one_token_512 && iq512_on() && nt >= mt_min512 && iq512_down_supported(f.d_type)) {
+    // and in a verify window.  The reference is ggml's x86 dot (ggml-cpu/arch/x86/quants.c): the same integer sums, one fused
+    // multiply-add per block; only the order of the float additions differs (native_expert_ff1024_test bounds it).  ggml-cpu's
+    // dot otherwise, as before (an IQ4_XS down never had another kernel); STRATA_IQ_MT_MIN set takes the kernel back, as
+    // it does the gate/up rows', and STRATA_NO_IQ512 drops it.
+    if (f.one_token_512 && !mt_env && iq512_on() && iq512_down_supported(f.d_type)) {
         iq512_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
@@ -292,7 +293,7 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     }
     // #152: the same rule as the gate/up rows; NativeFmt::one_token_512 serves a lone token too (the kernel's rows do not
     // depend on the token count), STRATA_IQ_MT_MIN set keeping its rule
-    const int nl_min = f.one_token_512 && std::getenv("STRATA_IQ_MT_MIN") == nullptr ? 1 : mt_min;
+    const int nl_min = f.one_token_512 && !mt_env ? 1 : mt_min;
     if (cpu_avx2_ok() && nt >= nl_min && f.d_type == 20 && iq4nl_mt) {
         iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;

@@ -34,20 +34,26 @@ inline constexpr int kPlanTok = kPlanDst + kPcieMaxEntries;
 inline constexpr int kPlanWords = kPlanTok + kPcieMaxEntries;
 
 /// The experts of one layer step that go over PCIe: the distinct missed experts in routing order (first appearance),
-/// the last (misses * pcie_num) >> 8 of them, at most `cap`.  `slot_of[x] < 0`: expert x has no VRAM slot.  Writes them
-/// to `picked` (in routing order) and returns how many.
-inline int pcie_pick(const int32_t* ids, int n_ent, const std::vector<int>& slot_of, int pcie_num, int cap, int32_t* picked) {
+/// the last (misses * pcie_num) >> 8 of them, at most kPcieSlots.  `slot_of[x] < 0`: expert x has no VRAM slot.  Writes them
+/// to `picked` (in routing order) and returns how many; `announced`, when given, gets the count the share asked for before
+/// the staging region's kPcieSlots cut it.  A step of more than kPcieMaxEntries entries gets no share (k_hy_split serves at
+/// most that many): kPcieMaxEntries / top_k rows, 32 at the top-8 of Ornith and Qwen3.6, so a --hybrid-rows above that
+/// runs its bigger batches on the CPU pool alone.
+inline int pcie_pick(const int32_t* ids, int n_ent, const std::vector<int>& slot_of, int pcie_num, int32_t* picked,
+                     int* announced = nullptr) {
+    if (announced != nullptr) *announced = 0;
     if (pcie_num <= 0 || n_ent <= 0 || n_ent > kPcieMaxEntries) return 0;
-    std::vector<char> seen(slot_of.size(), 0);
-    std::vector<int32_t> misses;
+    int32_t misses[kPcieMaxEntries];
+    int n_miss = 0;
     for (int e = 0; e < n_ent; ++e) {
         const int32_t x = ids[e];
-        if (x < 0 || (size_t) x >= slot_of.size() || seen[(size_t) x] || slot_of[(size_t) x] >= 0) continue;
-        seen[(size_t) x] = 1;
-        misses.push_back(x);
+        if (x < 0 || (size_t) x >= slot_of.size() || slot_of[(size_t) x] >= 0 || std::find(misses, misses + n_miss, x) != misses + n_miss) continue;
+        misses[n_miss++] = x;
     }
-    const int m = std::min<int>(std::min(cap, kPcieSlots), ((int) misses.size() * pcie_num) >> 8);
-    for (int q = 0; q < m; ++q) picked[q] = misses[misses.size() - (size_t) m + (size_t) q];
+    const int want = (n_miss * pcie_num) >> 8;
+    if (announced != nullptr) *announced = want;
+    const int m = std::min(kPcieSlots, want);
+    for (int q = 0; q < m; ++q) picked[q] = misses[n_miss - m + q];
     return m;
 }
 

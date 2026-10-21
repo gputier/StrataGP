@@ -1427,7 +1427,7 @@ struct Engine {
     // batch of up to hybrid_t rows runs its VRAM-resident experts on the GPU and the others on the CPU pool, side by
     // side; a bigger prompt chunk streams each layer's experts into a staging buffer for MMQ (two, double-buffered)
     struct Hy {
-        std::vector<int> slot_of, exp_in_slot;
+        std::vector<int> slot_of;
         std::vector<double> score;   // routing counts, decayed at each rebalance
         std::vector<double> heat;    // the routing counted since the start (--expert-profile-save), never decayed
         int32_t* slot_of_d = nullptr;
@@ -1473,6 +1473,7 @@ struct Engine {
     // the PCIe share of the missed experts (q36_pcie.hpp): hy_pcie = entries computed on the GPU from the staging region
     // (not counted in hy_cpu), hy_cpu_jobs = the pool's experts (one per expert and call), what PcieAuto reads
     long long hy_pcie = 0, hy_cpu_jobs = 0;
+    long long pc_want = 0, pc_sent = 0;   // PCIe groups the share asked for / the staging region let through, since the last log line
     bool pcie_on = false;          // the graph carries the PCIe call of each hybrid layer; fixed before the first capture
     int pcie_num = 0;              // the share of the missed experts, in 256ths (0 with pcie_on: nothing goes that way)
     strata::core::PcieAuto pcie_auto;
@@ -1485,8 +1486,9 @@ struct Engine {
     std::vector<std::pair<int32_t, int32_t>> profile_prior;
     double hy_cpu_ms = 0;
     // decode / verify rows: their routing is counted once the rows are kept (commit), so a verify window's rejected
-    // drafts never move the slots; the slots follow the counts at every kRebalanceEvery-th position exactly (a
-    // window never steps over one), so plain and speculative decoding see the same slot tables at every position
+    // drafts never move the slots; a single session's slots follow the counts at every kRebalanceEvery-th position
+    // exactly (a window never steps over one), so plain and speculative decoding see the same slot tables at every
+    // position; the batch windows (run_rows) rebalance every kRebalanceEvery-th window instead, positions being per session
     static constexpr int kRebalanceEvery = 32;
     bool rows_deferred = false;          // set while a decode step or a verify window runs
     std::vector<std::vector<int32_t>> row_ids;   // [main layer][row * top_k + k] of the last such call
@@ -1504,9 +1506,11 @@ struct Engine {
         const double nf = pcie_auto.window(hy_cpu_ms, hy_cpu_jobs, pcie_num / 256.0, &tc_us, &rate);
         if (nf < 0.0) return;
         std::fprintf(stderr, "strata-q36: PCIe share: the CPU pool takes %.0f us per missed expert (%.1f GB/s of expert bytes), "
-                     "the link %.1f GB/s -> %.2f (was %.2f; --pcie-frac N fixes it)\n", tc_us, rate, pcie_auto.link_gbps, nf,
-                     pcie_num / 256.0);
-        pcie_num = std::max(0, std::min(256, (int) (nf * 256.0 + 0.5)));
+                     "the link %.1f GB/s -> %.2f (was %.2f; --pcie-frac N fixes it); since the last update %lld of %lld announced "
+                     "groups went over PCIe (the staging region holds %d per layer step)\n", tc_us, rate, pcie_auto.link_gbps, nf,
+                     pcie_num / 256.0, pc_sent, pc_want, strata::q36::kPcieSlots);
+        pc_want = pc_sent = 0;
+        pcie_num = strata::core::pcie_num_of(nf);
     }
     void after_rows(int n) {   // a decode step / verify window kept n rows: count them, rebalance at the boundary
         if (!m->hybrid) return;
@@ -2528,7 +2532,10 @@ struct Engine {
         // the PCIe share: its experts leave the pool's jobs; their copies start now and run beside the pool, and the
         // plan the graph's PCIe call reads is written before the layer is answered (no share: an empty plan)
         int32_t picked[strata::q36::kPcieSlots];
-        const int n_pcie = pcie_on ? strata::q36::pcie_pick(h_ids, n_ent, H.slot_of, pcie_num, strata::q36::kPcieSlots, picked) : 0;
+        int want = 0;
+        const int n_pcie = pcie_on ? strata::q36::pcie_pick(h_ids, n_ent, H.slot_of, pcie_num, picked, &want) : 0;
+        pc_want += want;
+        pc_sent += n_pcie;
         std::fill(pc_mark.begin(), pc_mark.end(), 0);
         for (int q = 0; q < n_pcie; ++q) {
             pc_mark[(size_t) picked[q]] = 1;
@@ -2663,7 +2670,6 @@ struct Engine {
             const int s = H.slot_of[(size_t) w.out];
             H.slot_of[(size_t) w.out] = -1;
             H.slot_of[(size_t) w.in] = s;
-            H.exp_in_slot[(size_t) s] = w.in;
             CK(cudaMemcpyAsync(L.blobs + (size_t) s * L.stride, L.hblobs + (size_t) w.in * L.stride, L.L.bytes,
                                cudaMemcpyHostToDevice, st));
             changed[(size_t) w.layer] = 1;
@@ -3133,13 +3139,12 @@ struct Engine {
         int a;
         if (sample_row) {   // sampled: row t's pick is the draw of its position over its own history (q36_sampling.hpp)
             a = strata::q36::spec_accept(drafts.data(), D, picks, [&](int t) { return sample_row(t, drafts.data()); });
-            if (cancel != nullptr && cancel->load()) a = 0;
         } else {
             a = 0;
             while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
-            if (cancel != nullptr && cancel->load()) a = 0;
             for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
         }
+        if (cancel != nullptr && cancel->load()) a = 0;   // (picks[0] is row 0's pick either way)
         commit(a + 1);
         CK(cudaMemcpyAsync(hlast, hmain + (size_t) a * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
         pos += a + 1;
@@ -3171,7 +3176,7 @@ struct Engine {
             std::fill(H.score.begin(), H.score.end(), 0.0);
             std::fill(H.heat.begin(), H.heat.end(), 0.0);
         }
-        hy_cpu = hy_gpu = hy_swaps = hy_pcie = hy_cpu_jobs = 0;
+        hy_cpu = hy_gpu = hy_swaps = hy_pcie = hy_cpu_jobs = pc_want = pc_sent = 0;
         hy_cpu_ms = 0;
         pcie_auto.mark(0.0, 0);
         reset();
@@ -3234,8 +3239,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     // copies go when even so the slots win.  Ornith (IQ3_XXS / IQ4_XS, 13.55 GiB free): 3.80 GiB of copies = 55 -> 76 slots
     // per layer of 256, 10.4% fewer missed experts against 2.3%.  No profile or timing: a fixed rule from the two numbers.
     constexpr double kPackedGain = 0.023;   // arch_defaults.cpp: STRATA_Q8_PACKED, "+2.3% (S26)"
-    const size_t fixed_est = (E.use_mmq ? max_layer + max_main + 2 * kMmqTail : 0) +
-                             (pcie_frac != 0.0 ? (size_t) strata::q36::kPcieSlots * pc_blob + kMmqTail : 0);
+    // the PCIe share's staging region (q36_pcie.hpp): kPcieSlots blobs of the widest layer's stride; --pcie-frac 0 is off.  The
+    // estimate counts it before main_hybrid is known; the real size (pcie_bytes) drops it when only the MTP block is hybrid
+    const size_t pcie_stage = pcie_frac != 0.0 ? (size_t) strata::q36::kPcieSlots * pc_blob + kMmqTail : 0;
+    const size_t fixed_est = (E.use_mmq ? max_layer + max_main + 2 * kMmqTail : 0) + pcie_stage;
     const auto slots_in = [&](size_t room) {
         return room > reserve + fixed_est ? std::min<size_t>((size_t) ne, (room - reserve - fixed_est) / per_slot) : (size_t) 0;
     };
@@ -3315,7 +3322,12 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     namespace C = strata::kernels::cpu;
     m.hybrid = true;
     E.main_hybrid = !mtp_only;
-    E.hybrid_t = std::max(1, std::min(hybrid_t, E.use_mmq ? E.tmax : E.tmax));
+    // never below kGemmT: a batch of 2 .. kGemmT rows past hybrid_t would take the resident-experts path, which reads the
+    // blobs as if every expert were in VRAM
+    if (hybrid_t < Engine::kGemmT)
+        std::fprintf(stderr, "strata-q36: --hybrid-rows %d raised to %d (a batch of up to %d rows always runs on the slots and the pool)\n",
+                     hybrid_t, Engine::kGemmT, Engine::kGemmT);
+    E.hybrid_t = std::min(std::max(hybrid_t, Engine::kGemmT), E.tmax);
     if (!E.use_mmq) E.hybrid_t = E.tmax;   // no streamed prompt path: every batch on slots + the pool
     // the graphs (a decode step, a verify window) run the hybrid layers through the doorbell; a window over hybrid_t
     // rows would stream the layer's experts with host syncs in the middle, which a capture cannot hold
@@ -3324,9 +3336,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     // widest layer where its gate / up are Q4_K: 1.24 GiB against 0.97 GiB for a main layer on Ornith) is streamed alone,
     // so it only ever takes the first (stream_begin with one layer): the second holds a main layer
     const size_t staging = E.use_mmq && E.main_hybrid ? max_layer + max_main + 2 * kMmqTail : 0;
-    // the PCIe share's staging region (q36_pcie.hpp): kPcieSlots blobs of the widest layer's stride; the main layers' hybrid
-    // path only (the MTP block alone runs few rows).  --pcie-frac 0 is off.
-    const size_t pcie_bytes = pcie_frac != 0.0 && E.main_hybrid ? (size_t) strata::q36::kPcieSlots * pc_blob + kMmqTail : 0;
+    // the main layers' hybrid path only (the MTP block alone runs few rows)
+    const size_t pcie_bytes = E.main_hybrid ? pcie_stage : 0;
     // no --pcie-frac: the share the link's probed bandwidth gives (as Flash-Next's native packs: 0.55 on a 20 GB/s link or
     // faster), then refined from the pool's speed (PcieAuto); a probe that fails keeps the 0.55
     double link_gbps = -1.0;
@@ -3403,11 +3414,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         }
         Engine::Hy& H = E.hy[li];
         H.slot_of.assign((size_t) ne, -1);
-        H.exp_in_slot.assign((size_t) S, 0);
-        for (int s = 0; s < S; ++s) {
-            H.slot_of[(size_t) placed[(size_t) s]] = s;
-            H.exp_in_slot[(size_t) s] = placed[(size_t) s];
-        }
+        for (int s = 0; s < S; ++s) H.slot_of[(size_t) placed[(size_t) s]] = s;
         H.score.assign((size_t) ne, 0.0);
         H.heat.assign((size_t) ne, 0.0);
         CK(cudaMalloc(&H.slot_of_d, (size_t) ne * 4));
@@ -3452,7 +3459,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         }
     }
     E.pool = std::make_unique<C::ExpertPool>(threads);
-    if (pcie_bytes > 0 && !pinned) {
+    if (pcie_frac == 0.0) {
+        std::fprintf(stderr, "strata-q36: PCIe share off (--pcie-frac 0)\n");
+    } else if (pcie_bytes > 0 && !pinned) {
         std::fprintf(stderr, "strata-q36: the PCIe share is off: the experts are in pageable host memory\n");
     } else if (pcie_bytes > 0) {
         E.pcie_on = true;
@@ -3474,10 +3483,11 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             double sum = 0.0;
             for (const Layer& L : m.layers) sum += (double) L.L.bytes;
             E.pcie_auto.on = true;
+            E.pcie_auto.min_share = 0.0;   // (Flash-Next's 0.10 floor would keep sending a share a slow link cannot carry)
             E.pcie_auto.link_gbps = link_gbps;
             E.pcie_auto.blob_bytes = sum / (double) m.layers.size();
         }
-        E.pcie_num = std::max(0, std::min(256, (int) (frac * 256.0 + 0.5)));
+        E.pcie_num = strata::core::pcie_num_of(frac);
         if (pcie_frac >= 0.0)
             std::fprintf(stderr, "strata-q36: PCIe share %.2f of the missed experts (--pcie-frac)\n", frac);
         else if (link_gbps > 0.0)
@@ -3616,7 +3626,6 @@ struct Slot {
     int32_t x = 0;
     int64_t produced = 0, max_new = 0;
     Sampling smp;
-    std::mt19937_64 rng;
     std::vector<int32_t> hist;
     Clock::time_point t0;
     int32_t draft = 0;            // --batch-mtp: the MTP block's proposal for the token after `x`
@@ -3726,7 +3735,8 @@ struct Serve {
             int y0 = E.rows_pick[r0];
             if (sl.smp.needs_logits()) {
                 E.host_logits_row(r0, lg);
-                y0 = sample(lg, sl.smp, sl.hist, sl.rng);
+                std::mt19937_64 rng = draw_rng(sl.smp.seed, (uint64_t) ss.pos);   // (the window did not move ss.pos: the fed token's cell)
+                y0 = sample(lg, sl.smp, sl.hist, rng);
             }
             bool two = n == 2 && y0 == sl.draft && !is_eos(y0) && !sl.stop && sl.produced + 2 <= sl.max_new &&
                        ss.pos + 3 <= E.ctx;   // (ss.pos: the position of the slot's next token: the window did not move it)
@@ -3832,7 +3842,8 @@ struct Serve {
             int y;
             if (sl.smp.needs_logits()) {
                 E.host_logits_row((int) r, lg);
-                y = sample(lg, sl.smp, sl.hist, sl.rng);
+                std::mt19937_64 rng = draw_rng(sl.smp.seed, (uint64_t) (ss.pos - 1));   // (the step moved ss.pos: the fed token's cell is the one before)
+                y = sample(lg, sl.smp, sl.hist, rng);
             } else {
                 y = E.rows_pick[r];
             }
@@ -4030,7 +4041,6 @@ struct Serve {
             std::fflush(stdout);
             return;
         }
-        std::mt19937_64 rng(smp.seed);
         std::vector<int32_t> hist = ids;
         const auto d0 = Clock::now();
         const long long hc0 = E.hy_cpu, hg0 = E.hy_gpu, hs0 = E.hy_swaps, hp0 = E.hy_pcie;   // the hybrid counters at the start of the decode
@@ -4038,7 +4048,7 @@ struct Serve {
         const char* finish = "length";
         // requests alone with the MTP block: speculative steps of mtp_d drafts, verified (greedy: the greedy text; sampled:
         // each position's own draw, so the text is the one plain sampling gives for the seed); requests beside others,
-        // one token at a time
+        // one token at a time, drawn the same way (a seed gives one text alone or in a batch)
         const bool spec = E.mtp_d > 0 && !adm;
         std::vector<int32_t> fix, drafts;
         int32_t picks[16];
@@ -4046,7 +4056,8 @@ struct Serve {
         if (adm) {
             if (smp.needs_logits()) {
                 E.host_logits(lg);
-                nx = sample(lg, smp, hist, rng);
+                std::mt19937_64 r = draw_rng(smp.seed, (uint64_t) (E.pos - 1));
+                nx = sample(lg, smp, hist, r);
             }
             std::printf("T %d\n", nx);
             ++produced;
@@ -4064,7 +4075,6 @@ struct Serve {
                 sl.produced = 1;
                 sl.max_new = max_new;
                 sl.smp = smp;
-                sl.rng = rng;
                 sl.hist = hist;
                 sl.t0 = Clock::now();
                 ss.active = true;
@@ -4422,8 +4432,8 @@ int strata::qwen35::run(int argc, char** argv) {
         int64_t pslots = 0;
         std::string perr;
         if (strata::core::read_expert_profile(expert_profile, (int64_t) m.layers.size(), m.g.n_expert, E.profile_prior, pslots, perr))
-            std::fprintf(stderr, "strata-q36: expert profile %s: %zu ranked pairs, the slots start from it\n", expert_profile.c_str(),
-                         E.profile_prior.size());
+            std::fprintf(stderr, "strata-q36: expert profile %s: %zu ranked pairs, built for %lld slots, the slots start from it\n",
+                         expert_profile.c_str(), E.profile_prior.size(), (long long) pslots);
         else {
             E.profile_prior.clear();
             std::fprintf(stderr, "strata-q36: %s - the slots start with experts 0 .. S - 1\n", perr.c_str());

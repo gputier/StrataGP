@@ -34,11 +34,14 @@ struct NativeFmt {
     /// projection's FP32 output: gate * s_gate, up * s_up, down * s_down. Do not fold s_down into up: the hidden
     /// drops to ~1e-5 and its q8 block scale becomes an FP16 subnormal (expert error 2-12% instead of 1.1%).
     size_t tail_off = 0;
-    /// Set by an engine that wants the one-token AVX-512 expert rows: IQ3_XXS gate/up served by iq512_gu_rows for a
-    /// lone token too, and an IQ4_XS down served by iq512_rows for any token count.  Off (the default) keeps the
-    /// selection the Flash-Next path has always had: ggml-cpu's dot for one token, and for an IQ4_XS down always.
-    /// Their rows round differently from ggml-cpu's (only the order of the float additions), so it is a choice of
-    /// the engine, per layer, and STRATA_NO_IQ512=1 / STRATA_IQ_MT_MIN=2 still take it back.
+    /// Set by an engine that wants the one-token expert rows: IQ3_XXS gate/up served by iq512_gu_rows for a lone token
+    /// too, an IQ4_XS down served by iq512_rows for any token count, and an IQ4_NL down served by iq4nl256_down_rows (AVX-2)
+    /// for a lone token too.  Off (the default) keeps the selection the Flash-Next path has always had: ggml-cpu's dot
+    /// for one token, and for an IQ4_XS down always.  Their rows round differently from ggml-cpu's (only the order of the
+    /// float additions), so it is a choice of the engine, per layer.  STRATA_IQ_MT_MIN set takes all three back: the gate/up
+    /// and IQ4_NL rows go by that variable's token threshold as before, and an IQ4_XS down (which never had another kernel)
+    /// goes back to ggml-cpu's dot for any token count.  STRATA_NO_IQ512=1 alone takes back the two AVX-512 kernels
+    /// (IQ3_XXS gate/up, IQ4_XS down), STRATA_NO_IQ4NL=1 alone the IQ4_NL down.
     bool one_token_512 = false;
 };
 constexpr int kNvfp4Type = 40;

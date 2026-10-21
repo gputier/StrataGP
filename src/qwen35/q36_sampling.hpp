@@ -55,10 +55,11 @@ inline int sample(std::vector<float>& lg, const Sampling& s, const std::vector<i
     for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int) i;
     std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&](int a, int b) { return lg[a] > lg[b]; });
     idx.resize((size_t) kk);
+    // top_p and min_p cut the untempered distribution (llama.cpp's and Flash-Next's order); the temperature only shapes the draw
     std::vector<double> p(idx.size());
     const double mx = lg[(size_t) idx[0]];
     double sum = 0;
-    for (size_t i = 0; i < idx.size(); ++i) sum += (p[i] = std::exp((lg[(size_t) idx[i]] - mx) / s.temperature));
+    for (size_t i = 0; i < idx.size(); ++i) sum += (p[i] = std::exp((double) lg[(size_t) idx[i]] - mx));
     size_t keep = idx.size();
     double cum = 0;
     for (size_t i = 0; i < idx.size(); ++i) {
@@ -68,7 +69,7 @@ inline int sample(std::vector<float>& lg, const Sampling& s, const std::vector<i
     }
     keep = std::max<size_t>(1, keep);
     double tot = 0;
-    for (size_t i = 0; i < keep; ++i) tot += p[i];
+    for (size_t i = 0; i < keep; ++i) tot += (p[i] = std::exp(((double) lg[(size_t) idx[i]] - mx) / s.temperature));
     std::uniform_real_distribution<double> u(0.0, tot);
     double r = u(rng);
     for (size_t i = 0; i < keep; ++i) {

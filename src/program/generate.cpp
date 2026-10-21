@@ -332,6 +332,7 @@ bool refill_blocking() {
 using Clock = std::chrono::steady_clock;
 using strata::core::PcieAuto;
 using strata::core::pcie_frac_for_gbps;
+using strata::core::pcie_num_of;
 using strata::core::probe_pcie_h2d_gbps;
 
 // --pipeline-windows: every STRATA_PIPELINE_* test and tuning variable (THETA, FORCE_MISS, SWITCH, LOG, TRACE, DOOM_SKIP,
@@ -8283,7 +8284,6 @@ int main(int argc, char** argv) {
         auto stage_ver = [&](int st) -> strata::core::Verifier& {
             return st == 0 ? ver : split_same ? ver_same : stages[(size_t) st - 1]->ver;
         };
-        auto pcie_num_of = [](double f) { return std::max(0, std::min(256, (int) (f * 256.0 + 0.5))); };
         const int n_stages = split_devs.empty() ? 1 : (int) split_at.size() + 1;
         // --pipeline-windows (decided where the split was): two verifiers per stage, one for the even windows and one
         // for the odd ones, sharing one stream of their card, and a hand-off per parity - so stage 0 can run window
@@ -9252,7 +9252,7 @@ int main(int argc, char** argv) {
             strata::core::FileExpertSource* src;
             ~FsDetach() { la->set_foresight(nullptr); src->set_foresight_swap(nullptr); }
         } fs_detach{&lookahead, &src};
-        drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
+        drive.d.pcie_num = pcie_num_of(o.pcie_frac);
         const bool all_experts_resident = !host_res.empty() &&
             std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
         // STRATA_ROUTE_TAIL_SKIP: ON BY DEFAULT on CUDA builds (owner decision, 0.1.42) and on HIP gfx1200/gfx1201 (0.1.43): a missed expert that every token of
@@ -9330,8 +9330,7 @@ int main(int argc, char** argv) {
                          tc_us, rate, pcie_auto.link_gbps, nf, o.pcie_frac);
             o.pcie_frac = nf;
             req_pcie_frac = nf;
-            const auto num_of = [](double f) { return std::max(0, std::min(256, (int) (f * 256.0 + 0.5))); };
-            drive.d.pcie_num = num_of(nf);
+            drive.d.pcie_num = pcie_num_of(nf);
             split_drive.pcie_num[0] = drive.d.pcie_num;
             split_drive_b.pcie_num[0] = drive.d.pcie_num;
             for (int st = 1; st < n_stages; ++st) {
@@ -9339,7 +9338,7 @@ int main(int argc, char** argv) {
                 if (!(gs.link_gbps > 0.0)) continue;
                 gs.pcie_frac = std::min(0.60, std::max(0.10, std::round(gs.link_gbps / (gs.link_gbps +
                                    PcieAuto::kPoolFactor * rate) * 20.0) / 20.0));
-                split_drive.pcie_num[st] = num_of(gs.pcie_frac);
+                split_drive.pcie_num[st] = pcie_num_of(gs.pcie_frac);
                 split_drive_b.pcie_num[st] = split_drive.pcie_num[st];
                 std::fprintf(stderr, "strata serve: PCIe share: stage %d (link %.1f GB/s) -> pcie_frac %.2f\n", st + 1,
                              gs.link_gbps, gs.pcie_frac);
@@ -13164,7 +13163,7 @@ int main(int argc, char** argv) {
                                  want && !strata::aux_cpus::enabled() ? " (asked for, but no CPU is spare: see the start-up line)" : "");
             }
             ver.pause_pcie_balance(req_pcie_set);   // the measured costs keep across requests
-            drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
+            drive.d.pcie_num = pcie_num_of(req_pcie_frac);
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
             for (int st = 0; st < split_drive.n; ++st)
                 split_drive.pcie_num[st] = (st == 0 || split_same || req_pcie_frac != o.pcie_frac)

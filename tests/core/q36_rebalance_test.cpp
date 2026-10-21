@@ -1,6 +1,7 @@
 // tests/core/q36_rebalance_test.cpp - strata-q36's expert profile and global rebalance (src/qwen35/q36_rebalance.hpp), no GPU:
 // the choice of the slot replacements on a known set of counts (global best gain, the count and gain thresholds, the
 // budget), the slots' start from a profile, and the learned profile's round trip through the STRP file.
+#include "check.hpp"
 #include "q36_rebalance.hpp"
 
 #include "strata/core/expert_cache.hpp"
@@ -13,12 +14,6 @@
 #include <vector>
 
 namespace {
-int g_fail = 0;
-void check(bool ok, const char* what) {
-    std::printf("  %-90s %s\n", what, ok ? "ok" : "FAIL");
-    if (!ok) ++g_fail;
-}
-
 using strata::q36::LayerCounts;
 using strata::q36::SlotSwap;
 using Pair = std::pair<int32_t, int32_t>;

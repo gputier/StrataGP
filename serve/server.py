@@ -2699,7 +2699,8 @@ def parallel_args(cfg: dict, args: list[str]) -> list[str]:
 
 def profile_shape(path: str) -> tuple[int, int] | None:
     """An expert profile's (layers, experts per layer), from its header (tools/make_profile.py's format), or None
-    when the file is missing, is not one or is shorter than the pairs its header promises."""
+    when the file is missing, is not one, is not a version 1 profile (the only one the engines read) or is shorter than
+    the pairs its header promises."""
     try:
         with open(path, "rb") as f:
             head = f.read(24)
@@ -2708,8 +2709,8 @@ def profile_shape(path: str) -> tuple[int, int] | None:
         return None
     if len(head) < 24 or head[:4] != b"STRP":
         return None
-    _, nl, ne, _, n = struct.unpack("<5I", head[4:])
-    return (nl, ne) if size >= 24 + 4 * n else None
+    version, nl, ne, _, n = struct.unpack("<5I", head[4:])
+    return (nl, ne) if version == 1 and size >= 24 + 4 * n else None
 
 
 def learned_profile_args(cfg: dict, args: list[str]) -> list[str]:
