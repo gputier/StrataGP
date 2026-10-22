@@ -2,6 +2,7 @@
 // (src/qwen35/q36_pcie.hpp), the plan the graph's PCIe call reads, and the share's start and refinement
 // (include/strata/core/pcie_share.hpp, shared with Flash-Next).
 #include "check.hpp"
+#include "q36_delta.hpp"
 #include "q36_pcie.hpp"
 
 #include "strata/core/pcie_share.hpp"
@@ -325,6 +326,38 @@ int main() {
         bool same = true;
         for (int e = 0; e < 8; ++e) same = same && first_of_row(row_ids, e, 4) == want[e];
         check(same, "an entry repeating an earlier entry of its own row is not the first; another row's does not count");
+    }
+    std::printf("delta_avg_step:\n");
+    {
+        float mean = 0.0f;
+        int32_t count = 0;
+        const float ranges[4] = {8.0f, 4.0f, 6.0f, 2.0f};
+        const float want[4] = {8.0f, 6.0f, 6.0f, 5.0f};   // the cumulative mean after each range
+        bool same = true;
+        for (int i = 0; i < 4; ++i) {
+            delta_avg_step(mean, count, ranges[i]);
+            same = same && mean == want[i] && count == i + 1;
+        }
+        check(same, "the state is the cumulative mean of the ranges seen so far, the first range alone at the first step");
+
+        const float before = mean;
+        delta_avg_step(mean, count, std::nanf(""));
+        delta_avg_step(mean, count, INFINITY);
+        delta_avg_step(mean, count, -1.0f);
+        check(mean == before && count == 4, "a NaN, infinite or negative range leaves the state alone");
+
+        int32_t full = INT32_MAX;
+        float kept = 3.0f;
+        delta_avg_step(kept, full, 9.0f);
+        check(kept == 3.0f && full == INT32_MAX, "a full count stops the average instead of wrapping");
+
+        // the kernel ranks row t with the mean after rows 0 .. t: the same chain, split across calls, gives the same bits
+        float m1 = 0.0f, m2 = 0.0f;
+        int32_t c1 = 0, c2 = 0;
+        for (int i = 0; i < 4; ++i) delta_avg_step(m1, c1, ranges[i]);
+        for (int i = 0; i < 2; ++i) delta_avg_step(m2, c2, ranges[i]);
+        for (int i = 2; i < 4; ++i) delta_avg_step(m2, c2, ranges[i]);
+        check(m1 == m2 && c1 == c2, "rows split over two calls (a decode window, then the next) give the one-call state");
     }
     std::printf("%s\n", g_fail ? "FAILED" : "all passed");
     return g_fail ? 1 : 0;

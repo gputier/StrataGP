@@ -1815,6 +1815,14 @@ struct Engine {
             if (S[l]) CK(cudaMemsetAsync(S[l], 0, (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4, st));
         }
         CK(cudaMemsetAsync(hlast, 0, (size_t) g.n_embd * 4, st));
+        if (cache_prior > 0.0f) {
+            if (!delta_mean) {
+                delta_mean = dalloc_t<float>(m->layers.size() + 1);
+                delta_count = dalloc_t<int32_t>(m->layers.size() + 1);
+            }
+            CK(cudaMemsetAsync(delta_mean, 0, (m->layers.size() + 1) * sizeof(float), st));
+            CK(cudaMemsetAsync(delta_count, 0, (m->layers.size() + 1) * sizeof(int32_t), st));
+        }
         CK(cudaStreamSynchronize(st));
         pos = 0;
         sess[(size_t) cur].pos = 0;
@@ -1873,7 +1881,9 @@ struct Engine {
     // ---- decode kernels of this engine (q36_kernels.cuh), each the old kernel's bits (STRATA_Q36_VERIFY=1 compares)
     bool fast_k = std::getenv("STRATA_Q36_OLD_KERNELS") == nullptr;
     // routing options (--cache-prior, --ser), both off: they act in route_group's decode / verify windows (T <= 8) only
-    float cache_prior = 0.0f;   // the bias on resident experts' logits, in units of the token's logit range
+    float cache_prior = 0.0f;   // the bias on resident experts' logits, in units of the layer's Delta_avg (q36_delta.hpp)
+    float* delta_mean = nullptr;      // Delta_avg's state, one pair per layer (the MTP block last): only with --cache-prior,
+    int32_t* delta_count = nullptr;   // zeroed by reset()
     int ser_kmin = 8;           // the picks of rank >= ser_kmin are kept only above ser_t * the top probability
     float ser_t = 0.0f;
     bool verify_k = std::getenv("STRATA_Q36_VERIFY") != nullptr;
@@ -2089,10 +2099,15 @@ struct Engine {
             if (v_bad <= 20) std::fprintf(stderr, "strata-q36 VERIFY MISMATCH group (T %d, groups %d vs %d)\n", T, nn, no);
         }
     }
+    /// A prompt chunk route_group does not serve (T > 8) still feeds the hybrid layer's Delta_avg (--cache-prior only).
+    void delta_rows(size_t li, int T, int ld) {
+        if (delta_mean && fast_k && T > 8 && lhy(li) && m->g.n_expert == 256 && m->top_k == 8)
+            q36k::k_delta_rows<<<1, dim3(32, 8), 0, st>>>(logits_r, T, ld, delta_mean + li, delta_count + li);
+    }
     bool grouped_by_route = false;   // route_group already filled the group arrays of this layer
     /// The router's top-k and the grouping of the picks in one launch (T <= 8, 256 experts, 8 picks); the logits are in logits_r.
     /// `slot_of`: the hybrid mode's slot table (null: every expert resident).  Returns false when the old kernels must run.
-    bool route_group(const Layer& L, const int32_t* slot_of, int T, int ld) {
+    bool route_group(const Layer& L, size_t li, const int32_t* slot_of, int T, int ld) {
         const int Kp = (int) m->top_k;
         grouped_by_route = false;
         if (!fast_k || T > 8 || m->g.n_expert != 256 || Kp != 8) return false;
@@ -2100,11 +2115,12 @@ struct Engine {
         if (slot_of) {
             const auto kern = opt ? q36k::k_route_group<true, true> : q36k::k_route_group<true, false>;
             kern<<<1, dim3(32, 8), 0, st>>>(logits_r, ids, ewts, T, ld, slot_of, L.blobs, L.stride, grp_ptr, grp_start, n_groups,
-                                            ent_dst, ent_tok, cache_prior, ser_kmin, ser_t);
+                                            ent_dst, ent_tok, cache_prior, ser_kmin, ser_t, delta_mean ? delta_mean + li : nullptr,
+                                            delta_count ? delta_count + li : nullptr);
         } else {
             const auto kern = opt ? q36k::k_route_group<false, true> : q36k::k_route_group<false, false>;
             kern<<<1, dim3(32, 8), 0, st>>>(logits_r, ids, ewts, T, ld, nullptr, L.blobs, L.stride, grp_ptr, grp_start, n_groups,
-                                            ent_dst, ent_tok, cache_prior, ser_kmin, ser_t);
+                                            ent_dst, ent_tok, cache_prior, ser_kmin, ser_t, nullptr, nullptr);
         }
         grouped_by_route = true;
         if (verify_k && !opt) {
@@ -2334,8 +2350,11 @@ struct Engine {
         // (its prompt pass too: no staging buffers then)
         const bool hy_rows = lhy(li) && (T <= hybrid_t || !main_hybrid);
         const bool mmq_rows = !hy_rows && T > kGemmT && use_mmq;
-        if (!(!mmq_rows && route_group(L, hy_rows ? hy[li].slot_of_d : nullptr, T, ext ? (int) g.n_expert + 1 : (int) g.n_expert)))
+        const int ld_r = ext ? (int) g.n_expert + 1 : (int) g.n_expert;
+        if (!(!mmq_rows && route_group(L, li, hy_rows ? hy[li].slot_of_d : nullptr, T, ld_r))) {
             K::native_router_topk(logits_r, ids, ewts, (int) g.n_expert, Kp, T, st);
+            delta_rows(li, T, ld_r);
+        }
         const int64_t n_ent = (int64_t) T * Kp;
         const int32_t* prow = nullptr;
         if (hy_rows) {
