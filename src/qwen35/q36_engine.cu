@@ -42,6 +42,7 @@
 #include "q36_rebalance.hpp"
 #include "q36_sampling.hpp"
 #include "q36_stats.hpp"
+#include "q36_threads.hpp"
 #if defined(STRATA_Q36_CPU_POOL)
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -3629,7 +3630,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             CK(cudaEventRecord(E.ev_used[b], E.st));
         }
     }
-    E.pool = std::make_unique<C::ExpertPool>(threads);
+    E.pool = std::make_unique<C::ExpertPool>(strata::q36::pool_workers(threads, (int) C::detect_cpu_topology(true).worker_cores.size()));
     if (pcie_frac == 0.0) {
         std::fprintf(stderr, "strata-q36: PCIe share off (--pcie-frac 0)\n");
     } else if (pcie_bytes > 0 && !pinned) {
@@ -4462,7 +4463,7 @@ static bool resolve_rope(Model& m, const std::string& type_opt, double scale_opt
 
 int strata::qwen35::run(int argc, char** argv) {
     std::string model, tokens, force, dump_full, emb_file;
-    int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
+    int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = -1, hybrid_rows = 128;   // cpu_threads < 0: q36_threads.hpp's default
     double expert_vram = -1.0;
     float cache_prior = 0.0f, ser_t = 0.0f;   // routing options, off
     int ser_kmin = 8;
