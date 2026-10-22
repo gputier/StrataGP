@@ -4,6 +4,7 @@
 // real activations (STRATA_Q36_VERIFY=1, --no-graph).
 #pragma once
 
+#include "q36_delta.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 
@@ -324,9 +325,10 @@ __global__ void k_group_small(const int32_t* ids, int n_ent, int K_, const int32
 /// route_topk<256, 8> (native_router.cu, copied: the same expressions) for n_tok <= 8 tokens (one warp each) and, in the same
 /// launch, k_group_small's grouping of the picks.  block (32, 8).  HY as k_group_small.
 /// OPT (routing options, off by default; OPT = false is the plain top-k, the arithmetic above untouched):
-///  - cache_prior (HY only): the experts with a VRAM slot get cache_prior * (max - min of the token's logits) added to the
-///    logit the ranking uses (arXiv 2412.00099, Eq. 9 with the token's own range as Delta); the weights stay the unbiased
-///    softmax's, renormalised over the picks.
+///  - cache_prior (HY only): the experts with a VRAM slot get cache_prior * Delta_avg added to the logit the ranking uses
+///    (arXiv 2412.00099, Eq. 9); Delta_avg is the layer's running mean of max(z) - min(z) (delta_avg_step), kept in this
+///    layer's delta_mean / delta_count and updated here, row by row in order: row t ranks with the mean after rows 0 .. t.
+///    The weights stay the unbiased softmax's, renormalised over the picks.
 ///  - SER (ser_kmin, ser_t; ik_llama.cpp PR 239): the pick of rank >= ser_kmin is kept only if its probability exceeds
 ///    ser_t * the top probability.  A dropped pick becomes a copy of the first pick's id with weight 0 (the expert is read
 ///    once, the weights of the kept picks renormalise as before).
@@ -336,11 +338,40 @@ __global__ void __launch_bounds__(256) k_route_group(const float* __restrict__ l
                                                      const uint8_t* blobs, unsigned long long blob,
                                                      unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups,
                                                      int32_t* ent_dst, int32_t* ent_tok, float cache_prior, int ser_kmin,
-                                                     float ser_t) {
+                                                     float ser_t, float* delta_mean, int32_t* delta_count) {
     constexpr int NE = 256, K = 8, V = NE / 32;
     __shared__ int sids[64], sid[64];
+    __shared__ float row_delta[8];   // OPT, HY: row t's Delta_avg
     const int tk = threadIdx.y;
     const int lane = threadIdx.x;
+    if constexpr (OPT && HY) {
+        if (cache_prior > 0.0f) {   // uniform over the block: every thread reaches the barriers
+            if (tk < n_tok) {
+                const float* lg = logits + (size_t) tk * ld;
+                float maximum = -INFINITY, minimum = INFINITY;
+#pragma unroll
+                for (int i = 0; i < V; ++i) {
+                    maximum = max(maximum, lg[lane + i * 32]);
+                    minimum = min(minimum, lg[lane + i * 32]);
+                }
+                maximum = wmax(maximum);
+                minimum = wmin(minimum);
+                if (lane == 0) row_delta[tk] = maximum - minimum;
+            }
+            __syncthreads();
+            if (tk == 0 && lane == 0) {
+                float mean = *delta_mean;
+                int32_t count = *delta_count;
+                for (int t = 0; t < n_tok; ++t) {
+                    strata::q36::delta_avg_step(mean, count, row_delta[t]);
+                    row_delta[t] = mean;
+                }
+                *delta_mean = mean;
+                *delta_count = count;
+            }
+            __syncthreads();
+        }
+    }
     if (tk < n_tok) {
         const float* lg = logits + (size_t) tk * ld;
         float values[V];
@@ -352,10 +383,7 @@ __global__ void __launch_bounds__(256) k_route_group(const float* __restrict__ l
         for (int i = 0; i < V; ++i) maximum = max(maximum, values[i]);
         maximum = wmax(maximum);
         if constexpr (OPT) {
-            float minimum = INFINITY;
-#pragma unroll
-            for (int i = 0; i < V; ++i) minimum = min(minimum, values[i]);
-            const float bias = HY ? cache_prior * (maximum - wmin(minimum)) : 0.0f;
+            const float bias = (HY && cache_prior > 0.0f) ? cache_prior * row_delta[tk] : 0.0f;
 #pragma unroll
             for (int i = 0; i < V; ++i) {
                 key[i] = values[i] + ((HY && slot_of[lane + i * 32] >= 0) ? bias : 0.0f);
@@ -443,6 +471,40 @@ __global__ void __launch_bounds__(256) k_route_group(const float* __restrict__ l
         for (int q = 1; q < nv; ++q) G += sid[q - 1] != sid[q] ? 1 : 0;
         grp_start[G] = nv;
         *n_groups = G;
+    }
+}
+
+/// k_route_group's Delta_avg update for the rows it does not serve (a prompt chunk of more than 8 rows, 256 experts): the
+/// layer's running mean takes the ranges of the n_tok rows in row order.  block (32, 8): warp w measures row base + w, then
+/// one thread steps the (up to) 8 rows in order.
+__global__ void __launch_bounds__(256) k_delta_rows(const float* __restrict__ logits, int n_tok, int ld, float* delta_mean,
+                                                    int32_t* delta_count) {
+    constexpr int V = 256 / 32;
+    __shared__ float range[8];
+    float mean = *delta_mean;
+    int32_t count = *delta_count;
+    for (int base = 0; base < n_tok; base += 8) {
+        const int row = base + threadIdx.y;
+        if (row < n_tok) {
+            const float* lg = logits + (size_t) row * ld;
+            float maximum = -INFINITY, minimum = INFINITY;
+#pragma unroll
+            for (int i = 0; i < V; ++i) {
+                maximum = max(maximum, lg[threadIdx.x + i * 32]);
+                minimum = min(minimum, lg[threadIdx.x + i * 32]);
+            }
+            maximum = wmax(maximum);
+            minimum = wmin(minimum);
+            if (threadIdx.x == 0) range[threadIdx.y] = maximum - minimum;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0 && threadIdx.y == 0)
+            for (int t = 0; t < 8 && base + t < n_tok; ++t) strata::q36::delta_avg_step(mean, count, range[t]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        *delta_mean = mean;
+        *delta_count = count;
     }
 }
 
