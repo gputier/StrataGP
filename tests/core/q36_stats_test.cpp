@@ -98,6 +98,13 @@ int main() {
         check(has(s, "expert union") && has(s, " w2 0.750 w3 0.000 w4 0.000"), "the union line: the mean per window");
         check(has(s, "per layer w2: 1.00 0.50"), "the union line: every layer");
     }
+    std::printf("one decoding session:\n");
+    {
+        check(single_decoder(true, 4, 4), "no other session at the start and none mixed in: the stats are printed");
+        check(!single_decoder(false, 4, 4), "another session decoding at the start: no line");
+        check(!single_decoder(true, 4, 5), "a window of two sessions since the start: no line");
+        check(!single_decoder(true, 4, 3), "a counter that went back (a new run) is not the start's count: no line");
+    }
     std::printf("the switch:\n");
     {
         check(stats_flag("1"), "STRATA_Q36_STATS=1 is on");

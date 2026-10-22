@@ -109,10 +109,11 @@ inline int pcie_num_of(double frac) { return std::max(0, std::min(256, (int) (fr
 // the same host loop launches) and the host's launch cost per PCIe blob, and sets pool_factor to 1: share = c / (c + w - l)
 // for c the CPU path's us per job, w = blob / link the PCIe us per blob, l the host us the launch of a blob takes.  The host
 // serves one layer as launches, job build, pool, so a launch is host time on the CPU path's side of the balance (the wire
-// time w of the blobs runs beside it): n w = J c + n l.  Flash-Next passes no launch time and keeps pool_factor 1.85, and
-// its arithmetic is the one above (k = 1.85 - 0.0).  An engine that times the copy streams passes the busy time and the
-// blobs the dispatch chose for PCIe as well: w is then that time per chosen blob (the demand copies, the prefetch traffic
-// and the link's real rate together) and the start-up probe is only the figure before the first reading.
+// time w of the blobs runs beside it): n w = J c + n l, n the blobs chosen for PCIe.  Flash-Next passes no launch time and
+// keeps pool_factor 1.85, and its arithmetic is the one above (k = 1.85 - 0.0).  An engine that times the copy streams
+// passes the busy time, the launch time and the blobs the dispatch chose for PCIe as well: w and l are then per chosen
+// blob (the demand copies, the prefetch traffic and the link's real rate together) and the start-up probe is only the
+// figure before the first reading.
 struct PcieAuto {
     static constexpr double kPoolFactor = 1.85;
     bool on = false;
@@ -121,35 +122,33 @@ struct PcieAuto {
     double max_share = 0.60;       ///< the highest share a refinement may set (Flash-Next's 0.60; an engine whose CPU pool is slow passes more)
     double pool_factor = kPoolFactor;   ///< what multiplies the pool's rate against the link's (an engine that times only the CPU path's own work passes 1)
     double mark_ms = 0.0, mark_launch_ms = 0.0, mark_wire_ms = 0.0;
-    int64_t mark_jobs = 0, mark_blobs = 0, mark_chosen = 0;
+    int64_t mark_jobs = 0, mark_chosen = 0;
     double acc_ms = 0.0, acc_launch_ms = 0.0, acc_wire_ms = 0.0;
-    int64_t acc_jobs = 0, acc_blobs = 0, acc_chosen = 0;
+    int64_t acc_jobs = 0, acc_chosen = 0;
     int acc_win = 0, updates = 0;
-    double launch_us = 0.0;        ///< the last reading: the host's us per PCIe blob launched (0 when the engine passes no launch time)
+    double launch_us = 0.0;        ///< the last reading: the host's us per chosen PCIe blob (0 when the engine passes no launch time)
     double wire_us = 0.0;          ///< the last reading: the PCIe us per chosen blob (the probe's when the engine passes no wire time)
-    void mark(double ms_run, int64_t jobs, double launch_ms = 0.0, int64_t blobs = 0, double wire_ms = 0.0,
-              int64_t chosen = 0) {
+    bool wire_measured = false;    ///< the last reading's wire_us is the copy streams' time (false: the start-up probe's link figure)
+    void mark(double ms_run, int64_t jobs, double launch_ms = 0.0, double wire_ms = 0.0, int64_t chosen = 0) {
         mark_ms = ms_run;
         mark_jobs = jobs;
         mark_launch_ms = launch_ms;
-        mark_blobs = blobs;
         mark_wire_ms = wire_ms;
         mark_chosen = chosen;
     }
     /// After a decode window: the new share, or -1 while there is nothing to change.  `tc_us`/`rate` get the reading.
-    /// `launch_ms`/`blobs`: the host time spent launching PCIe copies and how many, cumulative like `ms_run` (none: 0).
-    /// `wire_ms`/`chosen`: the time the copy streams were busy and the blobs the dispatch chose for PCIe, cumulative too
-    /// (none: 0, then w is the probe's).
+    /// `launch_ms`: the host time spent launching PCIe copies, cumulative like `ms_run` (none: 0).  `wire_ms`/`chosen`: the
+    /// time the copy streams were busy and the blobs the dispatch chose for PCIe, cumulative too (none: 0, then w is the
+    /// probe's).  The launch time is read per chosen blob as well, so both sides of the balance count the same blobs.
     double window(double ms_run, int64_t jobs, double cur, double* tc_us, double* rate, double launch_ms = 0.0,
-                  int64_t blobs = 0, double wire_ms = 0.0, int64_t chosen = 0) {
+                  double wire_ms = 0.0, int64_t chosen = 0) {
         if (!on) return -1.0;
         acc_ms += ms_run - mark_ms;
         acc_jobs += jobs - mark_jobs;
         acc_launch_ms += launch_ms - mark_launch_ms;
-        acc_blobs += blobs - mark_blobs;
         acc_wire_ms += wire_ms - mark_wire_ms;
         acc_chosen += chosen - mark_chosen;
-        mark(ms_run, jobs, launch_ms, blobs, wire_ms, chosen);
+        mark(ms_run, jobs, launch_ms, wire_ms, chosen);
         ++acc_win;
         if (acc_win < (updates == 0 ? 48 : 96)) return -1.0;
         if (acc_jobs < 300) {          // too few missed experts to read the pool's speed (everything hits): look again
@@ -157,14 +156,13 @@ struct PcieAuto {
             return -1.0;
         }
         const double tc = acc_ms * 1000.0 / (double) acc_jobs;
-        const double launch = acc_blobs > 0 ? acc_launch_ms * 1000.0 / (double) acc_blobs : 0.0;
+        const double launch = acc_chosen > 0 ? acc_launch_ms * 1000.0 / (double) acc_chosen : 0.0;
         const double measured_wire_us = acc_chosen > 0 ? acc_wire_ms * 1000.0 / (double) acc_chosen : 0.0;
         acc_wire_ms = 0.0;
         acc_chosen = 0;
         acc_ms = 0.0;
         acc_jobs = 0;
         acc_launch_ms = 0.0;
-        acc_blobs = 0;
         acc_win = 0;
         if (++updates >= 3) on = false;
         if (!(tc > 1.0) || !(blob_bytes > 0.0) || !(link_gbps > 0.0)) return -1.0;
@@ -177,6 +175,7 @@ struct PcieAuto {
         *rate = r;
         launch_us = launch;
         wire_us = wire;
+        wire_measured = measured_wire_us > 0.0;
         return std::fabs(f - cur) < 0.025 ? -1.0 : f;
     }
 };
