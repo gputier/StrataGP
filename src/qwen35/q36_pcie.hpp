@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 namespace strata::q36 {
@@ -102,6 +103,25 @@ inline void pcie_plan(const int32_t* ids, int n_ent, int top_k, const int32_t* p
             }
     }
     plan[kPlanStart + m] = entries;
+}
+
+/// The time the copy streams are busy: the length of the union of the copies' [begin, end] intervals (ms), so two streams
+/// copying at once count once.  Sorts `iv`.
+inline double interval_union_ms(std::vector<std::pair<double, double>>& iv) {
+    std::sort(iv.begin(), iv.end());
+    double total = 0.0, end = 0.0;
+    bool open = false;
+    for (const std::pair<double, double>& x : iv) {
+        if (!open || x.first > end) {
+            total += x.second - x.first;
+            end = x.second;
+            open = true;
+        } else if (x.second > end) {
+            total += x.second - end;
+            end = x.second;
+        }
+    }
+    return total;
 }
 
 }  // namespace strata::q36
