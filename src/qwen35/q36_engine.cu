@@ -1505,21 +1505,22 @@ struct Engine {
     std::vector<std::pair<int32_t, int32_t>> profile_prior;
     double hy_cpu_ms = 0;
     // what PcieAuto reads (the clocks behind them run only while it is on): pa_cpu_ms = the CPU path's own time, the pool's row
-    // phases plus the jobs' build (not the PCIe launches the same host loop makes), pa_launch_ms / pa_blobs = the host time
-    // spent picking, launching and planning the PCIe copies, and how many
-    double pa_cpu_ms = 0, pa_launch_ms = 0;
-    long long pa_blobs = 0;
+    // phases plus the jobs' build (not the PCIe launches the same host loop makes); the host time spent picking, launching and
+    // planning the PCIe copies is WireStep::launch_ms
+    double pa_cpu_ms = 0;
     // the wire clock (it runs with the PcieAuto clocks): each layer step stamps its demand copies (stream pcs) and its prefetch
     // copies (stream pfs) with a begin and an end event; a step is read, without a sync, once its events have completed, and
-    // the busy time is the union of the intervals read (wire_ms), against the blobs the steps chose for PCIe (wire_chosen)
+    // the busy time is the union of the intervals read (wire_ms), against the blobs the steps chose for PCIe (wire_chosen);
+    // the launch time and the chosen blobs are read from the same steps, so PcieAuto divides both by the same count
     struct WireStep {
         cudaEvent_t ev[4] = {};   // demand begin, demand end, prefetch begin, prefetch end (null: that stream copied nothing)
         int chosen = 0, demand = 0, prefetch = 0;
         size_t bytes = 0;
+        double launch_ms = 0.0;   // the host time spent picking, launching and planning the step's PCIe copies
     };
     struct WireCount {
         double wire_ms = 0, bytes = 0, cpu_ms = 0, launch_ms = 0;
-        long long chosen = 0, demand = 0, prefetch = 0, jobs = 0, launched = 0;
+        long long chosen = 0, demand = 0, prefetch = 0, jobs = 0;
     };
     cudaEvent_t ev_wire0 = nullptr;   // the common origin of the stamps
     std::vector<cudaEvent_t> wire_free;
@@ -1531,6 +1532,7 @@ struct Engine {
     const bool stats_on = strata::q36::stats_enabled();
     strata::q36::DecodeStats stat_acc;
     strata::q36::ExpertUnion stat_union;
+    long long stat_mixed = 0;          // decode windows of two or more sessions, and requests started beside a decoding one
     std::vector<char> stat_hit_mark;   // per expert: counted as a resident expert read by this layer step
     /// The accumulated counters now, the pool's included (the request's figures are the difference of two snapshots).
     strata::q36::DecodeStats stat_snapshot() const {
@@ -1590,6 +1592,7 @@ struct Engine {
             }
             if (ok) {
                 iv.insert(iv.end(), mine.begin(), mine.end());
+                wire.launch_ms += r.launch_ms;
                 wire.chosen += r.chosen;
                 wire.demand += r.demand;
                 wire.prefetch += r.prefetch;
@@ -1609,19 +1612,17 @@ struct Engine {
         ++wire_logs;
         WireCount now = wire;
         now.cpu_ms = pa_cpu_ms;
-        now.launch_ms = pa_launch_ms;
         now.jobs = hy_cpu_jobs;
-        now.launched = pa_blobs;
         const long long chosen = now.chosen - wire_mark.chosen, on_wire = now.demand - wire_mark.demand + now.prefetch - wire_mark.prefetch;
-        const long long jobs = now.jobs - wire_mark.jobs, launched = now.launched - wire_mark.launched;
+        const long long window_jobs = now.jobs - wire_mark.jobs;
         const double busy_us = (now.wire_ms - wire_mark.wire_ms) * 1000.0, bytes = now.bytes - wire_mark.bytes;
-        if (chosen > 0 && on_wire > 0 && jobs > 0 && launched > 0 && busy_us > 0.0) {
+        if (chosen > 0 && on_wire > 0 && window_jobs > 0 && busy_us > 0.0) {
             const double w = busy_us / (double) chosen;
-            const double c = (now.cpu_ms - wire_mark.cpu_ms) * 1000.0 / (double) jobs;
-            const double l = (now.launch_ms - wire_mark.launch_ms) * 1000.0 / (double) launched;
+            const double c = (now.cpu_ms - wire_mark.cpu_ms) * 1000.0 / (double) window_jobs;
+            const double l = (now.launch_ms - wire_mark.launch_ms) * 1000.0 / (double) chosen;
             std::fprintf(stderr, "strata-q36: stats: wire window %d: share %.2f, %lld blobs chosen for PCIe (%lld on demand, %lld "
                          "prefetched), busy %.0f us on the copy streams: %.1f us per chosen blob, %.1f us per blob on the wire, %.1f "
-                         "GB/s; CPU path %.0f us per job, launch %.1f us per blob -> c / (c + w - l) = %.3f\n", wire_logs,
+                         "GB/s; CPU path %.0f us per job, launch %.1f us per chosen blob -> c / (c + w - l) = %.3f\n", wire_logs,
                          pcie_num / 256.0, chosen, now.demand - wire_mark.demand, now.prefetch - wire_mark.prefetch, busy_us, w,
                          busy_us / (double) on_wire, bytes / (busy_us * 1e-6) / 1e9, c, l, c / (c + w - l));
         }
@@ -1635,14 +1636,15 @@ struct Engine {
         if (stats_on) wire_stats();
         if (!pcie_auto.on) return;
         double tc_us = 0.0, rate = 0.0;
-        const double nf = pcie_auto.window(pa_cpu_ms, hy_cpu_jobs, pcie_num / 256.0, &tc_us, &rate, pa_launch_ms, pa_blobs,
-                                           wire.wire_ms, wire.chosen);
+        const double nf = pcie_auto.window(pa_cpu_ms, hy_cpu_jobs, pcie_num / 256.0, &tc_us, &rate, wire.launch_ms, wire.wire_ms,
+                                           wire.chosen);
         if (nf < 0.0) return;
         std::fprintf(stderr, "strata-q36: PCIe share: the CPU path takes %.0f us per missed expert (%.1f GB/s of expert bytes; the "
-                     "pool's rows and the jobs' build), the copy streams %.0f us per chosen blob (the probe said %.1f GB/s) with "
-                     "%.0f us of host launch per blob -> %.2f (was %.2f; --pcie-frac N fixes it); since the last update %lld of "
-                     "%lld announced groups went over PCIe (the staging region holds %d per layer step)\n", tc_us, rate,
-                     pcie_auto.wire_us, pcie_auto.link_gbps, pcie_auto.launch_us, nf, pcie_num / 256.0, pc_sent, pc_want,
+                     "pool's rows and the jobs' build), the copy streams %.0f us per chosen blob (%s; the link probe said %.1f GB/s) "
+                     "with %.0f us of host launch per chosen blob -> %.2f (was %.2f; --pcie-frac N fixes it); since the last update "
+                     "%lld of %lld announced groups went over PCIe (the staging region holds %d per layer step)\n", tc_us, rate,
+                     pcie_auto.wire_us, pcie_auto.wire_measured ? "measured" : "not measured: no blob went over PCIe in the window",
+                     pcie_auto.link_gbps, pcie_auto.launch_us, nf, pcie_num / 256.0, pc_sent, pc_want,
                      strata::q36::kPcieSlots);
         pc_want = pc_sent = 0;
         pcie_num = strata::core::pcie_num_of(nf);
@@ -1967,10 +1969,16 @@ struct Engine {
     void quant(const float* xin, int n, int T, void* q) { K::native_quantize_q8_1(xin, q, n * T, 1, st); }
     // ---- decode kernels of this engine (q36_kernels.cuh), each the old kernel's bits (STRATA_Q36_VERIFY=1 compares)
     bool fast_k = std::getenv("STRATA_Q36_OLD_KERNELS") == nullptr;
+    /// The routing kernels that take the routing options: the new kernels on a 256-expert, 8-pick model (the start refuses
+    /// --cache-prior and --ser when this is false).
+    bool fast_route() const { return fast_k && m->g.n_expert == 256 && m->top_k == 8; }
     // routing options (--cache-prior, --ser), both off: they act in route_group's decode / verify windows (T <= 8) only
     float cache_prior = 0.0f;   // the bias on resident experts' logits, in units of the layer's Delta_avg (q36_delta.hpp)
-    float* delta_mean = nullptr;      // Delta_avg's state, one pair per layer (the MTP block last): only with --cache-prior,
-    int32_t* delta_count = nullptr;   // zeroed by reset()
+    // Delta_avg's state, one pair per layer (the MTP block last), engine-wide: it is one session's state because the start
+    // refuses --cache-prior with two or more sessions (--batch) and with MTP drafts (their rejected rows would stay folded in).
+    // Only with --cache-prior; zeroed by reset().
+    float* delta_mean = nullptr;
+    int32_t* delta_count = nullptr;
     int ser_kmin = 8;           // the picks of rank >= ser_kmin are kept only above ser_t * the top probability
     float ser_t = 0.0f;
     bool verify_k = std::getenv("STRATA_Q36_VERIFY") != nullptr;
@@ -2103,11 +2111,11 @@ struct Engine {
         const uint8_t* wa = a.d;
         const uint8_t* wb = b.d;
         const half* da = nullptr;
-        const half* db = nullptr;
+        const half* db_half = nullptr;
 #define Q36_SH(NCV)                                                                                          \
     case NCV:                                                                                                \
         if (pkd)                                                                                             \
-            q36k::k_sh_gu<NCV, 2, true><<<grid, 1024, 0, st>>>(wa, da, wb, db, (const q36k::QB*) xq,        \
+            q36k::k_sh_gu<NCV, 2, true><<<grid, 1024, 0, st>>>(wa, da, wb, db_half, (const q36k::QB*) xq,        \
                                                                (q36k::QB*) q8, nb, FS);                      \
         else if (nb <= 2 * q36k::kQ8RowBlocks)                                                               \
             q36k::k_sh_gu<NCV, 2, false><<<grid, 1024, 0, st>>>(wa, nullptr, wb, nullptr, (const q36k::QB*) xq, \
@@ -2166,19 +2174,19 @@ struct Engine {
         bool bad = nn != no;
         if (!bad) {
             std::vector<unsigned long long> a((size_t) nn + 1), b((size_t) nn + 1);
-            std::vector<int32_t> sa((size_t) nn + 1), sb((size_t) nn + 1), da(64), db(64), ta(64), tb(64);
+            std::vector<int32_t> sa((size_t) nn + 1), sb((size_t) nn + 1), da(64), dbv(64), ta(64), tb(64);
             CK(cudaMemcpy(a.data(), grp_ptr, (size_t) nn * 8, cudaMemcpyDeviceToHost));
             CK(cudaMemcpy(b.data(), o_ptr, (size_t) nn * 8, cudaMemcpyDeviceToHost));
             CK(cudaMemcpy(sa.data(), grp_start, ((size_t) nn + 1) * 4, cudaMemcpyDeviceToHost));
             CK(cudaMemcpy(sb.data(), o_start, ((size_t) nn + 1) * 4, cudaMemcpyDeviceToHost));
             const int tot = sa[(size_t) nn];
             CK(cudaMemcpy(da.data(), ent_dst, (size_t) tot * 4, cudaMemcpyDeviceToHost));
-            CK(cudaMemcpy(db.data(), o_dst, (size_t) tot * 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(dbv.data(), o_dst, (size_t) tot * 4, cudaMemcpyDeviceToHost));
             CK(cudaMemcpy(ta.data(), ent_tok, (size_t) tot * 4, cudaMemcpyDeviceToHost));
             CK(cudaMemcpy(tb.data(), o_tok, (size_t) tot * 4, cudaMemcpyDeviceToHost));
             bad = std::memcmp(a.data(), b.data(), (size_t) nn * 8) != 0 ||
                   std::memcmp(sa.data(), sb.data(), ((size_t) nn + 1) * 4) != 0 ||
-                  std::memcmp(da.data(), db.data(), (size_t) tot * 4) != 0 ||
+                  std::memcmp(da.data(), dbv.data(), (size_t) tot * 4) != 0 ||
                   std::memcmp(ta.data(), tb.data(), (size_t) tot * 4) != 0;
         }
         if (bad) {
@@ -2188,7 +2196,7 @@ struct Engine {
     }
     /// A prompt chunk route_group does not serve (T > 8) still feeds the hybrid layer's Delta_avg (--cache-prior only).
     void delta_rows(size_t li, int T, int ld) {
-        if (delta_mean && fast_k && T > 8 && lhy(li) && m->g.n_expert == 256 && m->top_k == 8)
+        if (delta_mean && fast_route() && T > 8 && lhy(li))
             q36k::k_delta_rows<<<1, dim3(32, 8), 0, st>>>(logits_r, T, ld, delta_mean + li, delta_count + li);
     }
     bool grouped_by_route = false;   // route_group already filled the group arrays of this layer
@@ -2197,7 +2205,7 @@ struct Engine {
     bool route_group(const Layer& L, size_t li, const int32_t* slot_of, int T, int ld) {
         const int Kp = (int) m->top_k;
         grouped_by_route = false;
-        if (!fast_k || T > 8 || m->g.n_expert != 256 || Kp != 8) return false;
+        if (!fast_route() || T > 8) return false;
         const bool opt = cache_prior > 0.0f || ser_kmin < Kp;
         if (slot_of) {
             const auto kern = opt ? q36k::k_route_group<true, true> : q36k::k_route_group<true, false>;
@@ -2651,16 +2659,6 @@ struct Engine {
         ++stream_pos;
     }
 
-    /// The PCIe copies as q36 submits them: one cudaMemcpyBatchAsync per group (Flash-Next's STRATA_DMA_BATCH path,
-    /// core/dma_batch.hpp), on unless STRATA_DMA_BATCH=0.  Flash-Next's own default stays its own (a copy of the same
-    /// blobs, the same destinations, one submission).
-    static int dma_mode() {
-        static const int mode = [] {
-            const char* e = std::getenv("STRATA_DMA_BATCH");
-            return e != nullptr && e[0] != '\0' ? std::atoi(e) : 1;
-        }();
-        return mode;
-    }
     uint8_t* pf_region(int par) const { return pc_stage + (size_t) (strata::q36::kPcieSlots + par * strata::q36::kPrefetchSlots) * pc_blob; }
     /// Layer li + 1's picks are predicted at layer li: the layer ahead is a hybrid main layer and a step this wide has a share.
     bool pf_predicts(size_t li, int T) const {
@@ -2694,7 +2692,9 @@ struct Engine {
             bytes[j] = Ln.stride;
         }
         if (ws != nullptr) wire_stamp(ws->ev[2], pfs);
-        CK(strata::core::copy_blobs(dst, src, bytes, (size_t) n, pfs, dma_mode()));
+        // the PCIe copies as one cudaMemcpyBatchAsync per group, on unless STRATA_DMA_BATCH=0 (q36's default of 1; Flash-Next's
+        // default is its own).  No other caller of dma_batch_mode runs in strata-q36, so its process-wide cache takes this 1.
+        CK(strata::core::copy_blobs(dst, src, bytes, (size_t) n, pfs, strata::core::dma_batch_mode(1)));
         if (ws != nullptr) {
             wire_stamp(ws->ev[3], pfs);
             ws->prefetch = n;
@@ -2766,19 +2766,19 @@ struct Engine {
         size_t cbytes[strata::q36::kPcieSlots];
         unsigned long long blob_ptr[strata::q36::kPcieSlots];
         int n_copy = 0;
-        for (int q = 0; q < n_pcie; ++q) {
-            pc_mark[(size_t) picked[q]] = 1;
-            const uint8_t* at = pf_slot[q] >= 0 ? pf_region(par) + (size_t) pf_slot[q] * pc_blob : pc_stage + (size_t) q * pc_blob;
-            blob_ptr[q] = (unsigned long long) (uintptr_t) at;
-            if (pf_slot[q] >= 0) continue;
-            cdst[n_copy] = pc_stage + (size_t) q * pc_blob;
-            csrc[n_copy] = L.hblobs + (size_t) picked[q] * L.stride;
+        for (int k = 0; k < n_pcie; ++k) {
+            pc_mark[(size_t) picked[k]] = 1;
+            const uint8_t* at = pf_slot[k] >= 0 ? pf_region(par) + (size_t) pf_slot[k] * pc_blob : pc_stage + (size_t) k * pc_blob;
+            blob_ptr[k] = (unsigned long long) (uintptr_t) at;
+            if (pf_slot[k] >= 0) continue;
+            cdst[n_copy] = pc_stage + (size_t) k * pc_blob;
+            csrc[n_copy] = L.hblobs + (size_t) picked[k] * L.stride;
             cbytes[n_copy] = L.stride;
             ++n_copy;
         }
         if (n_copy > 0) {
             if (pa_on) wire_stamp(ws.ev[0], pcs);
-            CK(strata::core::copy_blobs(cdst, csrc, cbytes, (size_t) n_copy, pcs, dma_mode()));
+            CK(strata::core::copy_blobs(cdst, csrc, cbytes, (size_t) n_copy, pcs, strata::core::dma_batch_mode(1)));
             if (pa_on) {
                 wire_stamp(ws.ev[1], pcs);
                 ws.demand = n_copy;
@@ -2791,10 +2791,9 @@ struct Engine {
         double launch_ms = 0.0;
         if (pa_on) {
             launch_ms = ms_since(l0);
-            pa_launch_ms += launch_ms;
-            pa_blobs += n_copy + n_pf;
             if (n_pcie > 0 || n_pf > 0) {
                 ws.chosen = n_pcie;
+                ws.launch_ms = launch_ms;
                 wire_pending.push_back(ws);
             }
         }
@@ -3183,6 +3182,7 @@ struct Engine {
     /// it for the kept rows) and the sessions' positions stay.  The greedy picks end up in rows_pick (one per row), every
     /// row's logits in `logits`.  Without verify the sessions' positions advance by their rows.
     void run_rows(const Group* gr, int G, bool verify) {
+        if (stats_on && G > 1) ++stat_mixed;
         sess[(size_t) cur].pos = pos;
         CK(cudaStreamSynchronize(st));   // the pinned staging is free again
         int64_t pmax = 0;
@@ -3462,8 +3462,7 @@ struct Engine {
             std::fill(H.heat.begin(), H.heat.end(), 0.0);
         }
         hy_cpu = hy_gpu = hy_swaps = hy_pcie = hy_cpu_jobs = pc_want = pc_sent = 0;
-        hy_cpu_ms = pa_cpu_ms = pa_launch_ms = 0;
-        pa_blobs = 0;
+        hy_cpu_ms = pa_cpu_ms = 0;
         wire = wire_mark = WireCount();
         wire_steps = wire_logs = 0;
         pcie_auto.mark(0.0, 0);
@@ -4356,8 +4355,14 @@ struct Serve {
         std::vector<int32_t> hist = ids;
         const auto d0 = Clock::now();
         const long long hc0 = E.hy_cpu, hg0 = E.hy_gpu, hs0 = E.hy_swaps, hp0 = E.hy_pcie;   // the hybrid counters at the start of the decode
+        // the expert union is the engine's ring: it is reset only when no other session decodes (another live session's ring is
+        // kept), and a request started beside one is counted in stat_mixed, which leaves its stats line out (single_decoder)
+        bool alone = true;
+        for (int i = 0; i < E.n_sess; ++i) alone = alone && (i == s || !E.sess[(size_t) i].active);
+        if (E.stats_on && !alone) ++E.stat_mixed;
+        const long long mixed0 = E.stat_mixed;
         const strata::q36::DecodeStats stat0 = E.stats_on ? E.stat_snapshot() : strata::q36::DecodeStats();
-        if (E.stats_on) E.stat_union.reset(E.m->layers.size(),(int) E.m->top_k);
+        if (E.stats_on && alone) E.stat_union.reset(E.m->layers.size(), (int) E.m->top_k);
         long long produced = 0, offered = 0, accepted = 0;
         const char* finish = "length";
         // requests alone with the MTP block: speculative steps of mtp_d drafts, verified (greedy: the greedy text; sampled:
@@ -4470,7 +4475,7 @@ struct Serve {
             std::fprintf(stderr, "strata serve: session %d: experts on the GPU %.1f%% (%lld of %lld rows), over PCIe %.1f%% "
                          "(%lld), on the CPU %.1f%% (%lld), %lld slot replacements, PCIe share %.2f\n", s, pct(hg), hg, hn,
                          pct(hp), hp, pct(hcpu), hcpu, E.hy_swaps - hs0, E.pcie_num / 256.0);
-            if (E.stats_on) {
+            if (E.stats_on && strata::q36::single_decoder(alone, mixed0, E.stat_mixed)) {
                 const strata::q36::DecodeStats d = E.stat_snapshot() - stat0;
                 std::fprintf(stderr, "%s\n%s\n%s\n", strata::q36::format_decode_stats(s, d, produced).c_str(),
                              strata::q36::format_wait_layers(s, d).c_str(), strata::q36::format_union(s, E.stat_union).c_str());
@@ -4781,6 +4786,27 @@ int strata::qwen35::run(int argc, char** argv) {
     if (!place_experts(m, E, expert_vram, cpu_threads, hybrid_rows, expert_slots, pcie_frac, err)) {
         std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
         return 1;
+    }
+    // the routing options that cannot hold their state or cannot apply are refused here, before anything runs
+    if (cache_prior > 0.0f && E.n_sess > 1) {
+        std::fprintf(stderr, "strata-q36: --cache-prior needs one session (--batch %d decodes %d at once): its Delta_avg state "
+                     "is kept for the engine, not per session. Use --batch 1 or drop --cache-prior\n", batch, E.n_sess);
+        return 2;
+    }
+    if (cache_prior > 0.0f && m.has_mtp && mtp_d > 0) {
+        std::fprintf(stderr, "strata-q36: --cache-prior and --mtp %d cannot be combined: the rejected MTP draft rows would stay "
+                     "folded into Delta_avg. Use --mtp 0 or drop --cache-prior\n", mtp_d);
+        return 2;
+    }
+    if (cache_prior > 0.0f && !m.hybrid) {
+        std::fprintf(stderr, "strata-q36: --cache-prior needs the hybrid expert mode (not every expert fits in VRAM): with every "
+                     "expert resident there is no slot miss to bias\n");
+        return 2;
+    }
+    if ((cache_prior > 0.0f || ser_kmin < (int) m.top_k) && !E.fast_route()) {
+        std::fprintf(stderr, "strata-q36: --cache-prior and --ser need the fast routing path (STRATA_Q36_OLD_KERNELS unset, 256 "
+                     "experts, 8 picks); this model or setting is not on it\n");
+        return 2;
     }
     struct Report {
         Engine& E;

@@ -222,9 +222,11 @@ int main() {
     std::printf("PcieAuto (q36: the CPU path's own time, the launch counted on the host's side):\n");
     {
         using strata::core::PcieAuto;
-        // a 54 GB/s link and a 4.08 MB expert: 75.6 us of wire per blob.  One first update after 48 windows of 100 jobs and
-        // 20 blobs, the CPU path at `us` per job, the host's launch at `launch_us` per blob.
-        const auto first = [](double us, double launch_us, double factor, double cap, PcieAuto* out = nullptr) {
+        // a 54 GB/s link and a 4.08 MB expert: 75.6 us of wire per blob.  One first update after 48 windows of 100 jobs, each
+        // window `launched` blobs sent to the host's launch (`launch_us` each) and `chosen` blobs chosen for PCIe, the CPU
+        // path at `us` per job.  The launch time is read per chosen blob: launch_us * launched / chosen.
+        const auto first = [](double us, double launch_us, double factor, double cap, PcieAuto* out = nullptr,
+                              int64_t launched = 20, int64_t chosen = 20) {
             PcieAuto a;
             a.on = true;
             a.link_gbps = 54.0;
@@ -232,15 +234,15 @@ int main() {
             a.pool_factor = factor;
             a.max_share = cap;
             a.min_share = 0.0;
-            a.mark(0.0, 0, 0.0, 0);
+            a.mark(0.0, 0);
             double tc = 0.0, rate = 0.0, ms = 0.0, lms = 0.0, got = -1.0;
-            int64_t jobs = 0, blobs = 0;
+            int64_t jobs = 0, ch = 0;
             for (int w = 1; w <= 48 && got < 0.0; ++w) {
                 ms += us / 10.0;
                 jobs += 100;
-                lms += launch_us * 20.0 / 1000.0;
-                blobs += 20;
-                got = a.window(ms, jobs, 0.55, &tc, &rate, lms, blobs);
+                lms += launch_us * (double) launched / 1000.0;
+                ch += chosen;
+                got = a.window(ms, jobs, 0.55, &tc, &rate, lms, 0.0, ch);
             }
             if (out != nullptr) *out = a;
             return got;
@@ -248,19 +250,27 @@ int main() {
         // c = 200 us per job, no launch: 200 / (200 + 75.6) = 0.726 -> 0.75 (the fitted 1.85 would say 54 / (54 + 37.7) = 0.59 -> 0.60)
         check(std::abs(first(200.0, 0.0, 1.0, 0.95) - 0.75) < 1e-9, "a CPU path at 200 us per job against 75.6 us of wire: 0.75");
         check(std::abs(first(200.0, 0.0, PcieAuto::kPoolFactor, 0.95) - 0.60) < 1e-9, "the fitted 1.85 on the same reading would say 0.60");
-        // the job build counts on the CPU path: 150 us of pool rows alone say 150 / 225.6 = 0.665 -> 0.65, and 50 us of job
-        // build on top make the 200 us above (0.75)
-        check(std::abs(first(150.0, 0.0, 1.0, 0.95) - 0.65) < 1e-9, "150 us of pool rows alone, no job build counted: 0.65");
+        // a CPU path at 150 us per job, 150 / 225.6 = 0.665 -> 0.65 (no launch time)
+        check(std::abs(first(150.0, 0.0, 1.0, 0.95) - 0.65) < 1e-9, "a CPU path at 150 us per job, no launch: 0.65");
         // 40 us of host launch per blob is host time: c / (c + w - l) = 200 / 235.6 = 0.849 -> 0.85
         {
             PcieAuto a;
             check(std::abs(first(200.0, 40.0, 1.0, 0.95, &a) - 0.85) < 1e-9, "40 us of launch per blob moves the balance to 0.85");
             check(std::abs(a.launch_us - 40.0) < 1e-6, "the reading's launch time is 40 us per blob");
         }
+        // 20 blobs launched, 10 chosen for PCIe (the rest prefetched or not sent): 20 x 20 us over the 10 chosen is 40 us per
+        // chosen blob, so 200 / (200 + 75.6 - 40) = 0.849 -> 0.85.  Divided by the launched blobs the 20 us would read as
+        // 200 / 255.6 = 0.78 -> 0.80.
+        {
+            PcieAuto a;
+            check(std::abs(first(200.0, 20.0, 1.0, 0.95, &a, 20, 10) - 0.85) < 1e-9,
+                  "20 us of launch per launched blob, 10 blobs chosen of 20 launched: 40 us per chosen blob, 0.85");
+            check(std::abs(a.launch_us - 40.0) < 1e-6, "the reading's launch time is 40 us per chosen blob");
+        }
         check(std::abs(first(200.0, 80.0, 1.0, 0.95) - 0.95) < 1e-9, "a launch dearer than the wire leaves only the cap: 0.95");
         check(std::abs(first(200.0, 80.0, 1.0, 0.80) - 0.80) < 1e-9, "the cap holds");
         check(std::abs(first(1000.0, 0.0, 1.0, 0.95) - 0.95) < 1e-9, "a CPU path at 1000 us per job: 1000 / 1075.6 = 0.93 -> 0.95");
-        // launch time with no blob counted (a window where nothing went over PCIe) is read as none
+        // launch time with no blob chosen (a window where nothing went over PCIe) is read as none
         {
             PcieAuto a;
             a.on = true;
@@ -268,23 +278,25 @@ int main() {
             a.blob_bytes = 4.08e6;
             a.pool_factor = 1.0;
             a.max_share = 0.95;
-            a.mark(0.0, 0, 0.0, 0);
+            a.mark(0.0, 0);
             double tc = 0.0, rate = 0.0, ms = 0.0, got = -1.0;
             int64_t jobs = 0;
             for (int w = 1; w <= 48 && got < 0.0; ++w) {
                 ms += 20.0;
                 jobs += 100;
-                got = a.window(ms, jobs, 0.55, &tc, &rate, 5.0 * w, 0);
+                got = a.window(ms, jobs, 0.55, &tc, &rate, 5.0 * w, 0.0, 0);
             }
-            check(std::abs(got - 0.75) < 1e-9 && a.launch_us == 0.0, "a launch time without blobs counts as none");
+            check(std::abs(got - 0.75) < 1e-9 && a.launch_us == 0.0, "a launch time without a chosen blob counts as none");
         }
     }
     std::printf("PcieAuto (q36: the copy streams' measured time per chosen blob):\n");
     {
         using strata::core::PcieAuto;
-        // the same 54 GB/s probe and 4.08 MB blob (75.6 us of wire); 48 windows of 100 jobs, 20 blobs launched and `chosen`
-        // blobs chosen for PCIe, the copy streams busy `wire_us` per chosen blob, the CPU path at `us` per job.
-        const auto first = [](double us, double launch_us, double wire_us, int64_t chosen, PcieAuto* out = nullptr) {
+        // the same 54 GB/s probe and 4.08 MB blob (75.6 us of wire); 48 windows of 100 jobs, `launched` blobs sent to the host's
+        // launch (`launch_us` each) and `chosen` blobs chosen for PCIe, the copy streams busy `wire_us` per chosen blob, the
+        // CPU path at `us` per job.
+        const auto first = [](double us, double launch_us, double wire_us, int64_t launched, int64_t chosen,
+                              PcieAuto* out = nullptr) {
             PcieAuto a;
             a.on = true;
             a.link_gbps = 54.0;
@@ -292,17 +304,16 @@ int main() {
             a.pool_factor = 1.0;
             a.max_share = 0.95;
             a.min_share = 0.0;
-            a.mark(0.0, 0, 0.0, 0, 0.0, 0);
+            a.mark(0.0, 0);
             double tc = 0.0, rate = 0.0, ms = 0.0, lms = 0.0, wms = 0.0, got = -1.0;
-            int64_t jobs = 0, blobs = 0, ch = 0;
+            int64_t jobs = 0, ch = 0;
             for (int w = 1; w <= 48 && got < 0.0; ++w) {
                 ms += us / 10.0;
                 jobs += 100;
-                lms += launch_us * 20.0 / 1000.0;
-                blobs += 20;
+                lms += launch_us * (double) launched / 1000.0;
                 wms += wire_us * (double) chosen / 1000.0;
                 ch += chosen;
-                got = a.window(ms, jobs, 0.55, &tc, &rate, lms, blobs, wms, ch);
+                got = a.window(ms, jobs, 0.55, &tc, &rate, lms, wms, ch);
             }
             if (out != nullptr) *out = a;
             return got;
@@ -310,16 +321,31 @@ int main() {
         // c = 200 us per job, 300 us measured per chosen blob: 200 / 500 = 0.40
         {
             PcieAuto a;
-            check(std::abs(first(200.0, 0.0, 300.0, 10, &a) - 0.40) < 1e-9, "300 us measured per chosen blob against a CPU path of 200 us: 0.40");
+            check(std::abs(first(200.0, 0.0, 300.0, 10, 10, &a) - 0.40) < 1e-9,
+                  "300 us measured per chosen blob against a CPU path of 200 us: 0.40");
             check(std::abs(a.wire_us - 300.0) < 1e-6, "the reading's wire time is the measured 300 us, not the probe's 75.6");
+            check(a.wire_measured, "the reading says the wire time is measured");
         }
         // the probe alone (no wire time passed) gives c / (c + 75.6) = 0.726 -> 0.75 on the same CPU path
-        check(std::abs(first(200.0, 0.0, 300.0, 0) - 0.75) < 1e-9, "no chosen blob: the probe's wire time, 0.75");
-        check(std::abs(first(200.0, 0.0, 75.6, 10) - 0.75) < 1e-9, "a measured wire time equal to the probe's gives the probe's share");
+        {
+            PcieAuto a;
+            check(std::abs(first(200.0, 0.0, 300.0, 0, 0, &a) - 0.75) < 1e-9, "no chosen blob: the probe's wire time, 0.75");
+            check(!a.wire_measured && std::abs(a.wire_us - 75.6) < 0.1,
+                  "no chosen blob: the reading's wire time is the probe's 75.6 us and is flagged as not measured");
+        }
+        check(std::abs(first(200.0, 0.0, 75.6, 10, 10) - 0.75) < 1e-9, "a measured wire time equal to the probe's gives the probe's share");
         // 40 us of launch per blob is host time: 200 / (200 + 300 - 40) = 0.435 -> 0.45
-        check(std::abs(first(200.0, 40.0, 300.0, 10) - 0.45) < 1e-9, "the launch time still counts on the host's side: 0.45");
-        check(std::abs(first(200.0, 0.0, 250.0, 10) - 0.45) < 1e-9, "250 us measured: 200 / 450 = 0.444 -> 0.45");
-        check(std::abs(first(200.0, 0.0, 1000.0, 10) - 0.15) < 1e-9, "1000 us measured: 200 / 1200 = 0.167 -> 0.15");
+        check(std::abs(first(200.0, 40.0, 300.0, 10, 10) - 0.45) < 1e-9, "the launch time still counts on the host's side: 0.45");
+        // 20 blobs launched, 10 chosen: 40 x 20 / 10 = 80 us per chosen blob, 200 / (200 + 100 - 80) = 0.909 -> 0.90.  Divided by
+        // the 20 launched blobs (40 us) it would read 200 / 260 = 0.77 -> 0.75.
+        {
+            PcieAuto a;
+            check(std::abs(first(200.0, 40.0, 100.0, 20, 10, &a) - 0.90) < 1e-9,
+                  "40 us per launched blob, 20 launched and 10 chosen, 100 us measured per chosen blob: 0.90");
+            check(std::abs(a.launch_us - 80.0) < 1e-6, "the reading's launch time is 80 us per chosen blob");
+        }
+        check(std::abs(first(200.0, 0.0, 250.0, 10, 10) - 0.45) < 1e-9, "250 us measured: 200 / 450 = 0.444 -> 0.45");
+        check(std::abs(first(200.0, 0.0, 1000.0, 10, 10) - 0.15) < 1e-9, "1000 us measured: 200 / 1200 = 0.167 -> 0.15");
         // the update schedule is the same: nothing before the 48th window
         {
             PcieAuto a;
@@ -327,11 +353,11 @@ int main() {
             a.link_gbps = 54.0;
             a.blob_bytes = 4.08e6;
             a.pool_factor = 1.0;
-            a.mark(0.0, 0, 0.0, 0, 0.0, 0);
+            a.mark(0.0, 0);
             double tc = 0.0, rate = 0.0;
             bool early = false;
             for (int w = 1; w < 48; ++w)
-                early = early || a.window(20.0 * w, 100 * w, 0.55, &tc, &rate, 1.0 * w, 20 * w, 3.0 * w, 10 * w) >= 0.0;
+                early = early || a.window(20.0 * w, 100 * w, 0.55, &tc, &rate, 1.0 * w, 3.0 * w, 10 * w) >= 0.0;
             check(!early, "no update before the 48th window");
         }
         // three updates, then it is off
@@ -343,7 +369,7 @@ int main() {
             a.pool_factor = 1.0;
             a.min_share = 0.0;
             a.max_share = 0.95;
-            a.mark(0.0, 0, 0.0, 0, 0.0, 0);
+            a.mark(0.0, 0);
             double tc = 0.0, rate = 0.0;
             int64_t jobs = 0, ch = 0;
             double ms = 0.0, wms = 0.0, cur = 0.55;
@@ -352,7 +378,7 @@ int main() {
                 jobs += 100;
                 wms += 3.0;
                 ch += 10;
-                const double f = a.window(ms, jobs, cur, &tc, &rate, 0.0, 0, wms, ch);
+                const double f = a.window(ms, jobs, cur, &tc, &rate, 0.0, wms, ch);
                 if (f >= 0.0) cur = f;
             }
             check(!a.on && std::abs(cur - 0.40) < 1e-9, "three updates settle on 0.40 and PcieAuto is off");

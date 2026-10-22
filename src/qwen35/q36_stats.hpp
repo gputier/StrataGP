@@ -25,6 +25,13 @@ inline bool stats_enabled() {
     return on;
 }
 
+/// Whether a request's stats describe one session's decode: no other session decoded at its start (`alone`), and no decode
+/// window carried rows of two or more sessions since (`mixed_at_start` and `mixed_now` count those windows and the starts
+/// made beside a decoding session).  Otherwise the expert union and the counters mix sessions and no line is printed.
+inline bool single_decoder(bool alone, long long mixed_at_start, long long mixed_now) {
+    return alone && mixed_now == mixed_at_start;
+}
+
 inline constexpr int kUnionMinWindow = 2, kUnionMaxWindow = 4;
 
 /// How many distinct experts a layer asks for over `w` consecutive tokens, as a share of the w * top_k asks: 1.0 when no
