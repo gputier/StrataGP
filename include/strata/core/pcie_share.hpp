@@ -110,7 +110,9 @@ inline int pcie_num_of(double frac) { return std::max(0, std::min(256, (int) (fr
 // for c the CPU path's us per job, w = blob / link the PCIe us per blob, l the host us the launch of a blob takes.  The host
 // serves one layer as launches, job build, pool, so a launch is host time on the CPU path's side of the balance (the wire
 // time w of the blobs runs beside it): n w = J c + n l.  Flash-Next passes no launch time and keeps pool_factor 1.85, and
-// its arithmetic is the one above (k = 1.85 - 0.0).
+// its arithmetic is the one above (k = 1.85 - 0.0).  An engine that times the copy streams passes the busy time and the
+// blobs the dispatch chose for PCIe as well: w is then that time per chosen blob (the demand copies, the prefetch traffic
+// and the link's real rate together) and the start-up probe is only the figure before the first reading.
 struct PcieAuto {
     static constexpr double kPoolFactor = 1.85;
     bool on = false;
@@ -118,28 +120,36 @@ struct PcieAuto {
     double min_share = 0.10;       ///< the lowest share a refinement may set (Flash-Next's 0.10; an engine that can do without the share passes 0)
     double max_share = 0.60;       ///< the highest share a refinement may set (Flash-Next's 0.60; an engine whose CPU pool is slow passes more)
     double pool_factor = kPoolFactor;   ///< what multiplies the pool's rate against the link's (an engine that times only the CPU path's own work passes 1)
-    double mark_ms = 0.0, mark_launch_ms = 0.0;
-    int64_t mark_jobs = 0, mark_blobs = 0;
-    double acc_ms = 0.0, acc_launch_ms = 0.0;
-    int64_t acc_jobs = 0, acc_blobs = 0;
+    double mark_ms = 0.0, mark_launch_ms = 0.0, mark_wire_ms = 0.0;
+    int64_t mark_jobs = 0, mark_blobs = 0, mark_chosen = 0;
+    double acc_ms = 0.0, acc_launch_ms = 0.0, acc_wire_ms = 0.0;
+    int64_t acc_jobs = 0, acc_blobs = 0, acc_chosen = 0;
     int acc_win = 0, updates = 0;
     double launch_us = 0.0;        ///< the last reading: the host's us per PCIe blob launched (0 when the engine passes no launch time)
-    void mark(double ms_run, int64_t jobs, double launch_ms = 0.0, int64_t blobs = 0) {
+    double wire_us = 0.0;          ///< the last reading: the PCIe us per chosen blob (the probe's when the engine passes no wire time)
+    void mark(double ms_run, int64_t jobs, double launch_ms = 0.0, int64_t blobs = 0, double wire_ms = 0.0,
+              int64_t chosen = 0) {
         mark_ms = ms_run;
         mark_jobs = jobs;
         mark_launch_ms = launch_ms;
         mark_blobs = blobs;
+        mark_wire_ms = wire_ms;
+        mark_chosen = chosen;
     }
     /// After a decode window: the new share, or -1 while there is nothing to change.  `tc_us`/`rate` get the reading.
     /// `launch_ms`/`blobs`: the host time spent launching PCIe copies and how many, cumulative like `ms_run` (none: 0).
+    /// `wire_ms`/`chosen`: the time the copy streams were busy and the blobs the dispatch chose for PCIe, cumulative too
+    /// (none: 0, then w is the probe's).
     double window(double ms_run, int64_t jobs, double cur, double* tc_us, double* rate, double launch_ms = 0.0,
-                  int64_t blobs = 0) {
+                  int64_t blobs = 0, double wire_ms = 0.0, int64_t chosen = 0) {
         if (!on) return -1.0;
         acc_ms += ms_run - mark_ms;
         acc_jobs += jobs - mark_jobs;
         acc_launch_ms += launch_ms - mark_launch_ms;
         acc_blobs += blobs - mark_blobs;
-        mark(ms_run, jobs, launch_ms, blobs);
+        acc_wire_ms += wire_ms - mark_wire_ms;
+        acc_chosen += chosen - mark_chosen;
+        mark(ms_run, jobs, launch_ms, blobs, wire_ms, chosen);
         ++acc_win;
         if (acc_win < (updates == 0 ? 48 : 96)) return -1.0;
         if (acc_jobs < 300) {          // too few missed experts to read the pool's speed (everything hits): look again
@@ -148,6 +158,9 @@ struct PcieAuto {
         }
         const double tc = acc_ms * 1000.0 / (double) acc_jobs;
         const double launch = acc_blobs > 0 ? acc_launch_ms * 1000.0 / (double) acc_blobs : 0.0;
+        const double measured_wire_us = acc_chosen > 0 ? acc_wire_ms * 1000.0 / (double) acc_chosen : 0.0;
+        acc_wire_ms = 0.0;
+        acc_chosen = 0;
         acc_ms = 0.0;
         acc_jobs = 0;
         acc_launch_ms = 0.0;
@@ -156,12 +169,14 @@ struct PcieAuto {
         if (++updates >= 3) on = false;
         if (!(tc > 1.0) || !(blob_bytes > 0.0) || !(link_gbps > 0.0)) return -1.0;
         const double r = blob_bytes / (tc * 1e-6) / 1e9;
-        const double wire_us = blob_bytes / (link_gbps * 1e3);
-        const double k = std::max(0.0, pool_factor - launch / wire_us);   // launch 0: pool_factor, the same double
-        const double f = std::min(max_share, std::max(min_share, std::round(link_gbps / (link_gbps + k * r) * 20.0) / 20.0));
+        const double link = measured_wire_us > 0.0 ? blob_bytes / (measured_wire_us * 1e3) : link_gbps;
+        const double wire = blob_bytes / (link * 1e3);
+        const double k = std::max(0.0, pool_factor - launch / wire);   // launch 0: pool_factor, the same double
+        const double f = std::min(max_share, std::max(min_share, std::round(link / (link + k * r) * 20.0) / 20.0));
         *tc_us = tc;
         *rate = r;
         launch_us = launch;
+        wire_us = wire;
         return std::fabs(f - cur) < 0.025 ? -1.0 : f;
     }
 };

@@ -1509,6 +1509,23 @@ struct Engine {
     // spent picking, launching and planning the PCIe copies, and how many
     double pa_cpu_ms = 0, pa_launch_ms = 0;
     long long pa_blobs = 0;
+    // the wire clock (it runs with the PcieAuto clocks): each layer step stamps its demand copies (stream pcs) and its prefetch
+    // copies (stream pfs) with a begin and an end event; a step is read, without a sync, once its events have completed, and
+    // the busy time is the union of the intervals read (wire_ms), against the blobs the steps chose for PCIe (wire_chosen)
+    struct WireStep {
+        cudaEvent_t ev[4] = {};   // demand begin, demand end, prefetch begin, prefetch end (null: that stream copied nothing)
+        int chosen = 0, demand = 0, prefetch = 0;
+        size_t bytes = 0;
+    };
+    struct WireCount {
+        double wire_ms = 0, bytes = 0, cpu_ms = 0, launch_ms = 0;
+        long long chosen = 0, demand = 0, prefetch = 0, jobs = 0, launched = 0;
+    };
+    cudaEvent_t ev_wire0 = nullptr;   // the common origin of the stamps
+    std::vector<cudaEvent_t> wire_free;
+    std::deque<WireStep> wire_pending;
+    WireCount wire, wire_mark;
+    int wire_steps = 0, wire_logs = 0;
     // STRATA_Q36_STATS=1 (q36_stats.hpp): the bytes each path reads, the host's wait on the doorbell, the experts' union over
     // consecutive tokens; every use below is behind stats_on, so a run without the switch reads no clock and adds no sync
     const bool stats_on = strata::q36::stats_enabled();
@@ -1545,18 +1562,88 @@ struct Engine {
                     for (int r = 0; r < n; ++r) stat_union.add(li, row_ids[li].data() + (size_t) r * Kp);
             }
     }
+    void wire_stamp(cudaEvent_t& ev, cudaStream_t s) {
+        if (wire_free.empty()) {
+            CK(cudaEventCreate(&ev));
+        } else {
+            ev = wire_free.back();
+            wire_free.pop_back();
+        }
+        CK(cudaEventRecord(ev, s));
+    }
+    /// Reads the layer steps whose copies have completed, in order (the first one still copying ends the pass).
+    void wire_resolve() {
+        std::vector<std::pair<double, double>> iv;
+        while (!wire_pending.empty()) {
+            WireStep& r = wire_pending.front();
+            bool done = true;
+            for (cudaEvent_t ev : r.ev) done = done && (ev == nullptr || cudaEventQuery(ev) == cudaSuccess);
+            if (!done) break;
+            bool ok = true;
+            std::vector<std::pair<double, double>> mine;
+            for (int i = 0; i < 4; i += 2) {
+                if (r.ev[i] == nullptr) continue;
+                float a = 0.f, b = 0.f;
+                ok = ok && cudaEventElapsedTime(&a, ev_wire0, r.ev[i]) == cudaSuccess &&
+                     cudaEventElapsedTime(&b, ev_wire0, r.ev[i + 1]) == cudaSuccess;
+                mine.emplace_back((double) a, (double) b);
+            }
+            if (ok) {
+                iv.insert(iv.end(), mine.begin(), mine.end());
+                wire.chosen += r.chosen;
+                wire.demand += r.demand;
+                wire.prefetch += r.prefetch;
+                wire.bytes += (double) r.bytes;
+            }
+            for (cudaEvent_t ev : r.ev)
+                if (ev != nullptr) wire_free.push_back(ev);
+            wire_pending.pop_front();
+        }
+        wire.wire_ms += strata::q36::interval_union_ms(iv);
+    }
+    /// STRATA_Q36_STATS=1: one line per window (48 steps, then 96 each, as PcieAuto's updates): the wire time measured against
+    /// the blobs chosen for PCIe and the blobs that crossed the link, and the share c / (c + w - l) gives with it.
+    void wire_stats() {
+        if (!pcie_on || ++wire_steps < (wire_logs == 0 ? 48 : 96)) return;
+        wire_steps = 0;
+        ++wire_logs;
+        WireCount now = wire;
+        now.cpu_ms = pa_cpu_ms;
+        now.launch_ms = pa_launch_ms;
+        now.jobs = hy_cpu_jobs;
+        now.launched = pa_blobs;
+        const long long chosen = now.chosen - wire_mark.chosen, on_wire = now.demand - wire_mark.demand + now.prefetch - wire_mark.prefetch;
+        const long long jobs = now.jobs - wire_mark.jobs, launched = now.launched - wire_mark.launched;
+        const double busy_us = (now.wire_ms - wire_mark.wire_ms) * 1000.0, bytes = now.bytes - wire_mark.bytes;
+        if (chosen > 0 && on_wire > 0 && jobs > 0 && launched > 0 && busy_us > 0.0) {
+            const double w = busy_us / (double) chosen;
+            const double c = (now.cpu_ms - wire_mark.cpu_ms) * 1000.0 / (double) jobs;
+            const double l = (now.launch_ms - wire_mark.launch_ms) * 1000.0 / (double) launched;
+            std::fprintf(stderr, "strata-q36: stats: wire window %d: share %.2f, %lld blobs chosen for PCIe (%lld on demand, %lld "
+                         "prefetched), busy %.0f us on the copy streams: %.1f us per chosen blob, %.1f us per blob on the wire, %.1f "
+                         "GB/s; CPU path %.0f us per job, launch %.1f us per blob -> c / (c + w - l) = %.3f\n", wire_logs,
+                         pcie_num / 256.0, chosen, now.demand - wire_mark.demand, now.prefetch - wire_mark.prefetch, busy_us, w,
+                         busy_us / (double) on_wire, bytes / (busy_us * 1e-6) / 1e9, c, l, c / (c + w - l));
+        }
+        wire_mark = now;
+    }
     /// After a decode step / verify window: the PCIe share refined from the pool's speed (PcieAuto, Flash-Next's rule: three
     /// updates at most, after 48 then 96 and 96 more windows).
     void pcie_window() {
-        if (!pcie_auto.on || warming) return;
+        if ((!pcie_auto.on && !stats_on) || warming) return;
+        wire_resolve();
+        if (stats_on) wire_stats();
+        if (!pcie_auto.on) return;
         double tc_us = 0.0, rate = 0.0;
-        const double nf = pcie_auto.window(pa_cpu_ms, hy_cpu_jobs, pcie_num / 256.0, &tc_us, &rate, pa_launch_ms, pa_blobs);
+        const double nf = pcie_auto.window(pa_cpu_ms, hy_cpu_jobs, pcie_num / 256.0, &tc_us, &rate, pa_launch_ms, pa_blobs,
+                                           wire.wire_ms, wire.chosen);
         if (nf < 0.0) return;
         std::fprintf(stderr, "strata-q36: PCIe share: the CPU path takes %.0f us per missed expert (%.1f GB/s of expert bytes; the "
-                     "pool's rows and the jobs' build), the link %.1f GB/s with %.0f us of host launch per blob -> %.2f (was %.2f; "
-                     "--pcie-frac N fixes it); since the last update %lld of %lld announced groups went over PCIe (the staging "
-                     "region holds %d per layer step)\n", tc_us, rate, pcie_auto.link_gbps, pcie_auto.launch_us, nf,
-                     pcie_num / 256.0, pc_sent, pc_want, strata::q36::kPcieSlots);
+                     "pool's rows and the jobs' build), the copy streams %.0f us per chosen blob (the probe said %.1f GB/s) with "
+                     "%.0f us of host launch per blob -> %.2f (was %.2f; --pcie-frac N fixes it); since the last update %lld of "
+                     "%lld announced groups went over PCIe (the staging region holds %d per layer step)\n", tc_us, rate,
+                     pcie_auto.wire_us, pcie_auto.link_gbps, pcie_auto.launch_us, nf, pcie_num / 256.0, pc_sent, pc_want,
+                     strata::q36::kPcieSlots);
         pc_want = pc_sent = 0;
         pcie_num = strata::core::pcie_num_of(nf);
     }
@@ -2571,7 +2658,7 @@ struct Engine {
     /// The host's part, while it serves layer li: the predicted picks of li + 1 (the real rule on the predicted routing, at
     /// most kPrefetchSlots) start copying into li + 1's region.  That region was last read by the PCIe call of li - 1,
     /// which ran before the routing of li was published.  Returns the blobs issued.
-    int pf_issue(size_t li, int n_ent) {
+    int pf_issue(size_t li, int n_ent, WireStep* ws) {
         const size_t nx = li + 1;
         const int par = (int) (nx & 1);
         const Layer& Ln = m->layers[nx];
@@ -2587,7 +2674,13 @@ struct Engine {
             src[j] = Ln.hblobs + (size_t) pf_ids[par][j] * Ln.stride;
             bytes[j] = Ln.stride;
         }
+        if (ws != nullptr) wire_stamp(ws->ev[2], pfs);
         CK(strata::core::copy_blobs(dst, src, bytes, (size_t) n, pfs, dma_mode()));
+        if (ws != nullptr) {
+            wire_stamp(ws->ev[3], pfs);
+            ws->prefetch = n;
+            ws->bytes += (size_t) n * Ln.stride;
+        }
         CK(cudaEventRecord(ev_pf[par], pfs));
         (void) cudaStreamQuery(pfs);   // submits the copies to the GPU (on WDDM the driver batches until asked)
         return n;
@@ -2624,7 +2717,8 @@ struct Engine {
         Hy& H = hy[li];
         const Layer& L = layer_at((int) li);
         const auto t0 = Clock::now();
-        const bool pa_on = pcie_auto.on && !warming;   // PcieAuto's clocks: none once it has settled
+        const bool pa_on = (pcie_auto.on || stats_on) && !warming;   // PcieAuto's clocks (and the stats'): none once it has settled
+        WireStep ws;
         // the missed entries per expert (up to MAXT tokens per job)
         jobs.clear();
         std::vector<char> quantized((size_t) T, 0);
@@ -2664,16 +2758,26 @@ struct Engine {
             ++n_copy;
         }
         if (n_copy > 0) {
+            if (pa_on) wire_stamp(ws.ev[0], pcs);
             CK(strata::core::copy_blobs(cdst, csrc, cbytes, (size_t) n_copy, pcs, dma_mode()));
+            if (pa_on) {
+                wire_stamp(ws.ev[1], pcs);
+                ws.demand = n_copy;
+                ws.bytes = (size_t) n_copy * L.stride;
+            }
             (void) cudaStreamQuery(pcs);   // submits the copies to the GPU (on WDDM the driver batches until asked)
         }
-        const int n_pf = pf_predicts(li, T) ? pf_issue(li, n_ent) : 0;
+        const int n_pf = pf_predicts(li, T) ? pf_issue(li, n_ent, pa_on ? &ws : nullptr) : 0;
         if (pcie_on) strata::q36::pcie_plan(h_ids, n_ent, Kp, picked, n_pcie, blob_ptr, pc_plan);
         double launch_ms = 0.0;
         if (pa_on) {
             launch_ms = ms_since(l0);
             pa_launch_ms += launch_ms;
             pa_blobs += n_copy + n_pf;
+            if (n_pcie > 0 || n_pf > 0) {
+                ws.chosen = n_pcie;
+                wire_pending.push_back(ws);
+            }
         }
         int n_pcie_ent = 0;
         for (int e = 0; e < n_ent; ++e) {
@@ -3341,6 +3445,8 @@ struct Engine {
         hy_cpu = hy_gpu = hy_swaps = hy_pcie = hy_cpu_jobs = pc_want = pc_sent = 0;
         hy_cpu_ms = pa_cpu_ms = pa_launch_ms = 0;
         pa_blobs = 0;
+        wire = wire_mark = WireCount();
+        wire_steps = wire_logs = 0;
         pcie_auto.mark(0.0, 0);
         reset();
         std::fprintf(stderr, "strata-q36: warmed up in %.1f s (one prompt chunk, a decode step%s)\n",
@@ -3641,6 +3747,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         CK(cudaMalloc(&E.pc_stage, pcie_bytes));
         CK(cudaMemset(E.pc_stage, 0, pcie_bytes));
         CK(cudaStreamCreateWithFlags(&E.pcs, cudaStreamNonBlocking));
+        CK(cudaEventCreate(&E.ev_wire0));
+        CK(cudaEventRecord(E.ev_wire0, E.pcs));
+        CK(cudaEventSynchronize(E.ev_wire0));
         E.pf_on = std::getenv("STRATA_Q36_NO_PREFETCH") == nullptr && m.layers.size() > 1;   // the staging area is the same size without it
         if (E.pf_on) {
             CK(cudaStreamCreateWithFlags(&E.pfs, cudaStreamNonBlocking));
