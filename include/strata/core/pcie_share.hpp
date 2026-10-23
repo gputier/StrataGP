@@ -120,8 +120,8 @@ struct PcieAuto {
     static constexpr double kMaxShare = 0.60;   ///< Flash-Next's highest share
     bool on = false;
     double link_gbps = 0.0, blob_bytes = 0.0;
-    double min_share = kMinShare;  ///< the lowest share a refinement may set (Flash-Next's 0.10; an engine that can do without the share passes 0)
-    double max_share = kMaxShare;  ///< the highest share a refinement may set (Flash-Next's 0.60; an engine whose CPU pool is slow passes more)
+    double min_share = kMinShare;  ///< the lowest share a refinement may set (an engine that can do without the share passes 0)
+    double max_share = kMaxShare;  ///< the highest share a refinement may set (an engine whose CPU pool is slow passes more)
     double pool_factor = kPoolFactor;   ///< what multiplies the pool's rate against the link's (an engine that times only the CPU path's own work passes 1)
     double mark_ms = 0.0, mark_launch_ms = 0.0, mark_wire_ms = 0.0;
     int64_t mark_jobs = 0, mark_chosen = 0;

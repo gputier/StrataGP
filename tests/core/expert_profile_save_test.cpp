@@ -43,11 +43,16 @@ int main() {
           r0[3] == Pair(1, 3) && r0[4] == Pair(0, 1) && r0[5] == Pair(0, 0), "without heat: resident, then prior");
 
     const std::filesystem::path dir = std::filesystem::temp_directory_path() / "strata_profile_save_test";
+    std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
     const std::string path = (dir / "learned.bin").string();
     std::string err;
     check(strata::core::write_expert_profile(path, L, E, r, err), "written");
-    check(!std::filesystem::exists(path + ".tmp"), "no temporary file left");
+    // the save writes a temporary of its own and renames it over the target: afterwards the directory holds the
+    // profile and nothing else, so a leftover temporary (any name starting with learned.bin.tmp) fails here
+    std::vector<std::string> names;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) names.push_back(entry.path().filename().string());
+    check(names.size() == 1 && names[0] == "learned.bin", "no temporary file left next to the profile");
     // the bytes make_profile.write_profile would write for the same ranking
     std::vector<uint8_t> want(4);
     std::memcpy(want.data(), "STRP", 4);

@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <functional>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <utility>
@@ -131,11 +132,7 @@ int main() {
             int64_t got_slots = 0;
             std::string rerr;
             const bool readable = strata::core::read_expert_profile(race, L, E, got, got_slots, rerr) && (got == ra || got == rb);
-            std::size_t entries = 0;
-            for (const auto& entry : std::filesystem::directory_iterator(race_dir)) {
-                (void) entry;
-                ++entries;
-            }
+            const auto entries = std::distance(std::filesystem::directory_iterator(race_dir), std::filesystem::directory_iterator{});
             if (!ok_a || !ok_b || !readable || entries != 1) ++failed;
         }
         check(failed == 0, "two saves of one path at once both succeed and leave one readable profile");

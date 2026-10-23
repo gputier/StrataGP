@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -24,6 +25,7 @@
 #ifndef NDEBUG
 namespace strata::kernels::cpu {
 extern std::atomic<int> g_pool_fail_thread_at;
+extern std::atomic<bool> g_pool_fail_thread_bad_alloc;
 }
 #endif
 
@@ -68,6 +70,20 @@ void test_thread_creation_failure() {
     }
     cpu::g_pool_fail_thread_at.store(-1);
     check(reported, "the failed start is reported as an error, and the process survives");
+
+    // Any other exception from a worker's creation (std::bad_alloc from its thread state) is rethrown as it is, and the
+    // workers already started are joined: the process survives it too.
+    cpu::g_pool_fail_thread_bad_alloc.store(true);
+    cpu::g_pool_fail_thread_at.store(2);
+    reported = false;
+    try {
+        cpu::ExpertPool pool(4, false, false);
+    } catch (const std::bad_alloc&) {
+        reported = true;
+    }
+    cpu::g_pool_fail_thread_at.store(-1);
+    cpu::g_pool_fail_thread_bad_alloc.store(false);
+    check(reported, "a std::bad_alloc while the pool starts is rethrown, and the process survives");
 
     // The hook must not point at the pool that failed to start.  Calling it must be safe either way.
     if (strata::core::DiagFn fn = strata::core::diag_pool_fn().load()) {

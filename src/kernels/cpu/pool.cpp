@@ -15,6 +15,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -506,9 +507,11 @@ void ExpertPool::diag(std::FILE* f) const {
 }
 
 #ifndef NDEBUG
-// Test hook (tests/core/pool_lifecycle_test.cpp): the worker whose creation fails, -1 for none.  Compiled out of
-// release builds, where the start is the plain loop.
+// Test hook (tests/core/pool_lifecycle_test.cpp): the worker whose creation fails, -1 for none, and the exception that
+// failure throws (std::bad_alloc when the flag is set, std::system_error otherwise).  Compiled out of release builds,
+// where the start is the plain loop.
 std::atomic<int> g_pool_fail_thread_at{-1};
+std::atomic<bool> g_pool_fail_thread_bad_alloc{false};
 #endif
 
 ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity affinity, int tasks)
@@ -531,11 +534,22 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     split_.resize((size_t) kMaxSplit);
     split_multi_.resize((size_t) kMaxSplitMulti);
     threads_.reserve((size_t) n_);
+    // The destructor never runs for a constructor that throws, so the workers already started are stopped here, as the
+    // destructor would stop them, and joined before the error goes out: a joinable thread destroyed would call
+    // std::terminate.
+    auto stop_started = [this] {
+        stop_.store(true, std::memory_order_release);
+        publish();
+        for (auto& t : threads_) t.join();
+    };
     try {
         for (int i = 0; i < n_; ++i) {
             const int core = pin ? (i < (int) topo_.worker_cores.size() ? topo_.worker_cores[(size_t) i] : -1) : -1;
 #ifndef NDEBUG
-            if (i == g_pool_fail_thread_at.load()) throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again), "injected");
+            if (i == g_pool_fail_thread_at.load()) {
+                if (g_pool_fail_thread_bad_alloc.load()) throw std::bad_alloc();
+                throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again), "injected");
+            }
 #endif
             threads_.emplace_back([this, i, core] {
                 strata::aux_cpus::note_owned_thread();   // --aux-cpus never moves a worker
@@ -544,13 +558,11 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
             });
         }
     } catch (const std::system_error& e) {
-        // The destructor never runs for a constructor that throws, so the workers already started are stopped here,
-        // as the destructor would stop them, and joined before the error goes out: a joinable thread destroyed would
-        // call std::terminate.
-        stop_.store(true, std::memory_order_release);
-        publish();
-        for (auto& t : threads_) t.join();
+        stop_started();
         throw std::runtime_error(std::string("expert pool: thread creation failed: ") + e.what());
+    } catch (...) {
+        stop_started();
+        throw;
     }
     {
         std::lock_guard<std::mutex> lk(diag_mu());
