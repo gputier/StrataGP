@@ -24,6 +24,20 @@ namespace k = strata::kernels;
 
 namespace {
 constexpr int N = 2560, HC = 4, D = N * HC, LR = 320, TM = 8;
+void set_env(const char* name, const char* value) {
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+void unset_env(const char* name) {
+#if defined(_WIN32)
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
+#endif
+}
 void ck(cudaError_t e, const char* w) {
     if (e != cudaSuccess) {
         std::fprintf(stderr, "%s: %s\n", w, cudaGetErrorString(e));
@@ -52,8 +66,8 @@ T* dev(size_t n) {
 
 int main(int argc, char** argv) {
     const bool off = argc > 1 && std::strcmp(argv[1], "--off") == 0;
-    if (off) unsetenv("STRATA_HC_PERSIST");
-    else setenv("STRATA_HC_PERSIST", "1", 1);
+    if (off) unset_env("STRATA_HC_PERSIST");
+    else set_env("STRATA_HC_PERSIST", "1");
     k::fused_gr_check();
     k::fused_gr_persist_init();
 
