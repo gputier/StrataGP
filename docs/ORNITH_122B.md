@@ -253,7 +253,7 @@ Estimated gains come from calculations in the sources, not from measurements on 
 10. Expert pruning (REAP), issue #75. Not measured on Ornith. The published figure is 95.8 % kept on BoolQ alone at 20 % pruning, on another model. First measurement: KL on the ten prompts.
 11. KV precision, issue #72. Accepted by the owner on 23 October 2026: KL 0.079 on the short prompts against the 0.061 bar, with `--kv q4`. The measurements are in the Ornith section of QWEN36.md.
 12. YaRN gate, issue #73. A 99 % top-1 target cannot be reached even by llama.cpp (91.6 %). The owner must choose a criterion.
-13. Q2_0 on CPU, issue #70. A pack of type 42 passes a null activation to the pool, found by reading the code and not yet reproduced. It must be fixed before any move to Q2_0.
+13. Q2_0 on CPU, issue #70. Fixed on branch `fix-issues-simples`: `hy_cpu_compute` now fills the ActQ that the Q2_0 kernels read. A Q2_0 pack whose n_embd exceeds 2560 is refused at load, so Ornith (3072) stays off native Q2_0 while the ActQ keeps its size. The fix is not yet proven on an AVX2 CPU and not compiled under CUDA.
 
 ## Resuming
 

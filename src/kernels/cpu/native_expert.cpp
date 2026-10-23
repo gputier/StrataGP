@@ -74,6 +74,13 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
               std::to_string(kNativeMaxFF) + " row buffers";
         return false;
     }
+    // Q2_0 gate/up reads its activation from an ActQ, sized for cpu::H; a wider n_embd would write past it. Refused
+    // whatever the CPU, so a pack loads the same way everywhere.
+    if (gu_type == 42 && n_embd > cpu::H) {
+        err = "native experts: Q2_0 gate/up with n_embd " + std::to_string(n_embd) + " is above the ActQ width " +
+              std::to_string(cpu::H);
+        return false;
+    }
     f.gu_type = gu_type;
     f.d_type = d_type;
     f.gu_act = (int) tg->vec_dot_type;

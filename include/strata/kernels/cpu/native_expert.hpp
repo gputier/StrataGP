@@ -52,7 +52,8 @@ constexpr size_t kNvfp4Tail = 16;
 
 /// Whether this build has the ggml-cpu path.
 bool native_experts_available() noexcept;
-/// Fills `f` for a layer; false (with a reason) when ggml-cpu has no dot product for a type or n_ff is above kNativeMaxFF.
+/// Fills `f` for a layer; false (with a reason) when ggml-cpu has no dot product for a type, n_ff is above kNativeMaxFF,
+/// or a Q2_0 (type 42) gate/up has n_embd above cpu::H.
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err);
 
 /// x (n_embd floats) -> the gate/up activation (act_bytes).

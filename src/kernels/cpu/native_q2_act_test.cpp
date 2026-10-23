@@ -44,6 +44,19 @@ double rel(const std::vector<float>& a, const std::vector<float>& b) {
 
 int main(int argc, char** argv) {
     const bool hy_job = argc > 1 && std::strcmp(argv[1], "--hy-job") == 0;
+    // the geometry refusal runs before the AVX-2 skip, so it is checked on every CPU
+    {
+        cpu::NativeFmt wide, fits;
+        std::string wide_err, fits_err;
+        const bool wide_ok = cpu::native_fmt(kGuType, kDType, 3072, kFF, wide, wide_err);
+        const bool fits_ok = cpu::native_fmt(kGuType, kDType, kH, kFF, fits, fits_err);
+        if (wide_ok || !fits_ok) {
+            std::printf("native_q2_act_test: FAIL geometry: n_embd 3072 accepted %s, n_embd %lld refused (%s)\n",
+                        wide_ok ? "yes" : "no", (long long) kH, fits_err.c_str());
+            return 1;
+        }
+        std::printf("native_q2_act_test: Q2_0 refused at n_embd 3072 (%s)\n", wide_err.c_str());
+    }
     if (!cpu::cpu_avx2_ok()) {
         std::printf("native_q2_act_test: no AVX2 on this CPU, the Q2_0 kernels are not reached: skipped\n");
         return kSkip;
