@@ -437,6 +437,26 @@ int main() {
         std::snprintf(what, sizeof what, "%d readings: the share is the old formula's, bit for bit, and no launch time is read", n);
         check(same, what);
     }
+    std::printf("stage_share (one formula for every stage's share):\n");
+    {
+        using strata::core::PcieAuto;
+        // the formula the Flash-Next stages copied, written out: the balance, rounded to 1/20, between 0.10 and 0.60; the
+        // function equals it bit for bit on a grid of links and pool rates, at its default factor and bounds
+        bool same = true;
+        int n = 0;
+        for (int i = 1; i <= 120; ++i) {
+            const double link = 0.5 * i;
+            for (int j = 1; j <= 400; ++j) {
+                const double rate = 0.2 * j;
+                const double old = std::min(0.60, std::max(0.10, std::round(link / (link + 1.85 * rate) * 20.0) / 20.0));
+                same = same && PcieAuto::stage_share(link, rate) == old;
+                ++n;
+            }
+        }
+        char what[120];
+        std::snprintf(what, sizeof what, "%d links and rates: stage_share is the old formula's, bit for bit", n);
+        check(same, what);
+    }
     std::printf("interval_union_ms:\n");
     {
         std::vector<std::pair<double, double>> none;

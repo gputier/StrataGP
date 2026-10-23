@@ -116,10 +116,12 @@ inline int pcie_num_of(double frac) { return std::max(0, std::min(256, (int) (fr
 // figure before the first reading.
 struct PcieAuto {
     static constexpr double kPoolFactor = 1.85;
+    static constexpr double kMinShare = 0.10;   ///< Flash-Next's lowest share
+    static constexpr double kMaxShare = 0.60;   ///< Flash-Next's highest share
     bool on = false;
     double link_gbps = 0.0, blob_bytes = 0.0;
-    double min_share = 0.10;       ///< the lowest share a refinement may set (Flash-Next's 0.10; an engine that can do without the share passes 0)
-    double max_share = 0.60;       ///< the highest share a refinement may set (Flash-Next's 0.60; an engine whose CPU pool is slow passes more)
+    double min_share = kMinShare;  ///< the lowest share a refinement may set (Flash-Next's 0.10; an engine that can do without the share passes 0)
+    double max_share = kMaxShare;  ///< the highest share a refinement may set (Flash-Next's 0.60; an engine whose CPU pool is slow passes more)
     double pool_factor = kPoolFactor;   ///< what multiplies the pool's rate against the link's (an engine that times only the CPU path's own work passes 1)
     double mark_ms = 0.0, mark_launch_ms = 0.0, mark_wire_ms = 0.0;
     int64_t mark_jobs = 0, mark_chosen = 0;
@@ -135,6 +137,13 @@ struct PcieAuto {
         mark_launch_ms = launch_ms;
         mark_wire_ms = wire_ms;
         mark_chosen = chosen;
+    }
+    /// The share of a stage's missed experts for a link of `link_gbps` against a CPU pool of `pool_gbps`: the balance
+    /// link / (link + pool_factor x pool), rounded to 1/20 and kept within [min_share, max_share].  The only copy of
+    /// this formula: every stage of a split takes its share here.
+    static double stage_share(double link_gbps, double pool_gbps, double pool_factor = kPoolFactor, double min_share = kMinShare,
+                              double max_share = kMaxShare) {
+        return std::min(max_share, std::max(min_share, std::round(link_gbps / (link_gbps + pool_factor * pool_gbps) * 20.0) / 20.0));
     }
     /// After a decode window: the new share, or -1 while there is nothing to change.  `tc_us`/`rate` get the reading.
     /// `launch_ms`: the host time spent launching PCIe copies, cumulative like `ms_run` (none: 0).  `wire_ms`/`chosen`: the
@@ -170,7 +179,7 @@ struct PcieAuto {
         const double link = measured_wire_us > 0.0 ? blob_bytes / (measured_wire_us * 1e3) : link_gbps;
         const double wire = blob_bytes / (link * 1e3);
         const double k = std::max(0.0, pool_factor - launch / wire);   // launch 0: pool_factor, the same double
-        const double f = std::min(max_share, std::max(min_share, std::round(link / (link + k * r) * 20.0) / 20.0));
+        const double f = stage_share(link, r, k, min_share, max_share);
         *tc_us = tc;
         *rate = r;
         launch_us = launch;

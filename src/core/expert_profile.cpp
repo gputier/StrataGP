@@ -3,11 +3,18 @@
 #include "strata/core/expert_cache.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <system_error>
+
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace strata::core {
 
@@ -136,7 +143,15 @@ bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_e
     // the slot count is the ranking's length: the producer ranks every pair once, so the two agree
     const uint32_t hdr[5] = {1u, (uint32_t) n_layers, (uint32_t) n_expert, (uint32_t) ranked.size(),
                              (uint32_t) ranked.size()};
-    const std::string tmp = path + ".tmp";
+    // a temporary of its own: the process id and a counter of this process's writes, so two saves of one path never
+    // share a file (the rename below still replaces the target in one step)
+    static std::atomic<uint64_t> n_writes{0};
+#ifdef _WIN32
+    const long pid = (long) _getpid();
+#else
+    const long pid = (long) ::getpid();
+#endif
+    const std::string tmp = path + ".tmp." + std::to_string(pid) + "." + std::to_string(n_writes++);
     std::FILE* f = std::fopen(tmp.c_str(), "wb");
     if (f == nullptr) {
         err = "write_expert_profile: cannot create " + tmp;

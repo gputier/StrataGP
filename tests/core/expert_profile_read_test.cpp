@@ -5,10 +5,13 @@
 #include "check.hpp"
 #include "strata/core/expert_cache.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <functional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -101,6 +104,42 @@ int main() {
     const bool wrote = strata::core::write_expert_profile(target, L, E, {{1, 2}}, werr);
     check(!wrote && has(werr, "write_expert_profile: cannot write " + target + ": "),
           "a write whose rename fails names its cause");
+
+    // two saves of one path at once: each writes its own temporary, so both succeed, the file reads back as one of the
+    // two rankings, and no temporary is left beside it
+    {
+        const std::filesystem::path race_dir = dir / "race";
+        std::filesystem::create_directories(race_dir);
+        const std::string race = (race_dir / "profile.bin").string();
+        const std::vector<Pair> ra = {{0, 1}, {1, 2}, {2, 3}}, rb = {{3, 4}, {0, 0}};
+        int failed = 0;
+        for (int round = 0; round < 300; ++round) {
+            std::atomic<int> ready{0};
+            bool ok_a = false, ok_b = false;
+            auto save = [&](const std::vector<Pair>& r, bool& ok) {
+                ready.fetch_add(1);
+                while (ready.load() < 2) {
+                }
+                std::string e;
+                ok = strata::core::write_expert_profile(race, L, E, r, e);
+            };
+            std::thread ta(save, std::cref(ra), std::ref(ok_a));
+            std::thread tb(save, std::cref(rb), std::ref(ok_b));
+            ta.join();
+            tb.join();
+            std::vector<Pair> got;
+            int64_t got_slots = 0;
+            std::string rerr;
+            const bool readable = strata::core::read_expert_profile(race, L, E, got, got_slots, rerr) && (got == ra || got == rb);
+            std::size_t entries = 0;
+            for (const auto& entry : std::filesystem::directory_iterator(race_dir)) {
+                (void) entry;
+                ++entries;
+            }
+            if (!ok_a || !ok_b || !readable || entries != 1) ++failed;
+        }
+        check(failed == 0, "two saves of one path at once both succeed and leave one readable profile");
+    }
 
     std::filesystem::remove_all(dir);
     if (g_fail == 0) std::puts("expert_profile_read_test: OK");
