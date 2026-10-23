@@ -6,7 +6,10 @@ tells Ornith-1.5-122B (the same arch) from Qwen3.6: its API name and the model c
 """
 from __future__ import annotations
 
+import json
+import os
 import struct
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -135,6 +138,57 @@ class Q36ExpertProfile(unittest.TestCase):
         self.assertEqual(engine_args(c), ["--native", "x", "--expert-profile-save", "p.bin", "--expert-profile-save-every", "5"])
         self.write(d / "p.bin")
         self.assertNotIn("--expert-profile", engine_args(c))                     # only the Qwen3.6 engine starts from the save alone
+
+
+class _Reached(Exception):
+    """raised by the patched serve(): main() has built the service and is about to serve it."""
+
+
+class ServiceFamily(unittest.TestCase):
+    """#90: the family and the card's sampling that main() gives the service it builds from a config (the strata engine
+    is a stub: no process, no GPU)."""
+
+    def service_for(self, **kw):
+        import serve.server as S
+        built = {}
+
+        class StubEngine:
+            def __init__(self, exe, args, **opts):
+                self.info = {}
+                self.spawn = (exe, list(args), opts.get("cwd"), None, opts.get("env"), False, None)
+
+        def fake_serve(svc, host=None, port=None):
+            built["svc"] = svc
+            raise _Reached
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ), mock.patch("builtins.print"), \
+                mock.patch.object(S, "StrataEngine", StubEngine), mock.patch.object(S, "serve", fake_serve):
+            os.environ.pop("STRATA_API_KEY", None)
+            tok = Path(d) / "tokenizer"
+            tok.mkdir()
+            vocab = {chr(i): i - 32 for i in range(32, 127)}           # every printable character, one token each
+            vocab["ab"] = len(vocab)                                    # the one merge below needs its result
+            (tok / "vocab.json").write_text(json.dumps(vocab), encoding="utf-8")
+            (tok / "merges.txt").write_text("a b", encoding="utf-8")
+            (tok / "token_type.json").write_text(json.dumps([1] * len(vocab)), encoding="utf-8")
+            p = Path(d) / "cfg.json"
+            p.write_text(json.dumps(cfg(tokenizer=str(tok), **kw)), encoding="utf-8")
+            with mock.patch.object(sys, "argv", ["server.py", "--engine", "strata", "--port", "0", "--config", str(p)]):
+                with self.assertRaises(_Reached):
+                    S.main()
+        return built["svc"]
+
+    def test_each_model_gets_its_own_family_and_card_sampling(self):
+        card_general = {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5}
+        card_instruct = {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}
+        ornith = self.service_for(model_name="ornith-1.5-122b-iq3xxs-iq4xs")
+        self.assertEqual(ornith.model_arch, "ornith")
+        self.assertEqual(model_card_sampling(ornith.model_arch, False), card_general)
+        self.assertEqual(model_card_sampling(ornith.model_arch, True), card_general)
+        qwen = self.service_for(model_name="qwen3.6-35b-a3b-ud-q4_k_xl")
+        self.assertEqual(qwen.model_arch, "qwen35moe")
+        self.assertEqual(model_card_sampling(qwen.model_arch, False), card_instruct)
+        self.assertEqual(model_card_sampling(qwen.model_arch, True), card_general)
 
 
 if __name__ == "__main__":
