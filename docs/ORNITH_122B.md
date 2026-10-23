@@ -170,7 +170,7 @@ of six greedy prompts and ten of ten logit prompts.
 
 ### Kernels from ik_llama (22 October)
 
-Reading the source of ik_llama's CPU MoE kernels (MIT licence, commit `c12b5ac`) shows that its IQ3_XXS path repacks
+Reading the source of ik_llama's CPU MoE kernels (MIT licence, commit `c12b5ac` of the external ik_llama repository, not checked from this repository) shows that its IQ3_XXS path repacks
 weights in R4 layout and its IQ4_XS path in R8 layout. The R8 path quantizes the activation to Q8_K32 instead of Q8_K,
 which changes the bits of the output. A second copy of the repacked experts would cost about 50 GB of RAM (calculated).
 No measurement was made. The recommended order is to measure the existing bench first, then the existing one-token path.
