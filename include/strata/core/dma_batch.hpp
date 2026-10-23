@@ -25,14 +25,11 @@
 
 namespace strata::core {
 
-/// The mode: STRATA_DMA_BATCH (0, 1, 2); unset = the engine's default (`default_mode`, set at the call site's first
-/// use; 0 until a measured win makes it 1).
+/// The mode: STRATA_DMA_BATCH (0, 1, 2), read once for the process; unset, `default_mode` (the caller's, at each call;
+/// 0 until a measured win makes it 1).
 inline int dma_batch_mode(int default_mode = 0) {
-    static const int mode = [default_mode] {
-        const char* e = std::getenv("STRATA_DMA_BATCH");
-        return e != nullptr && e[0] != '\0' ? std::atoi(e) : default_mode;
-    }();
-    return mode;
+    static const char* const env = std::getenv("STRATA_DMA_BATCH");
+    return env != nullptr && env[0] != '\0' ? std::atoi(env) : default_mode;
 }
 
 namespace detail {

@@ -95,6 +95,8 @@ double ms_since(Clock::time_point t) { return std::chrono::duration<double, std:
 constexpr int kThreads = 256;
 constexpr int kChunkCells = 256;   // attention split-K chunk
 constexpr int kConvTile = 16;     // tokens per block of the prompt conv (k_conv_seq tile mode)
+// the PCIe copies' DMA mode unless STRATA_DMA_BATCH is set (dma_batch.hpp: 1 = one batch per group)
+constexpr int kPcieDmaBatch = 1;
 
 // ------------------------------------------------------------------------------------------------ small kernels
 __device__ __forceinline__ float silu(float v) { return v / (1.0f + expf(-v)); }
@@ -1982,6 +1984,8 @@ struct Engine {
     int ser_kmin = 8;           // the picks of rank >= ser_kmin are kept only above ser_t * the top probability
     float ser_t = 0.0f;
     bool verify_k = std::getenv("STRATA_Q36_VERIFY") != nullptr;
+    // the verify scratch (vbuf), in floats: the start refuses a model whose matrices would not fit it
+    static constexpr size_t kVerifyFloats = (size_t) 8 * 16384;
     float* vbuf = nullptr;                       // verify scratch
     long long v_calls = 0, v_bad = 0;
     std::map<std::string, long long> v_by;   // mismatches per check
@@ -2000,14 +2004,19 @@ struct Engine {
                              tag.c_str(), i, n, (double) ha[i], (double) hb[i], *(unsigned*) &ha[i], *(unsigned*) &hb[i]);
         }
     }
+    /// The Q8_0 matrices q8_small takes, whatever T: fast_k, a shape the kernel reads, not on the packed decode kernel. Only
+    /// these write vbuf (T x n_out floats), so the VERIFY start guard tests exactly them.
+    bool q8_small_shape(const Mat& w) const {
+        if (!fast_k || w.type != 8 || w.n_in % 32 != 0) return false;
+        if (K::native_q8_0_packed_eligible(w.n_in, w.n_out) && K::native_q8_0_packed_enabled()) return false;
+        return w.n_in / 32 <= q36k::kQ8MaxBlocks;
+    }
     /// A Q8_0 matrix that is not on the packed decode kernel (the shared expert, attention k / v: fewer than 2048
     /// rows) for T <= 8 columns: one warp per row (q36k::k_q8_rows) in place of the 4-warp block of
     /// native_small_mmvq_kernel; the same bits.
     bool q8_small(const Mat& w, const void* q, float* out, int T) {
-        if (!fast_k || w.type != 8 || T < 1 || T > 8 || w.n_in % 32 != 0) return false;
-        if (K::native_q8_0_packed_eligible(w.n_in, w.n_out) && K::native_q8_0_packed_enabled()) return false;
+        if (T < 1 || T > 8 || !q8_small_shape(w)) return false;
         const int nb = w.n_in / 32;
-        if (nb > q36k::kQ8MaxBlocks) return false;
         const void* wp = w.d;
         const half* dpl = nullptr;
 #define Q36_Q8(NCV)                                                                                          \
@@ -2017,7 +2026,7 @@ struct Engine {
         switch (T) { Q36_Q8(1) Q36_Q8(2) Q36_Q8(3) Q36_Q8(4) Q36_Q8(5) Q36_Q8(6) Q36_Q8(7) Q36_Q8(8) }
 #undef Q36_Q8
         if (verify_k) {
-            if (!vbuf) CK(cudaMalloc((void**) &vbuf, (size_t) 8 * 16384 * 4));
+            if (!vbuf) CK(cudaMalloc((void**) &vbuf, kVerifyFloats * 4));
             const size_t qb = K::native_q8_1_bytes(w.n_in, 1);
             for (int c0 = 0; c0 < T; c0 += 8) {
                 const int nc = std::min(8, T - c0);
@@ -2097,14 +2106,20 @@ struct Engine {
         }
         k_add_rms<<<T, kThreads, 0, st>>>(x, y, L.post_norm, h, N, m->eps);
     }
+    /// The layer's shared expert takes shared_gu, whatever T: fast_k, Q8_0 gate and up of FS outputs, not on the packed decode
+    /// kernel. Only these write vbuf (gate at 0, up at 8 x FS, T <= 4 rows of each), so the VERIFY start guard tests exactly them.
+    bool shared_gu_shape(const Layer& L) const {
+        const int FS = (int) m->g.n_ff_shexp;
+        const Mat &a = L.sh_gate, &b = L.sh_up;
+        return fast_k && a.type == 8 && b.type == 8 && a.n_in == b.n_in && a.n_out == FS && b.n_out == FS && a.n_in % 32 == 0 &&
+               a.n_in / 32 <= q36k::kQ8MaxBlocks && a.n_in / 32 > q36k::kQ8RowBlocks && FS % 32 == 0 &&
+               !(K::native_q8_0_packed_eligible(a.n_in, a.n_out) && K::native_q8_0_packed_enabled());
+    }
     /// The shared expert's gate + up + SwiGLU + q8_1 image (into q8) for T <= 4 rows in one launch (q36k::k_sh_gu), else false.
     bool shared_gu(const Layer& L, int T) {
         const int FS = (int) m->g.n_ff_shexp;
         const Mat &a = L.sh_gate, &b = L.sh_up;
-        if (!fast_k || T < 1 || T > 4 || a.type != 8 || b.type != 8 || a.n_in != b.n_in || a.n_out != FS || b.n_out != FS ||
-            a.n_in % 32 != 0 || a.n_in / 32 > q36k::kQ8MaxBlocks || a.n_in / 32 <= q36k::kQ8RowBlocks || FS % 32 != 0 ||
-            (K::native_q8_0_packed_eligible(a.n_in, a.n_out) && K::native_q8_0_packed_enabled()))
-            return false;
+        if (T < 1 || T > 4 || !shared_gu_shape(L)) return false;
         const int nb = a.n_in / 32;
         const dim3 grid((unsigned) (FS / 32));
         const bool pkd = false;
@@ -2127,7 +2142,7 @@ struct Engine {
         switch (T) { Q36_SH(1) Q36_SH(2) Q36_SH(3) Q36_SH(4) }
 #undef Q36_SH
         if (verify_k) {
-            if (!vbuf) CK(cudaMalloc((void**) &vbuf, (size_t) 8 * 16384 * 4));
+            if (!vbuf) CK(cudaMalloc((void**) &vbuf, kVerifyFloats * 4));
             if (!vq) CK(cudaMalloc(&vq, K::native_q8_1_bytes(m->g.n_embd, 1) * 8));
             float* vg = vbuf;
             float* vu = vbuf + (size_t) 8 * FS;
@@ -2220,7 +2235,7 @@ struct Engine {
         grouped_by_route = true;
         if (verify_k && !opt) {
             // the old top-k into scratch, the ids / weights compared, then the old grouping of the new ids
-            if (!vbuf) CK(cudaMalloc((void**) &vbuf, (size_t) 8 * 16384 * 4));
+            if (!vbuf) CK(cudaMalloc((void**) &vbuf, kVerifyFloats * 4));
             int32_t* vid = (int32_t*) (vbuf + 8 * 8192);
             float* vw = vbuf + 8 * 8192 + 64;
             K::native_router_topk(logits_r, vid, vw, 256, Kp, T, st);
@@ -2692,9 +2707,9 @@ struct Engine {
             bytes[j] = Ln.stride;
         }
         if (ws != nullptr) wire_stamp(ws->ev[2], pfs);
-        // the PCIe copies as one cudaMemcpyBatchAsync per group, on unless STRATA_DMA_BATCH=0 (q36's default of 1; Flash-Next's
-        // default is its own).  No other caller of dma_batch_mode runs in strata-q36, so its process-wide cache takes this 1.
-        CK(strata::core::copy_blobs(dst, src, bytes, (size_t) n, pfs, strata::core::dma_batch_mode(1)));
+        // the PCIe copies as one cudaMemcpyBatchAsync per group, on unless STRATA_DMA_BATCH=0 (q36's default is kPcieDmaBatch;
+        // Flash-Next's default is its own).
+        CK(strata::core::copy_blobs(dst, src, bytes, (size_t) n, pfs, strata::core::dma_batch_mode(kPcieDmaBatch)));
         if (ws != nullptr) {
             wire_stamp(ws->ev[3], pfs);
             ws->prefetch = n;
@@ -2778,7 +2793,7 @@ struct Engine {
         }
         if (n_copy > 0) {
             if (pa_on) wire_stamp(ws.ev[0], pcs);
-            CK(strata::core::copy_blobs(cdst, csrc, cbytes, (size_t) n_copy, pcs, strata::core::dma_batch_mode(1)));
+            CK(strata::core::copy_blobs(cdst, csrc, cbytes, (size_t) n_copy, pcs, strata::core::dma_batch_mode(kPcieDmaBatch)));
             if (pa_on) {
                 wire_stamp(ws.ev[1], pcs);
                 ws.demand = n_copy;
@@ -2790,12 +2805,11 @@ struct Engine {
         if (pcie_on) strata::q36::pcie_plan(h_ids, n_ent, Kp, picked, n_pcie, blob_ptr, pc_plan);
         double launch_ms = 0.0;
         if (pa_on) {
+            // every step is read, one with no copy too (no events, so it resolves at once): its host time is launch time
             launch_ms = ms_since(l0);
-            if (n_pcie > 0 || n_pf > 0) {
-                ws.chosen = n_pcie;
-                ws.launch_ms = launch_ms;
-                wire_pending.push_back(ws);
-            }
+            ws.chosen = n_pcie;
+            ws.launch_ms = launch_ms;
+            wire_pending.push_back(ws);
         }
         int n_pcie_ent = 0;
         for (int e = 0; e < n_ent; ++e) {
@@ -3829,18 +3843,19 @@ using strata::q36::Sampling;
 using strata::q36::draw_rng;
 using strata::q36::sample;
 
-std::vector<int32_t> parse_ids(const char* s) {
-    std::vector<int32_t> v;
+// the ids of a comma or space separated list; false when a token is not an int32 integer: the list is refused, not cut short
+bool parse_ids(const char* s, std::vector<int32_t>& v) {
+    v.clear();
     while (*s) {
         while (*s == ',' || *s == ' ') ++s;
         if (!*s) break;
         char* e = nullptr;
         const long x = std::strtol(s, &e, 10);
-        if (e == s) break;
+        if (e == s || (*e != '\0' && *e != ',' && *e != ' ') || x < INT32_MIN || x > INT32_MAX) return false;
         v.push_back((int32_t) x);
         s = e;
     }
-    return v;
+    return true;
 }
 
 bool is_eos(int t) { return t == 248044 || t == 248046; }
@@ -4226,6 +4241,7 @@ struct Serve {
         }
         const long long max_new = std::strtoll(p, &p, 10);
         Sampling smp;
+        bool bad_repeat = false;   // a repeat penalty of 0 or below (or not finite) inverts the logits: refused, not run
         std::vector<uint64_t> img_keys;
         for (;;) {
             while (*p == ' ') ++p;
@@ -4241,7 +4257,10 @@ struct Serve {
             else if (key == "top_k") smp.top_k = std::atoi(v);
             else if (key == "min_p") smp.min_p = std::strtof(v, nullptr);
             else if (key == "penalty_last_n") smp.last_n = std::atoi(v);
-            else if (key == "penalty_repeat") smp.repeat = std::strtof(v, nullptr);
+            else if (key == "penalty_repeat") {
+                smp.repeat = std::strtof(v, nullptr);
+                bad_repeat = !std::isfinite(smp.repeat) || smp.repeat <= 0.0f;
+            }
             else if (key == "penalty_freq") smp.freq = std::strtof(v, nullptr);
             else if (key == "penalty_present") smp.present = std::strtof(v, nullptr);
             else if (key == "seed") smp.seed = std::strtoull(v, nullptr, 10);
@@ -4266,7 +4285,17 @@ struct Serve {
             emb.assign(p, (size_t) (e - p));
             p = const_cast<char*>(e);
         }
-        const std::vector<int32_t> ids = parse_ids(p);
+        if (bad_repeat) {
+            std::printf("ERR bad request: penalty_repeat must be a finite number above 0\n");
+            std::fflush(stdout);
+            return;
+        }
+        std::vector<int32_t> ids;
+        if (!parse_ids(p, ids)) {
+            std::printf("ERR bad request: the ids must be integers separated by commas or spaces\n");
+            std::fflush(stdout);
+            return;
+        }
         if (max_new < 1 || ids.empty() || (geni && emb.empty())) {
             std::printf("ERR bad request: max_new or the ids\n");
             std::fflush(stdout);
@@ -4787,6 +4816,34 @@ int strata::qwen35::run(int argc, char** argv) {
         std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
         return 1;
     }
+    // the model's geometry must fit the buffers it is written to, checked here with place_experts' final sizes (it shrinks the
+    // score buffer when the experts fit is close): the prompt attention writes H x ldp scores per query row, at least one row
+    if ((size_t) E.m->g.n_head * (size_t) ((E.kv_window() + 7) / 8 * 8) > E.kAttScoreFloats) {
+        std::fprintf(stderr, "strata-q36: the prompt attention needs %d heads x %d key cells of scores, more than the %zu floats "
+                     "the engine holds: lower --ctx or use --kv q4\n", (int) E.m->g.n_head, E.kv_window(), E.kAttScoreFloats);
+        return 2;
+    }
+    if (E.verify_k) {   // VERIFY's scratch (vbuf) must hold what the small Q8_0 path and the shared expert's gate and up write
+        // the kernels' own predicates decide which matrices write vbuf: the others are not tested
+        bool fits = true;
+        const auto q8_fits = [&E](const Mat& w) { return !E.q8_small_shape(w) || 8 * (size_t) w.n_out <= Engine::kVerifyFloats; };
+        std::vector<const Layer*> layers;   // the MTP block's Mats are empty (type -1) unless it is loaded
+        for (const Layer& L : E.m->layers) layers.push_back(&L);
+        layers.push_back(&E.m->mtp);
+        for (const Layer* L : layers) {
+            for (const Mat* w : {&L->wq, &L->wk, &L->wv, &L->wo, &L->qkv, &L->zg, &L->ssm_out, &L->sh_gate, &L->sh_up,
+                                 &L->sh_down})
+                fits = fits && q8_fits(*w);
+            if (E.shared_gu_shape(*L)) fits = fits && 12 * (size_t) E.m->g.n_ff_shexp <= Engine::kVerifyFloats;   // up at 8 x FS, T <= 4
+        }
+        fits = fits && q8_fits(E.m->head) && q8_fits(E.m->eh_proj);
+        if (!fits) {
+            std::fprintf(stderr, "strata-q36: STRATA_Q36_VERIFY needs every Q8_0 matrix on the small path to have at most %zu "
+                         "outputs and the shared expert at most %zu; this model has more: unset STRATA_Q36_VERIFY to run it\n",
+                         Engine::kVerifyFloats / 8, Engine::kVerifyFloats / 12);
+            return 2;
+        }
+    }
     // the routing options that cannot hold their state or cannot apply are refused here, before anything runs
     if (cache_prior > 0.0f && E.n_sess > 1) {
         std::fprintf(stderr, "strata-q36: --cache-prior needs one session (--batch %d decodes %d at once): its Delta_avg state "
@@ -4864,7 +4921,11 @@ int strata::qwen35::run(int argc, char** argv) {
         }
         return 0;
     }
-    const std::vector<int32_t> prompt = parse_ids(tokens.c_str()), forced = parse_ids(force.c_str());
+    std::vector<int32_t> prompt, forced;
+    if (!parse_ids(tokens.c_str(), prompt) || !parse_ids(force.c_str(), forced)) {
+        std::fprintf(stderr, "strata-q36: --tokens and --force take integers separated by commas or spaces\n");
+        return 2;
+    }
     if (prompt.empty()) { std::fprintf(stderr, "strata-q36: --tokens, --serve or --bench-pp is required\n"); return 2; }
     if (!forced.empty()) n_gen = (int) forced.size() + 1;
     FILE* ff = dump_full.empty() ? nullptr : std::fopen(dump_full.c_str(), "wb");

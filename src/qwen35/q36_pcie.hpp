@@ -33,6 +33,7 @@ inline constexpr int kPcieSlots = 16;          // experts one layer step can sen
 inline constexpr int kPrefetchSlots = 8;       // blobs the prefetch copies ahead for one layer (one region; two regions by layer parity)
 inline constexpr int kPcieStageBlobs = kPcieSlots + 2 * kPrefetchSlots;   // the staging area: the layer's own slots, then the two regions
 inline constexpr int kPcieMaxEntries = 256;    // entries (rows x top_k) of a step that may carry a share (k_hy_split's limit)
+inline constexpr int kPcieMaxExperts = 512;    // experts of a model that may carry a share (k_group's counts; the load refuses more)
 inline constexpr int kPcieGroupRows = 4;       // the PCIe call's groups side by side (Flash-Next's kPcieGroupRows)
 inline constexpr int kPlanGroups = 0;
 inline constexpr int kPlanPtr = 2;
@@ -54,16 +55,21 @@ inline bool first_of_row(const int32_t* ids, int e, int top_k) {
 /// to `picked` (in routing order) and returns how many; `announced`, when given, gets the count the share asked for before
 /// the cap cut it.  A step of more than kPcieMaxEntries entries gets no share (k_hy_split serves at
 /// most that many): kPcieMaxEntries / top_k rows, 32 at the top-8 of Ornith and Qwen3.6, so a --hybrid-rows above that
-/// runs its bigger batches on the CPU pool alone.
+/// runs its bigger batches on the CPU pool alone.  A model of more than kPcieMaxExperts experts gets none either: the
+/// distinct experts are marked in a bit array of that size.
 inline int pcie_pick(const int32_t* ids, int n_ent, const std::vector<int>& slot_of, int pcie_num, int32_t* picked,
                      int* announced = nullptr, int cap = kPcieSlots) {
     if (announced != nullptr) *announced = 0;
-    if (pcie_num <= 0 || n_ent <= 0 || n_ent > kPcieMaxEntries) return 0;
+    if (pcie_num <= 0 || n_ent <= 0 || n_ent > kPcieMaxEntries || (int) slot_of.size() > kPcieMaxExperts) return 0;
     int32_t misses[kPcieMaxEntries];
+    uint64_t seen[kPcieMaxExperts / 64] = {};   // the experts already in misses, one bit each
     int n_miss = 0;
     for (int e = 0; e < n_ent; ++e) {
         const int32_t x = ids[e];
-        if (x < 0 || (size_t) x >= slot_of.size() || slot_of[(size_t) x] >= 0 || std::find(misses, misses + n_miss, x) != misses + n_miss) continue;
+        if (x < 0 || (size_t) x >= slot_of.size() || slot_of[(size_t) x] >= 0) continue;
+        const uint64_t bit = (uint64_t) 1 << (x % 64);
+        if (seen[x / 64] & bit) continue;
+        seen[x / 64] |= bit;
         misses[n_miss++] = x;
     }
     const int want = (n_miss * pcie_num) >> 8;

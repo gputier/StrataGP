@@ -5,10 +5,12 @@
 #include "q36_delta.hpp"
 #include "q36_pcie.hpp"
 
+#include "strata/core/dma_batch.hpp"
 #include "strata/core/pcie_share.hpp"
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -75,6 +77,18 @@ int main() {
     {
         std::vector<int32_t> many((size_t) kPcieMaxEntries + 1, 5);
         check(pick(many, 256, s16).empty(), "more entries than the plan holds: no share");
+    }
+    {
+        // experts above the first 64 and the last one of the bit array: a repeat counts once, in first-appearance order
+        const std::vector<int> s512(512, -1);
+        const std::vector<int32_t> high = {300, 511, 300, 64, 511, 0, 300, 64};
+        check(pick(high, 256, s512) == std::vector<int32_t>({300, 511, 64, 0}),
+              "an expert above 63 routed again is one miss, also at the top of the 512 experts");
+        // a model with more experts than the bit array holds gets no share
+        const std::vector<int> s513(513, -1);
+        int announced = -1;
+        check(pick(high, 256, s513, &announced).empty() && announced == 0,
+              "more experts than kPcieMaxExperts: no share, nothing announced");
     }
     check(pick({99, -1, 5}, 256, s16) == std::vector<int32_t>({5}), "ids outside the experts are ignored");
 
@@ -431,6 +445,15 @@ int main() {
         check(std::fabs(interval_union_ms(apart) - 2.5) < 1e-12, "two separate intervals add up, in any order");
         std::vector<std::pair<double, double>> over = {{0.0, 2.0}, {1.0, 3.0}, {2.5, 2.8}, {10.0, 10.5}};
         check(std::fabs(interval_union_ms(over) - 3.5) < 1e-12, "overlapping and nested intervals count once");
+    }
+    std::printf("dma_batch_mode:\n");
+    {
+        // the default is the caller's at every call; STRATA_DMA_BATCH, read once for the process, wins over it when set
+        const char* env = std::getenv("STRATA_DMA_BATCH");
+        const int set = env != nullptr && env[0] != '\0' ? std::atoi(env) : -1;
+        bool same = true;
+        for (const int d : {0, 1, 2}) same = same && strata::core::dma_batch_mode(d) == (set >= 0 ? set : d);
+        check(same, "unset, each call returns its own default; set, STRATA_DMA_BATCH wins over every default");
     }
     std::printf("first_of_row:\n");
     {
