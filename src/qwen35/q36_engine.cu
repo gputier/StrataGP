@@ -672,11 +672,13 @@ __global__ void k_route_scatter(const int32_t* ids, int n_ent, int K_, int32_t* 
     inv[e] = r;   // entry e's sorted row: where its down product lands
 }
 
-/// The greedy pick of one logits row: out = argmax (lowest id on ties), -1 when no logit is finite.  Stage 1: `gridDim.x` blocks each write the
-/// best of their stride into (pv, pi); stage 2 (one block, n = the stage-1 block count) reads those.
+/// The greedy pick of one logits row: out = argmax (lowest id on ties), -1 when the row holds a NaN or no finite logit.  Stage 1:
+/// `gridDim.x` blocks each write the best of their stride into (pv, pi), pv = NaN when their stride holds one; stage 2 (one block,
+/// n = the stage-1 block count) reads those.
 __global__ void k_argmax(const float* x, int n, int32_t* out, float* pv, int32_t* pi, bool stage2) {
     __shared__ float bv[kThreads];
     __shared__ int bi[kThreads];
+    __shared__ int bn[kThreads];   // a NaN seen by the thread (then by the block)
     // row blockIdx.y: its logits (stage 1, n = the vocabulary) and its kArgBlocks partials
     x += (size_t) blockIdx.y * (stage2 ? 0 : n);
     pv += (size_t) blockIdx.y * 128;
@@ -684,15 +686,21 @@ __global__ void k_argmax(const float* x, int n, int32_t* out, float* pv, int32_t
     out += blockIdx.y;
     float v = -INFINITY;
     int id = 0x7fffffff;
+    int nan = 0;
     if (stage2) {
-        for (int i = threadIdx.x; i < n; i += blockDim.x)
-            if (pv[i] > v || (pv[i] == v && pi[i] < id)) { v = pv[i]; id = pi[i]; }
+        for (int i = threadIdx.x; i < n; i += blockDim.x) {
+            if (isnan(pv[i])) nan = 1;
+            else if (pv[i] > v || (pv[i] == v && pi[i] < id)) { v = pv[i]; id = pi[i]; }
+        }
     } else {
-        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
-            if (x[i] > v) { v = x[i]; id = i; }
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+            if (isnan(x[i])) nan = 1;
+            else if (x[i] > v) { v = x[i]; id = i; }
+        }
     }
     bv[threadIdx.x] = v;
     bi[threadIdx.x] = id;
+    bn[threadIdx.x] = nan;
     __syncthreads();
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if ((int) threadIdx.x < s) {
@@ -702,15 +710,19 @@ __global__ void k_argmax(const float* x, int n, int32_t* out, float* pv, int32_t
                 bv[threadIdx.x] = ov;
                 bi[threadIdx.x] = oi;
             }
+            bn[threadIdx.x] |= bn[threadIdx.x + s];
         }
         __syncthreads();
     }
     if (threadIdx.x == 0) {
-        if (stage2) *out = isfinite(bv[0]) ? bi[0] : -1;   // no finite logit in the row (all -inf): -1, the callers' ERR
-        else { pv[blockIdx.x] = bv[0]; pi[blockIdx.x] = bi[0]; }
+        // a NaN anywhere in the row, or no finite logit (all -inf): -1, the callers' ERR
+        if (stage2) *out = (bn[0] || !isfinite(bv[0])) ? -1 : bi[0];
+        else { pv[blockIdx.x] = bn[0] ? NAN : bv[0]; pi[blockIdx.x] = bi[0]; }
     }
 }
 constexpr int kArgBlocks = 128;   // (the row stride of k_argmax's partials)
+// the ERR (or stderr) text of a row with no finite logit: serve/server.py raises it, the tests read it
+constexpr const char* kNoLogitMsg = "the logits hold no finite maximum or a NaN: no token drawn";
 
 unsigned grid1(int64_t n, int b = kThreads) { return (unsigned) ((n + b - 1) / b); }
 
@@ -3982,6 +3994,14 @@ struct Serve {
         if (const char* v = std::getenv("STRATA_Q36_READ_WINDOWS")) read_windows = std::max(0, std::min(64, std::atoi(v)));
     }
 
+    /// A slot whose row has no finite logit ends with no token drawn: BDONE ... error, and it leaves the batch (the others go on).
+    void end_no_logit(int b, Slot& sl, Engine::Sess& ss) {
+        std::printf("BDONE %d %lld error %.1f\n", b, (long long) sl.produced, ms_since(sl.t0));
+        sl.active = false;
+        ss.active = false;
+        --n_active;
+    }
+
     /// BSTOP / BYIELD lines among the queued ones: applied now (a window is a moment away at most).
     void poll_control() {
         std::lock_guard<std::mutex> lk(mu);
@@ -4076,10 +4096,7 @@ struct Serve {
                 if (j == 1) y = E.rows_pick[r0 + 1];
                 ss.live.push_back(fed[j]);
                 if (y < 0) {   // no finite logit: the slot ends here with no token drawn, the other slots go on
-                    std::printf("BDONE %d %lld error %.1f\n", b, (long long) sl.produced, ms_since(sl.t0));
-                    sl.active = false;
-                    ss.active = false;
-                    --n_active;
+                    end_no_logit(b, sl, ss);
                     done = true;
                     break;
                 }
@@ -4182,10 +4199,7 @@ struct Serve {
                 y = E.rows_pick[r];
             }
             if (y < 0) {   // no finite logit: the slot ends with no token drawn, the other slots go on
-                std::printf("BDONE %d %lld error %.1f\n", b, (long long) sl.produced, ms_since(sl.t0));
-                sl.active = false;
-                ss.active = false;
-                --n_active;
+                end_no_logit(b, sl, ss);
                 continue;
             }
             std::printf("BT %d %d\n", b, y);
@@ -4423,7 +4437,7 @@ struct Serve {
                 nx = sample(lg, smp, hist, r);
             }
             if (nx < 0) {   // no finite logit: the request ends in ERR, no slot taken
-                std::printf("ERR the logits hold no finite maximum or a NaN: no token drawn\n");
+                std::printf("ERR %s\n", kNoLogitMsg);
                 std::fflush(stdout);
                 return;
             }
@@ -4516,7 +4530,7 @@ struct Serve {
         }
         E.sess[(size_t) E.cur].pos = E.pos;
         if (no_logit) {
-            std::printf("ERR the logits hold no finite maximum or a NaN: no token drawn\n");
+            std::printf("ERR %s\n", kNoLogitMsg);
             std::fflush(stdout);
             return;
         }
@@ -4942,7 +4956,7 @@ int strata::qwen35::run(int argc, char** argv) {
             for (int i = 0; i < bench_tg; ++i) {
                 const int32_t one = nx;
                 if (one < 0) {
-                    std::fprintf(stderr, "strata-q36: the logits hold no finite maximum or a NaN: no token drawn\n");
+                    std::fprintf(stderr, "strata-q36: %s\n", kNoLogitMsg);
                     return 2;
                 }
                 E.process(&one, 1, [](int64_t) {});
@@ -4986,7 +5000,7 @@ int strata::qwen35::run(int argc, char** argv) {
         int nx = E.greedy();
         while ((int) gen.size() < n_gen) {
             if (nx < 0) {
-                std::fprintf(stderr, "strata-q36: the logits hold no finite maximum or a NaN: no token drawn\n");
+                std::fprintf(stderr, "strata-q36: %s\n", kNoLogitMsg);
                 return 2;
             }
             gen.push_back(nx);
@@ -5011,7 +5025,7 @@ int strata::qwen35::run(int argc, char** argv) {
     for (int i = 0; i < n_gen; ++i) {
         const int a = E.greedy();
         if (a < 0) {
-            std::fprintf(stderr, "strata-q36: the logits hold no finite maximum or a NaN: no token drawn\n");
+            std::fprintf(stderr, "strata-q36: %s\n", kNoLogitMsg);
             return 2;
         }
         gen.push_back(a);

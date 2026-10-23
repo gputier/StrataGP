@@ -2510,6 +2510,35 @@ class NoLogitReply(unittest.TestCase):
                 httpd.shutdown()
                 httpd.server_close()
 
+    def test_responses_and_anthropic_non_stream(self):
+        """#87: without stream, the engine's ERR before the first token is a 400 on /v1/responses and /v1/messages
+        too, with an invalid_request_error body (the same as /v1/chat/completions)."""
+        tok = ByteTokenizer()
+        msgs = [{"role": "user", "content": "hi"}]
+        for path, body in (("/v1/responses", {"model": "m", "input": "hi", "max_output_tokens": 20}),
+                           ("/v1/messages", {"model": "m", "messages": msgs, "max_tokens": 20})):
+            eng = NoLogitEngine(tok, "hello", max_context=CTX, cut=0)
+            svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+            httpd = serve(svc, port=0)
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            try:
+                req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                                             headers={"Content-Type": "application/json"})
+                with contextlib.redirect_stdout(io.StringIO()):
+                    try:
+                        with urllib.request.urlopen(req, timeout=30) as r:
+                            got, text = r.status, r.read().decode()
+                    except urllib.error.HTTPError as e:
+                        with e:
+                            got, text = e.code, e.read().decode()
+                self.assertEqual(got, 400, f"{path}: {text}")
+                self.assertEqual(json.loads(text)["error"]["type"], "invalid_request_error", path)
+                self.assertIn("no finite maximum or a NaN", text, path)
+                self.assertNotIn("Traceback", text, path)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
 
 class LayerSplit(unittest.TestCase):
     """#644: "layer_split" is the first layer of each later GPU; a list is accepted, counts per card are not."""

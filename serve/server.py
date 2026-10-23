@@ -1778,11 +1778,11 @@ class StrataEngine:
                         self._apply_bdone(f)
                         # what the slot's sessions hold now: the prompt and every token fed (all but the last one)
                         self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
-                        if f[3:4] == ["nonfinite"]:              # #879: the engine dropped the slot's state
-                            self.slot_held[slot] = []
-                            raise EngineNonFinite("the engine's logits became non-finite (#879)")
-                        if f[3:4] == ["error"]:                  # the engine ended the slot on a row with no finite logit
+                        if f[3:4] in (["nonfinite"], ["error"]):
                             self.slot_held[slot] = []            # (the row's state may hold the NaN: nothing is reused)
+                            if f[3:4] == ["nonfinite"]:          # #879: the engine dropped the slot's state
+                                raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                            # the engine ended the slot on a row with no finite logit
                             raise ValueError("the logits hold no finite maximum or a NaN: no token drawn")
                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
                                 and not (out and out[-1] in EOS_IDS)):
@@ -6067,8 +6067,8 @@ def make_handler(svc: Service):
                                                                 code="server_error"))
                 except EngineNonFinite as e:                 # #879, twice: not the request's fault
                     return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
-                except ValueError as e:                      # the engine's ERR line
-                    return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
+                except ValueError as e:                      # the engine's ERR line, before the first token: the request's fault
+                    return self._json(400, responses_error_body(str(e)))
                 return self._json(200, result)
             self._sse()
             last = time.monotonic()
