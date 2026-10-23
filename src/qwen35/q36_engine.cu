@@ -672,7 +672,7 @@ __global__ void k_route_scatter(const int32_t* ids, int n_ent, int K_, int32_t* 
     inv[e] = r;   // entry e's sorted row: where its down product lands
 }
 
-/// The greedy pick of one logits row: out = argmax (lowest id on ties).  Stage 1: `gridDim.x` blocks each write the
+/// The greedy pick of one logits row: out = argmax (lowest id on ties), -1 when no logit is finite.  Stage 1: `gridDim.x` blocks each write the
 /// best of their stride into (pv, pi); stage 2 (one block, n = the stage-1 block count) reads those.
 __global__ void k_argmax(const float* x, int n, int32_t* out, float* pv, int32_t* pi, bool stage2) {
     __shared__ float bv[kThreads];
@@ -706,7 +706,7 @@ __global__ void k_argmax(const float* x, int n, int32_t* out, float* pv, int32_t
         __syncthreads();
     }
     if (threadIdx.x == 0) {
-        if (stage2) *out = bi[0];
+        if (stage2) *out = isfinite(bv[0]) ? bi[0] : -1;   // no finite logit in the row (all -inf): -1, the callers' ERR
         else { pv[blockIdx.x] = bv[0]; pi[blockIdx.x] = bi[0]; }
     }
 }
@@ -2026,7 +2026,6 @@ struct Engine {
         switch (T) { Q36_Q8(1) Q36_Q8(2) Q36_Q8(3) Q36_Q8(4) Q36_Q8(5) Q36_Q8(6) Q36_Q8(7) Q36_Q8(8) }
 #undef Q36_Q8
         if (verify_k) {
-            if (!vbuf) CK(cudaMalloc((void**) &vbuf, kVerifyFloats * 4));
             const size_t qb = K::native_q8_1_bytes(w.n_in, 1);
             for (int c0 = 0; c0 < T; c0 += 8) {
                 const int nc = std::min(8, T - c0);
@@ -2045,7 +2044,6 @@ struct Engine {
     void verify_q8(const char* what, const float* hsrc, int T, const std::string& tag) {
         const int N = (int) m->g.n_embd;
         const size_t qb = K::native_q8_1_bytes(N, 1);
-        if (!vq) CK(cudaMalloc(&vq, qb * 8));
         K::native_quantize_q8_1(hsrc, vq, N * T, 1, st);
         const long long before = v_bad;
         verify_cmp(what, (const float*) xq, (const float*) vq, qb * (size_t) T / 4, tag);
@@ -2088,10 +2086,6 @@ struct Engine {
         xq_post = false;
         if (fast_k && T <= kGemmT) {
             if (verify_k) {
-                if (!vx_) {
-                    CK(cudaMalloc((void**) &vx_, (size_t) 8 * N * 4));
-                    CK(cudaMalloc((void**) &vh_, (size_t) 8 * N * 4));
-                }
                 CK(cudaMemcpyAsync(vx_, x, (size_t) T * N * 4, cudaMemcpyDeviceToDevice, st));
                 k_add_rms<<<T, kThreads, 0, st>>>(vx_, y, L.post_norm, vh_, N, m->eps);
             }
@@ -2142,8 +2136,6 @@ struct Engine {
         switch (T) { Q36_SH(1) Q36_SH(2) Q36_SH(3) Q36_SH(4) }
 #undef Q36_SH
         if (verify_k) {
-            if (!vbuf) CK(cudaMalloc((void**) &vbuf, kVerifyFloats * 4));
-            if (!vq) CK(cudaMalloc(&vq, K::native_q8_1_bytes(m->g.n_embd, 1) * 8));
             float* vg = vbuf;
             float* vu = vbuf + (size_t) 8 * FS;
             mmq_ref(a, xq, vg, T);
@@ -2174,7 +2166,6 @@ struct Engine {
     }
     /// VERIFY: the old grouping of the current `ids` into scratch, compared with grp_ptr / grp_start / n_groups / ent_dst / ent_tok.
     void group_verify(const Layer& L, const int32_t* slot_of, int T) {
-        if (!vgrp) CK(cudaMalloc((void**) &vgrp, 2048));
         unsigned long long* o_ptr = (unsigned long long*) vgrp;
         int32_t* o_start = (int32_t*) (o_ptr + 65);
         int32_t* o_ng = o_start + 66;
@@ -2235,7 +2226,6 @@ struct Engine {
         grouped_by_route = true;
         if (verify_k && !opt) {
             // the old top-k into scratch, the ids / weights compared, then the old grouping of the new ids
-            if (!vbuf) CK(cudaMalloc((void**) &vbuf, kVerifyFloats * 4));
             int32_t* vid = (int32_t*) (vbuf + 8 * 8192);
             float* vw = vbuf + 8 * 8192 + 64;
             K::native_router_topk(logits_r, vid, vw, 256, Kp, T, st);
@@ -2266,15 +2256,22 @@ struct Engine {
     }
     void* vgrp = nullptr;
     float *vx_ = nullptr, *vh_ = nullptr;
+    /// VERIFY's buffers, allocated once at the start (main, before any graph capture): a cudaMalloc inside a captured path
+    /// fails, so the verify paths allocate nothing.
+    void verify_alloc() {
+        const int N = (int) m->g.n_embd, FS = (int) m->g.n_ff_shexp;
+        CK(cudaMalloc((void**) &vbuf, kVerifyFloats * 4));
+        // (vq: verify_q8's rows of n_embd, T <= 8, and the shared expert's gate/up quantised at FS, T <= 4)
+        CK(cudaMalloc(&vq, std::max(K::native_q8_1_bytes(N, 1) * 8, K::native_q8_1_bytes(FS, 1) * 4)));
+        CK(cudaMalloc((void**) &vgrp, 2048));
+        CK(cudaMalloc((void**) &vx_, (size_t) 8 * N * 4));
+        CK(cudaMalloc((void**) &vh_, (size_t) 8 * N * 4));
+    }
     /// The MoE block's end (k_moe_out) for T rows.
     void moe_end(int T, const int32_t* prow, const float* shared, const float* sgate, const float* wn, float* hout, int sgs = 1) {
         const int N = (int) m->g.n_embd, Kp = (int) m->top_k;
         const bool small = fast_k && T <= 8 && N <= q36k::kMoeOutSmallN && N % 256 == 0 && Kp <= 15;
         if (small && verify_k) {
-            if (!vx_) {
-                CK(cudaMalloc((void**) &vx_, (size_t) 8 * N * 4));
-                CK(cudaMalloc((void**) &vh_, (size_t) 8 * N * 4));
-            }
             CK(cudaMemcpyAsync(vx_, x, (size_t) T * N * 4, cudaMemcpyDeviceToDevice, st));
             k_moe_out<<<T, kThreads, 0, st>>>(vx_, eparts, prow, ewts, Kp, shared, sgate, sgs, wn, vh_, N, m->eps);
         }
@@ -3281,6 +3278,9 @@ struct Engine {
     /// mtp_pick[r], and the block's K / V cells are written.
     struct MtpRow { int slot; int32_t tok; int64_t cell; const float* seed; };
     int32_t mtp_pick[kVerify] = {};
+    /// A draft whose row had no finite logit (-1) is proposed as token 0: a token id is never -1 on its way into a window,
+    /// and the window keeps the draft only when its own pick is 0 too, so the text is the plain one.
+    static int32_t draft_token(int32_t t) { return t < 0 ? 0 : t; }
     float* logits_mr = nullptr;
     int32_t* pick_mr = nullptr;
     void mtp_rows(const MtpRow* rows, int T) {
@@ -3325,7 +3325,7 @@ struct Engine {
         rows_mode = false;
         CK(cudaMemcpyAsync(hrow + 32, pick_mr, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
-        for (int r = 0; r < T; ++r) mtp_pick[r] = hrow[32 + r];
+        for (int r = 0; r < T; ++r) mtp_pick[r] = draft_token(hrow[32 + r]);
     }
     /// Row r's logits of the last step_rows, on the host.
     void host_logits_row(int r, std::vector<float>& out) {
@@ -3408,7 +3408,7 @@ struct Engine {
         if (D > 0) {
             CK(cudaMemcpyAsync(hpin + 2, pick_m, 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
-            drafts[0] = hpin[2];
+            drafts[0] = draft_token(hpin[2]);
         }
         int last_row = T0 - 1;   // the row of the previous MTP call whose output seeds the next draft
         for (int d = 1; d < D; ++d) {   // chained: (the block's own output, the last draft) at the next position
@@ -3421,7 +3421,7 @@ struct Engine {
             graph_run(gs().gm1, [&] { forward_mtp(1, pos + d, seeds, true, use_graph); });
             CK(cudaMemcpyAsync(hpin + 2, pick_m, 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
-            drafts[(size_t) d] = hpin[2];
+            drafts[(size_t) d] = draft_token(hpin[2]);
         }
         // the verify window
         const int T = D + 1;
@@ -4075,6 +4075,14 @@ struct Serve {
             for (int j = 0; j < rows_kept; ++j) {
                 if (j == 1) y = E.rows_pick[r0 + 1];
                 ss.live.push_back(fed[j]);
+                if (y < 0) {   // no finite logit: the slot ends here with no token drawn, the other slots go on
+                    std::printf("BDONE %d %lld error %.1f\n", b, (long long) sl.produced, ms_since(sl.t0));
+                    sl.active = false;
+                    ss.active = false;
+                    --n_active;
+                    done = true;
+                    break;
+                }
                 std::printf("BT %d %d\n", b, y);
                 ++sl.produced;
                 sl.hist.push_back(y);
@@ -4172,6 +4180,13 @@ struct Serve {
                 y = sample(lg, sl.smp, sl.hist, rng);
             } else {
                 y = E.rows_pick[r];
+            }
+            if (y < 0) {   // no finite logit: the slot ends with no token drawn, the other slots go on
+                std::printf("BDONE %d %lld error %.1f\n", b, (long long) sl.produced, ms_since(sl.t0));
+                sl.active = false;
+                ss.active = false;
+                --n_active;
+                continue;
             }
             std::printf("BT %d %d\n", b, y);
             ++sl.produced;
@@ -4407,6 +4422,11 @@ struct Serve {
                 std::mt19937_64 r = draw_rng(smp.seed, (uint64_t) (E.pos - 1));
                 nx = sample(lg, smp, hist, r);
             }
+            if (nx < 0) {   // no finite logit: the request ends in ERR, no slot taken
+                std::printf("ERR the logits hold no finite maximum or a NaN: no token drawn\n");
+                std::fflush(stdout);
+                return;
+            }
             std::printf("T %d\n", nx);
             ++produced;
             hist.push_back(nx);
@@ -4443,6 +4463,7 @@ struct Serve {
             return (int32_t) sample(lg, smp, hist, r, dr, (size_t) t);
         };
         bool known = false;   // nx came out of a verify window already
+        bool no_logit = false;   // a pick had no finite logit (-1): the request ends in ERR, that pick is not emitted
         for (;;) {
             if (smp.needs_logits() && !known) {
                 E.host_logits(lg);
@@ -4451,6 +4472,10 @@ struct Serve {
             }
             known = false;
             auto emit = [&](int t) {   // false: the answer ends here
+                if (t < 0) {
+                    no_logit = true;
+                    return false;
+                }
                 std::printf("T %d\n", t);
                 std::fflush(stdout);
                 ++produced;
@@ -4490,6 +4515,11 @@ struct Serve {
             if (!smp.needs_logits()) nx = E.greedy();
         }
         E.sess[(size_t) E.cur].pos = E.pos;
+        if (no_logit) {
+            std::printf("ERR the logits hold no finite maximum or a NaN: no token drawn\n");
+            std::fflush(stdout);
+            return;
+        }
         const double decode_ms = ms_since(d0);
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms,
                     decode_ms, finish, accepted, offered, reuse, (long long) fresh);
@@ -4843,6 +4873,7 @@ int strata::qwen35::run(int argc, char** argv) {
                          Engine::kVerifyFloats / 8, Engine::kVerifyFloats / 12);
             return 2;
         }
+        E.verify_alloc();
     }
     // the routing options that cannot hold their state or cannot apply are refused here, before anything runs
     if (cache_prior > 0.0f && E.n_sess > 1) {
@@ -4910,6 +4941,10 @@ int strata::qwen35::run(int argc, char** argv) {
             int nx = E.greedy();
             for (int i = 0; i < bench_tg; ++i) {
                 const int32_t one = nx;
+                if (one < 0) {
+                    std::fprintf(stderr, "strata-q36: the logits hold no finite maximum or a NaN: no token drawn\n");
+                    return 2;
+                }
                 E.process(&one, 1, [](int64_t) {});
                 nx = E.greedy();
             }
@@ -4950,6 +4985,10 @@ int strata::qwen35::run(int argc, char** argv) {
         int32_t picks[16];
         int nx = E.greedy();
         while ((int) gen.size() < n_gen) {
+            if (nx < 0) {
+                std::fprintf(stderr, "strata-q36: the logits hold no finite maximum or a NaN: no token drawn\n");
+                return 2;
+            }
             gen.push_back(nx);
             if ((int) gen.size() >= n_gen) break;
             const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks);
@@ -4971,6 +5010,10 @@ int strata::qwen35::run(int argc, char** argv) {
     }
     for (int i = 0; i < n_gen; ++i) {
         const int a = E.greedy();
+        if (a < 0) {
+            std::fprintf(stderr, "strata-q36: the logits hold no finite maximum or a NaN: no token drawn\n");
+            return 2;
+        }
         gen.push_back(a);
         if (ff) {
             E.host_logits(lg);

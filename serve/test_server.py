@@ -2436,6 +2436,80 @@ class NonFiniteLogits(unittest.TestCase):
         self.assertEqual(eng.last["finish"], "nonfinite")
         self.assertNotIn("STOP", eng.proc.stdin.getvalue())   # the DONE was read: nothing to stop or drain
 
+    def test_engine_err_line_raises(self):
+        """StrataEngine.generate: `ERR ...` (a row with no finite logit) raises ValueError after the tokens before it,
+        and the line ends the read: no STOP is sent to an engine that has already answered."""
+        import queue as queue_
+        eng = object.__new__(StrataEngine)
+        eng.lines = queue_.Queue()
+        for line in ("T 5", "ERR the logits hold no finite maximum or a NaN: no token drawn"):
+            eng.lines.put(line)
+        eng.proc = SimpleNamespace(stdin=io.StringIO())
+        eng.alive = lambda: True
+        eng.silence_s, eng.can_stop, eng.last = 0, True, None
+        got = []
+        with self.assertRaises(ValueError) as cm:
+            for t in eng.generate([1, 2, 3], 10, {}, threading.Event()):
+                got.append(t)
+        self.assertEqual(got, [5])
+        self.assertIn("no finite maximum or a NaN", str(cm.exception))
+        self.assertNotIn("STOP", eng.proc.stdin.getvalue())
+
+
+class NoLogitEngine(MockEngine):
+    """The engine's ERR for a row with no finite logit (q36: a -inf row or a NaN, #87), as StrataEngine.generate raises
+    it: after `cut` tokens, or before the first one when cut is 0.  cut None: the reply runs whole, as usual."""
+
+    def __init__(self, *a, cut=None, **kw):
+        super().__init__(*a, **kw)
+        self.cut = cut
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        if self.cut is None:
+            yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+            return
+        for i, t in enumerate(super().generate(ids, max_new, sampling, cancel, embeddings)):
+            if i >= self.cut:
+                break
+            yield t
+        raise ValueError("the logits hold no finite maximum or a NaN: no token drawn")
+
+
+class NoLogitReply(unittest.TestCase):
+    """#87: the engine's ERR for a row with no finite logit ends the request with an HTTP error, and the next request
+    runs as usual on the same engine (no stuck session)."""
+
+    def test_over_http(self):
+        tok = ByteTokenizer()
+        for cut, stream, code in ((0, False, 400), (0, True, 200), (2, True, 200)):
+            eng = NoLogitEngine(tok, "hello", max_context=CTX, cut=cut)
+            svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+            httpd = serve(svc, port=0)
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            try:
+                def post(body):
+                    req = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                                 headers={"Content-Type": "application/json"})
+                    try:
+                        with urllib.request.urlopen(req, timeout=30) as r:
+                            return r.status, r.read().decode()
+                    except urllib.error.HTTPError as e:
+                        with e:
+                            return e.code, e.read().decode()
+                msgs = [{"role": "user", "content": "hi"}]
+                with contextlib.redirect_stdout(io.StringIO()):
+                    got, text = post({"model": "m", "messages": msgs, "max_tokens": 20, "stream": stream})
+                    self.assertEqual(got, code, text)
+                    self.assertIn("no finite maximum or a NaN", text)
+                    self.assertNotIn("Traceback", text)
+                    eng.cut = None
+                    got, text = post({"model": "m", "messages": msgs, "max_tokens": 20, "stream": False})
+                self.assertEqual(got, 200, text)
+                self.assertIn("hello", text)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
 
 class LayerSplit(unittest.TestCase):
     """#644: "layer_split" is the first layer of each later GPU; a list is accepted, counts per card are not."""

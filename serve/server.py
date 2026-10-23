@@ -1781,6 +1781,9 @@ class StrataEngine:
                         if f[3:4] == ["nonfinite"]:              # #879: the engine dropped the slot's state
                             self.slot_held[slot] = []
                             raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                        if f[3:4] == ["error"]:                  # the engine ended the slot on a row with no finite logit
+                            self.slot_held[slot] = []            # (the row's state may hold the NaN: nothing is reused)
+                            raise ValueError("the logits hold no finite maximum or a NaN: no token drawn")
                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
                                 and not (out and out[-1] in EOS_IDS)):
                             # the solo path continues it: the engine copies the slot's sessions back (all but the

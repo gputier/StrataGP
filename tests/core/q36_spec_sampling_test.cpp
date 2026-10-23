@@ -377,6 +377,48 @@ int main() {
         }
         check(differ == 0, "3 slots side by side: 60 seeds x 24 tokens identical to each request alone");
     }
+
+    // 7: a row with a NaN, or with no finite maximum, gives no token (-1) and takes no draw; a finite row with -inf
+    // entries draws as the same row with those entries at -1e30 (both give them a zero weight and the same order)
+    {
+        int bad = 0;
+        const std::vector<int32_t> hist = {1, 2, 3};
+        for (int it = 0; it < 60; ++it) {
+            Sampling s;
+            s.temperature = it % 2 ? 0.f : 0.8f;
+            s.seed = (uint64_t) it;
+            std::vector<float> lg(kV, -INFINITY);
+            if (it % 3 == 1) lg[(size_t) it % kV] = NAN;
+            if (it % 3 == 2) {
+                lg = row_logits({(int32_t) it, 5}, false, 0);
+                lg[(size_t) it % kV] = NAN;
+            }
+            std::mt19937_64 r = draw_rng(s.seed, 0), fresh = draw_rng(s.seed, 0);
+            bad += sample(lg, s, hist, r) != -1;
+            bad += r() != fresh();
+        }
+        check(bad == 0, "no finite maximum or a NaN: -1 and no draw taken, at temperature 0 and 0.8 (60 rows)");
+    }
+    {
+        int differ = 0;
+        for (int it = 0; it < 60; ++it) {
+            Sampling s;
+            s.temperature = it % 2 ? 0.f : 0.8f;
+            s.seed = (uint64_t) it;
+            std::vector<float> lg = row_logits({(int32_t) it, 9}, false, 0);
+            std::vector<float> ref = lg;
+            for (int k = 0; k < kV; k += 3) {
+                if (k != argmax(lg)) {
+                    lg[(size_t) k] = -INFINITY;
+                    ref[(size_t) k] = -1e30f;
+                }
+            }
+            std::mt19937_64 r = draw_rng(s.seed, 0), rr = draw_rng(s.seed, 0);
+            const int got = sample(lg, s, {}, r);
+            differ += got == -1 || got != sample(ref, s, {}, rr);
+        }
+        check(differ == 0, "finite maximum with -inf entries: the same token as the row with -1e30 there (60 rows)");
+    }
     std::printf("q36_spec_sampling_test: %d failures\n", g_fail);
     return g_fail == 0 ? 0 : 1;
 }

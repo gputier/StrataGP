@@ -35,7 +35,8 @@ inline std::mt19937_64 draw_rng(uint64_t seed, uint64_t counter) {
 }
 
 /// The pick from one row of logits (modified in place by the penalties).  The penalty history is `hist` followed by
-/// tail[0 .. n_tail), so a verify row counts the window's drafts without copying the prompt.
+/// tail[0 .. n_tail), so a verify row counts the window's drafts without copying the prompt.  -1 when the row holds a
+/// NaN or has no finite maximum (all -inf, or +inf): no token is drawn and rng is left as it was.
 inline int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>& hist, std::mt19937_64& rng,
                   const int32_t* tail = nullptr, size_t n_tail = 0) {
     if (s.last_n != 0 && (s.repeat != 1.f || s.freq != 0.f || s.present != 0.f)) {
@@ -49,6 +50,12 @@ inline int sample(std::vector<float>& lg, const Sampling& s, const std::vector<i
             v -= (float) c * s.freq + s.present;
         }
     }
+    float top = -INFINITY;
+    for (const float v : lg) {
+        if (std::isnan(v)) return -1;
+        top = std::max(top, v);
+    }
+    if (!std::isfinite(top)) return -1;
     if (s.temperature <= 0.f) return (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
     const int kk = std::max(1, std::min(s.top_k > 0 ? s.top_k : 64, (int) lg.size()));
     std::vector<int> idx(lg.size());
