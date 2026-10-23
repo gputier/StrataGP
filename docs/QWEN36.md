@@ -128,9 +128,11 @@ solo run there too, with and without `--batch-mtp`.
 ## Speed (0.1.45)
 
 Decode and prompt kernels of this engine path were rewritten for speed; **every change on the decode path gives the old kernels' bits**
-(`STRATA_Q36_VERIFY=1 strata ... --no-graph` runs the old kernel beside each new one on the real activations and compares them bit for bit:
-0 mismatches in 18,360 / 8,187 / 6,399 comparisons on the R9700 and the RTX 3060; `STRATA_Q36_OLD_KERNELS=1` switches them all off). The
-10 parity prompts (greedy 128) give the base engine's tokens, plain and with `--mtp 2`. Where the prompt's chunk size changes, the numbers
+(`STRATA_Q36_VERIFY=1 strata ...` runs the old kernel beside each new one on the real activations and compares them bit for bit,
+with or without CUDA graphs: the comparisons are counted on the device, so every graph replay counts (issue #92).
+On an RTX 5090, p00 and p05 give 16,599 comparisons and 0 mismatches each, with and without CUDA graphs (this change). The older
+18,360 / 8,187 / 6,399 comparisons, 0 mismatches each, were measured with `--no-graph` before this change, on the R9700 and the RTX 3060;
+`STRATA_Q36_OLD_KERNELS=1` switches them all off). The 10 parity prompts (greedy 128) give the base engine's tokens, plain and with `--mtp 2`. Where the prompt's chunk size changes, the numbers
 change a little: see "Prompt chunk".
 
 **What was slow** (rocprofv3, R9700, UD-Q4_K_XL, plain decode, 11.25 ms of kernel time per token): the big Q8_0 products (attention, GDN
@@ -179,8 +181,95 @@ prompt's token ids are above 65,536), and a candidate list built from the tokens
 stream (captured into the decode graph) decodes at 36 tok/s instead of 117 with this ROCm. Chunked (WY) GDN and the PCIe-assisted hybrid decode
 were not attempted.
 
+## Ornith-1.5-122B (hybrid, 400K context)
+
+Full engineering record (protocols, experiments in order, open leads): [ORNITH_122B.md](ORNITH_122B.md).
+
+Ornith-1.5-122B runs on the q36 engine path (`src/qwen35`), in hybrid mode: the experts that do not fit in VRAM run on the CPU pool, or are copied over PCIe and computed on the GPU. It is a mixture of experts of 48 layers, 256 experts per layer, top-8 routing, about 10B active parameters per token. The measured file is `Ornith-1.5-122B-IQ3XXS-IQ4XS.gguf` (58,241,032,032 bytes): IQ3_XXS for the gate and up experts, IQ4_XS for the down experts, and the MTP block (blk.48) at Q4_K for its gate and up.
+
+The server listens on port 8090. The Windows launcher (`start-ornith.ps1`, `stop-ornith.ps1`, `stratagp-ornith.json`) passes `--native <gguf> --max-context 409600 --prefill auto --rope-scaling yarn --rope-scale 2 --rope-orig-ctx 262144 --kv q4`. MTP is off in its config (see below).
+
+Options added by the branch:
+
+- `--expert-profile <file>` starts the expert slots from a learned profile (STRP format, version 1). `--expert-profile-save <file>` writes it at QUIT. The server passes the saved file back as `--expert-profile` at the next start, once it holds a whole header (`serve/test_q36_config.py`). On the q36 engine (Qwen3.6, Ornith) the profile is written at QUIT only: the server does not pass `--expert-profile-save-every` there, so a crash loses what was learned since the start.
+- `--pcie-frac F`: the share of the missed experts that are copied over PCIe and computed on the GPU. `0` turns it off. Without the option, the share starts from the probed PCIe bandwidth and is then refined from the CPU pool's speed, between 0 and a cap of 0.95. A fixed value is taken as given, up to 1.
+- `--mtp N`: number of MTP drafts. The start refuses N above 7 with `strata-q36: --mtp takes 0 .. 7 drafts` and exit code 2.
+
+Options that change the output (off by default):
+
+- `--cache-prior L` (0 to 1, 0 is off) biases the logits of resident experts, with the Delta_avg version of arXiv 2412.00099. Measured: L 0.02 gives KL 0.0707 at 23.1 and 29.4 tokens/s; L 0.05 gives KL 0.1453 at 30.2 and 35.4; L 0.1 gives KL 0.1893 at 32.5 and 44.2. No value falls under the bar of 0.061. The earlier version of this option reached 75 to 77 tokens/s at L 0.25 and 0.5, with KL 0.64 and 0.91, and altered the text.
+- `--ser Kmin,t` keeps a lower-ranked pick only when its probability is above t times the top probability. `--ser 7,0.4` gives KL 0.086 and `--ser 6,0.4` gives KL 0.168. The speed gain is within run-to-run noise.
+
+Refusals at start (exit code 2, messages prefixed by `strata-q36:`):
+
+- `--cache-prior` with two or more sessions (`--batch` 2 or more): it "needs one session".
+- `--cache-prior` with MTP drafts (`--mtp N`, N above 0) on a model with an MTP block: "cannot be combined".
+- `--cache-prior` when every expert fits in VRAM: it "needs the hybrid expert mode".
+- `--cache-prior`, or `--ser` with Kmin below the 8 picks of the model: it "needs the fast routing path". That path is taken when `STRATA_Q36_OLD_KERNELS` is unset, the model has 256 experts and 8 picks. With `--ser 8,t`, the option is not refused.
+- `--ser` not given as `Kmin,t` with 1 <= Kmin <= 8 and 0 <= t <= 1: "--ser must be Kmin,t".
+- `--cache-prior` outside [0, 1]: "--cache-prior must be in [0, 1]".
+
+Environment variables. The q36 engine reads 18 of them: 17 `STRATA_Q36_*` and `STRATA_DMA_BATCH`. Unset means the default shown.
+
+- `STRATA_Q36_BLAS_F32`: off. Set, the router product uses the hipBLAS / cuBLAS SGEMM instead of the native kernel (`q36_engine.cu:1933`, A/B check).
+- `STRATA_Q36_CHUNK=N`: forces the prompt chunk, from 256 to 4096 (`:4768`). Unset, `--chunk auto` picks it from the free VRAM (`:4721`).
+- `STRATA_Q36_DRAFT_VOCAB=N`: the MTP drafts pick among the first N token ids, used when `--draft-vocab` is absent (`:4835`). Unset, 0: the whole vocabulary (`:2548`).
+- `STRATA_Q36_FIXED_SLOTS=1`: freezes the expert slots as placed. The identity gate uses it (`:2942`).
+- `STRATA_Q36_KEEP_PACKED`: unset, the packed Q8_0 copies are freed when that gives more expert slots (`:3541`). Set, they are kept.
+- `STRATA_Q36_NO_EXT`: unset, a decode batch of up to 8 rows takes the router and the shared expert's gate in one product (`:2441`). Set, separate products.
+- `STRATA_Q36_NO_MMQ`: unset, the MMQ kernels are used when built (`:1749`). Set, they are not.
+- `STRATA_Q36_NO_MTP_CPU`: unset, the experts of the MTP block may go to the CPU pool (`:3519`, `:3570`). Set, they may not.
+- `STRATA_Q36_NO_PREFETCH`: unset, the experts of the next layer are prefetched (`:3771`). Set, no prefetch.
+- `STRATA_Q36_OLD_KERNELS`: unset, the fast decode kernels and the fast routing path are used (`:1971`). Set, the old kernels, and `--cache-prior` and `--ser` are refused.
+- `STRATA_Q36_ONE_TOKEN_CPU`: off. Set, the one-token AVX-512 CPU kernels are used. They ran slower than ggml-cpu on the Ornith box (comment at `:3716`, `native_expert_ff1024_test --bench`).
+- `STRATA_Q36_PLACE_DEBUG`: off. Set, prints the placement (`:4769`).
+- `STRATA_Q36_READ_WINDOWS=N`: default 1, from 0 to 64 (`:3967`). The decode windows run between two chunks of a prompt read.
+- `STRATA_Q36_STATS=1`: off. Prints one line per window, 48 steps then 96: the bytes each path reads and the host's wait on the doorbell (`src/qwen35/q36_stats.hpp:24`, `:1530`).
+- `STRATA_Q36_STREAM_ALL`: off. Set, the whole layer streams from host memory, the first version, PCIe-bound (`:2619`).
+- `STRATA_Q36_VERIFY`: off. Set, the decode kernels are compared with the old kernel's bits (`:2077`), on the device and with CUDA graphs on; its mismatch lines print at the end of each window (decode window, MTP step or prompt chunk), not at the comparison, so a fatal CUDA error inside a window loses them. This also disables the fused router path (`:2553`).
+- `STRATA_DMA_BATCH=N`: the grouping of PCIe copies, modes 0, 1 and 2 (`include/strata/core/dma_batch.hpp:32`). The q36 default is 1, one `cudaMemcpyBatchAsync` per group (`q36_engine.cu:2697`). 0 gives one copy each.
+
+`STRATA_Q36_CPU_POOL` is a compile-time macro (`q36_engine.cu:46`), not an environment variable.
+
+Measured on 22 and 23/10/2026, on an RTX 5090 32 GB with 128 GB of RAM, three runner VMs running. Commit ec3d4b63 is compared with 7bf040a5, the start of the work, and with 9ce40dca. The working set is capped at 24 GB per process, unless noted.
+
+- Greedy identity: 6 of 6 prompts (p00 to p05, 32 tokens) identical between ec3d4b63, 9ce40dca and 7bf040a5, with `STRATA_Q36_FIXED_SLOTS=1 --pcie-frac 0 --expert-slots 62 --cpu-threads 6`.
+- Forced logits at default settings: 10 of 10 files identical between ec3d4b63 and 9ce40dca.
+- KL against llama.cpp b11756 logits, 10 prompts of 32 steps: 0.0423, against a bar of 0.061. The top token matches llama.cpp on 299 of 320 steps (93.4 %). Repeated runs are identical to the byte. Between builds the KL moves by 0.0032 (0.0455 for the build of task 5, 0.0423 now). Perplexity was not measured.
+- Decode, 4 code requests of 1,024 tokens per launch, three cold launches per build, alternated: 30.0 tokens/s (29.7 to 30.2), against 22.6 (22.5 to 22.8) at 7bf040a5.
+- Decode after a 127,685-token prompt, one launch per build: 12.8 tokens/s, against 10.4. The prompt is read in 78.0 s on both builds, 1,636 tokens/s.
+
+Capped and uncapped runs differ, and only the capped figures are reproduced:
+
+- The first uncapped series ran by mistake, with the memory guard inactive: 43.2 tokens/s for the branch against 43.8 for the start at 1,024 tokens, and 18.8 and 17.2 at 128K. Free memory fell to 703 MB. On that series alone the branch is no faster than the start at 1,024 tokens.
+- A dedicated uncapped run loaded the model: available memory went from 108.7 GB to 4.3 GB in 25 s. The guard stopped the engine with a working set of 105 GB and 79.5 GB of private memory, still rising. The pinned experts take 48.07 GiB; about 28 GB of private memory is not identified. No uncapped series ran to the end.
+- Without the cap, a 128 GB machine running three VMs keeps less than 8 GB free.
+
+Where a token's time goes (`STRATA_Q36_STATS=1`, one launch at 30 tokens/s, so 33.3 ms per token, computed as 1,000 / 30):
+
+- CPU pool on the missed experts: 20.8 ms, 62 % of the token (computed).
+- Host waiting for the GPU (attention, GPU layers, GPU experts): 9.3 ms.
+- Host outside the pool: 3.1 ms.
+
+The three parts add to 33.2 ms, the rounding of 33.3. Even without the pool, 9.3 + 3.1 = 12.4 ms is above the 10 ms that 100 tokens/s allows (computed). Per token, 211 MB are copied over PCIe and 462 MB are read by the pool, at 22.5 GB/s.
+
+Attention costs 2.42 ms per token at 1k context, 6.82 ms at 32k and 18.93 ms at 128k (base 9ce40dca, `a5.md`). Bounding the grid of `k_attn_part` removes nothing: the time follows the chunks processed.
+
+Other levers measured: `STRATA_DMA_BATCH=1` against 0 has no measurable effect, and neither has `--pcie-frac 0.50` against the automatic share (issue #80). The automatic share now settles at 0.45. The former default settled at 0.80 and gave 22.4 tokens/s, against 24.6. The best fixed value measured is 0.50 to 0.55. The branch also prefetches the experts of the next layer, groups the copies, and drops a single-pass CPU pool per layer, which gave no gain. The pool runs 6 threads by default (`kDefaultPoolWorkers`, `src/qwen35/q36_threads.hpp:10`), capped by the worker processors present.
+
+Not reached: 100 tokens/s. The rate is 30.0 tokens/s at 1,024 tokens. Its open issues are #77 (CPU kernels of ik_llama: the pool stays the first cost, 20.8 ms), #79 (CPU pool), #80 (PCIe share), #81 (attention at long context), #74 (MTP), #75 (REAP) and #78 (speculative decoding). #76 (experts in 2 bits) was measured and set aside: 40.65 against 28.45 tokens/s, KL 0.4697 against 0.0423 (docs/ORNITH_122B.md).
+
+MTP is off in the configuration. With `STRATA_Q36_ONE_TOKEN_CPU=1`, its output is identical, but 20 to 35 % slower, with no drop in missed bytes (issue #74).
+
+## Non-finite logits
+
+A row of logits with no finite maximum, or a NaN, draws no token. The engine prints `ERR the logits hold no finite maximum or a NaN: no token drawn` (`src/qwen35/q36_engine.cu:726`, printed at `:4531` and `:4624`) and prints no DONE line for that request. In the batch path the slot ends with `BDONE <slot> <tokens> error <ms>` (`q36_engine.cu:4090`), and the server does not reuse that slot's state (`serve/server.py:1782`).
+
+The server turns the ERR line into HTTP 400 when it comes before the first token, on the non-streaming endpoints of `/v1/chat/completions`, `/v1/messages` and `/v1/responses` (`serve/server.py:5665`, `:6070`). A streaming request has already sent its 200 status and headers, so it gets no 400. It receives an error event, then the stream ends: `data: {"error": {"type": "server_error", ...}}` followed by `data: [DONE]` on chat completions (`serve/server.py:6001`), a `response.failed` event on `/v1/responses` (`:6102`), and an `event: error` on `/v1/messages` (`:6221`).
+
 ## Not done / limits
 
+- Ornith-1.5-122B does not reach 100 tokens/s (30.0 at 1,024 tokens). Its limits and open issues are in its section above.
 - Eight slots at most (the window holds 8 rows); `--batch-mtp` shares those rows between slots and proposals.
 - A sampling request in a batch decodes one token per window without proposals. `logit_bias` is not available on this engine path: the
   server refuses a request that has it (as it does with `--batch` for Flash-Next).

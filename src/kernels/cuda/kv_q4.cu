@@ -2,6 +2,7 @@
 // (from PR #21 by code-martin; KV-streaming integration and the deterministic group maximum added on merge).
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/kv_q4_group.cuh"
 #include "strata/kernels/kv_stream.hpp"
 
 #include <cuda_fp16.h>
@@ -68,28 +69,6 @@ __global__ void fwht256_kernel(const float* __restrict__ src, float* __restrict_
     for (int i = 0; i < el_w; ++i) row_dst[i * warp_size + lane] = reg[i];
 }
 
-// One 32-value group in one warp (lane = element), ggml's q4_0: d = (the value of largest |x|) / -8,
-// q = clamp(trunc(x / d + 8.5), 0, 15). Returns the scale bits; `byte` is lane t's packed byte for t < 16
-// (element t in the low nibble, t + 16 in the high one). Ties in |x| resolve to the larger value in EVERY lane,
-// so all lanes agree on d (a plain `a > amax` could leave lanes with opposite signs and one block two scales).
-__device__ __forceinline__ uint16_t q4_group(float x, int lane, uint8_t& byte) {
-    float amax = fabsf(x), mval = x;
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-        const float a = __shfl_xor_sync(0xffffffffu, amax, o);
-        const float v = __shfl_xor_sync(0xffffffffu, mval, o);
-        if (a > amax || (a == amax && v > mval)) { amax = a; mval = v; }
-    }
-    const float d = mval / -8.0f;
-    const float id = d != 0.0f ? 1.0f / d : 0.0f;
-    int q = __float2int_rz(x * id + 8.5f);
-    const uint8_t qc = (uint8_t) (q < 0 ? 0 : (q > 15 ? 15 : q));
-    const uint8_t qhi = __shfl_down_sync(0xffffffffu, qc, 16);
-    byte = (uint8_t) (qc | (qhi << 4));
-    (void) lane;
-    return f16_from_f32(d);
-}
-
 __device__ __forceinline__ void q4_store(uint8_t* pool, long long row, int b, int lane, uint16_t d, uint8_t byte) {
     block_q4_0* blk = reinterpret_cast<block_q4_0*>(pool + row * (long long) sizeof(block_q4_0) * 8) + b;
     if (lane == 0) blk->d = d;
@@ -109,7 +88,7 @@ __global__ void kv_append_q4_kernel(uint8_t* __restrict__ k_q4, uint8_t* __restr
     const long long step_off = (long long) step_idx * kv_heads * head_dim;
     const float x = (is_v ? vcur : kcur)[step_off + h * head_dim + b * QK4_0 + t];
     uint8_t byte;
-    const uint16_t d = q4_group(x, t, byte);
+    const uint16_t d = q4_group(x, byte);
     const long long page = (long long) table[pos / page_size];
     if (page >= 0) q4_store(is_v ? v_q4 : k_q4, (page * kv_heads + h) * page_size + (pos % page_size), b, t, d, byte);
     if (host.k_q4 != nullptr)
@@ -129,7 +108,7 @@ __global__ void kv_append_q4_batch_kernel(uint8_t* __restrict__ k_q4, uint8_t* _
     const bool is_v = is_v_grid != 0;
     const float x = (is_v ? V : K)[t * (kv_heads * head_dim) + h * head_dim + b * QK4_0 + th];
     uint8_t byte;
-    const uint16_t d = q4_group(x, th, byte);
+    const uint16_t d = q4_group(x, byte);
     const long long page = (long long) table[pos / page_size];
     const long long row_id = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
     if (page >= 0) q4_store(is_v ? v_q4 : k_q4, (page * kv_heads + h) * page_size + (pos % page_size), b, th, d, byte);

@@ -1778,9 +1778,12 @@ class StrataEngine:
                         self._apply_bdone(f)
                         # what the slot's sessions hold now: the prompt and every token fed (all but the last one)
                         self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
-                        if f[3:4] == ["nonfinite"]:              # #879: the engine dropped the slot's state
-                            self.slot_held[slot] = []
-                            raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                        if f[3:4] in (["nonfinite"], ["error"]):
+                            self.slot_held[slot] = []            # (the row's state may hold the NaN: nothing is reused)
+                            if f[3:4] == ["nonfinite"]:          # #879: the engine dropped the slot's state
+                                raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                            # the engine ended the slot on a row with no finite logit
+                            raise ValueError("the logits hold no finite maximum or a NaN: no token drawn")
                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
                                 and not (out and out[-1] in EOS_IDS)):
                             # the solo path continues it: the engine copies the slot's sessions back (all but the
@@ -2699,7 +2702,8 @@ def parallel_args(cfg: dict, args: list[str]) -> list[str]:
 
 def profile_shape(path: str) -> tuple[int, int] | None:
     """An expert profile's (layers, experts per layer), from its header (tools/make_profile.py's format), or None
-    when the file is missing, is not one or is shorter than the pairs its header promises."""
+    when the file is missing, is not one, is not a version 1 profile (the only one the engines read) or is shorter than
+    the pairs its header promises."""
     try:
         with open(path, "rb") as f:
             head = f.read(24)
@@ -2708,8 +2712,8 @@ def profile_shape(path: str) -> tuple[int, int] | None:
         return None
     if len(head) < 24 or head[:4] != b"STRP":
         return None
-    _, nl, ne, _, n = struct.unpack("<5I", head[4:])
-    return (nl, ne) if size >= 24 + 4 * n else None
+    version, nl, ne, _, n = struct.unpack("<5I", head[4:])
+    return (nl, ne) if version == 1 and size >= 24 + 4 * n else None
 
 
 def learned_profile_args(cfg: dict, args: list[str]) -> list[str]:
@@ -2717,21 +2721,27 @@ def learned_profile_args(cfg: dict, args: list[str]) -> list[str]:
     tier learned there - on QUIT and every "expert_profile_save_every" minutes (10 by default, 0 = at QUIT only) -
     and the next start begins from it instead of the config's --expert-profile, when it is a profile of the same
     model (its header's layers and experts match); otherwise from the config's own, as before.  A relative path is
-    the engine's (the config's "cwd").  Without the key, the arguments are the config's, unchanged."""
+    the engine's (the config's "cwd").  Without the key, the arguments are the config's, unchanged.
+    The Qwen3.6 / Ornith engine (arch qwen35moe) saves at QUIT only (no periodic save) and starts from the saved file
+    even when the config names no --expert-profile of its own: its first run learns the profile, the next ones use it
+    (the engine refuses a file of another geometry with one log line and starts from the default order)."""
     save = cfg.get("expert_profile_save")
     if not isinstance(save, str) or not save.strip() or "--expert-profile-save" in args:
         return args
     args = args + ["--expert-profile-save", save]
+    q36 = cfg.get("arch") == "qwen35moe"
     every = cfg.get("expert_profile_save_every")
-    if isinstance(every, (int, float)) and not isinstance(every, bool) and every >= 0:
+    if isinstance(every, (int, float)) and not isinstance(every, bool) and every >= 0 and not q36:
         args += ["--expert-profile-save-every", str(every)]
+    here = cfg.get("cwd") or "."
+    learned = profile_shape(save if os.path.isabs(save) else os.path.join(here, save))
     if "--expert-profile" in args[:-1]:
         i = args.index("--expert-profile") + 1
-        here = cfg.get("cwd") or "."
-        learned = profile_shape(save if os.path.isabs(save) else os.path.join(here, save))
         base = profile_shape(args[i] if os.path.isabs(args[i]) else os.path.join(here, args[i]))
         if learned is not None and learned == base:
             args[i] = save
+    elif q36 and learned is not None:
+        args += ["--expert-profile", save]
     return args
 
 
@@ -3115,7 +3125,7 @@ class Service:
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
         self.codex_thread_titles = False              # #923 (opt-in): answer Codex's thread-title turns without the engine
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
-        self.model_arch = None                        # the config's family ("qwen4exp", "qwen35moe"): None = no model-card defaults
+        self.model_arch = None                        # the config's family ("qwen4exp", "qwen35moe", "ornith"): None = no model-card defaults
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
@@ -6057,8 +6067,8 @@ def make_handler(svc: Service):
                                                                 code="server_error"))
                 except EngineNonFinite as e:                 # #879, twice: not the request's fault
                     return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
-                except ValueError as e:                      # the engine's ERR line
-                    return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
+                except ValueError as e:                      # the engine's ERR line, before the first token: the request's fault
+                    return self._json(400, responses_error_body(str(e)))
                 return self._json(200, result)
             self._sse()
             last = time.monotonic()
@@ -6741,7 +6751,9 @@ def check_request_sampling(req) -> None:
     replaced the configured default in run()'s merge and sampling_keys dropped it, so the reply was greedy.  Only
     types are checked: a number (int or float, never bool) for temperature, top_p, min_p and the three penalties; an
     integer (never bool or float) for top_k, penalty_last_n and seed.  Ranges behave as before (a temperature <= 0 is
-    greedy, top_k 0 or above 64 is clamped, a seed <= 0 is unset), and an absent or null field is not checked."""
+    greedy, top_k 0 or above 64 is clamped, a seed <= 0 is unset), except a top_p outside 0 < top_p <= 1 (as POST
+    /settings refuses it) and a repetition_penalty that is not a finite number above 0 (the engine divides the logits
+    by it), and an absent or null field is not checked."""
     if isinstance(req, dict):      # #1819: llama.cpp's names; the OpenAI-style field wins when both are sent
         if req.get("repeat_penalty") is not None and req.get("repetition_penalty") is None:
             req["repetition_penalty"] = req["repeat_penalty"]
@@ -6769,6 +6781,10 @@ def check_request_sampling(req) -> None:
             req[key] = value = num
         if isinstance(value, bool) or not isinstance(value, int if integer else (int, float)):
             raise ValueError(f"{key}: {'an integer' if integer else 'a number'}")
+        if key == "top_p" and not (math.isfinite(value) and 0 < value <= 1):      # the same range as POST /settings
+            raise ValueError("top_p: 0 < top_p <= 1")
+        if key == "repetition_penalty" and not (math.isfinite(value) and value > 0):
+            raise ValueError("repetition_penalty: a number > 0 (1 = off)")
 
 
 # the API's model name per model family (the GGUF architecture, "arch" in the config) when the config names none
@@ -6778,13 +6794,17 @@ FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35
 # The sampling each model card recommends ("Best Practices"), used when neither the request, the Chat settings nor the
 # run config's `sampling` block says otherwise.  Greedy is only for a request or config that asks for temperature 0.
 # min_p 0, repetition_penalty 1 and presence_penalty 0 are the engine's own "off", so they are not listed.
+_CARD_GENERAL = {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5}   # the Qwen3.5 / 3.6 cards' general-task set
 MODEL_CARD_SAMPLING = {
     # Qwen3.8-Flash-Next (and Gyro, the same base model)
     "qwen4exp": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
                  "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
     # Qwen3.6-35B-A3B: the general-task sets (the card's precise-coding set is temperature 0.6, presence_penalty 0)
-    "qwen35moe": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5},
+    "qwen35moe": {"thinking": _CARD_GENERAL,
                   "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
+    # Ornith-1.5-122B (a Qwen3.5-122B-A10B fine-tune, the same arch as Qwen3.6): the card's general-task set, for a
+    # reasoning model; it gives no separate non-thinking set (its precise-coding set is temperature 0.6, presence_penalty 0)
+    "ornith": {"thinking": _CARD_GENERAL, "instruct": _CARD_GENERAL},
 }
 
 
@@ -6794,9 +6814,18 @@ def model_card_sampling(arch, thinking) -> dict:
     return dict(sets["thinking" if thinking else "instruct"]) if sets else {}
 
 
+def model_family(cfg: dict) -> str:
+    """The family a config runs: its "arch" (qwen4exp, qwen35moe), or "ornith" for a qwen35moe config named Ornith (the
+    two share an engine path and an arch, so only the model name tells them apart); Flash-Next's when it names none."""
+    arch = cfg.get("arch") or "qwen4exp"
+    if arch == "qwen35moe" and str(cfg.get("model_name") or "").lower().startswith("ornith"):
+        return "ornith"
+    return arch
+
+
 def default_model_name(cfg: dict) -> str:
-    """The config's "model_name", else its family's name ("arch": qwen4exp, qwen35moe), else Flash-Next's."""
-    return cfg.get("model_name") or FAMILY_MODEL_NAMES.get(cfg.get("arch") or "qwen4exp", "qwen3.8-flash-next")
+    """The config's "model_name", else its family's name (qwen4exp, qwen35moe), else Flash-Next's."""
+    return cfg.get("model_name") or FAMILY_MODEL_NAMES.get(model_family(cfg), "qwen3.8-flash-next")
 
 
 def main() -> int:
@@ -6949,7 +6978,7 @@ def main() -> int:
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
-        svc.model_arch = cfg.get("arch") or "qwen4exp"
+        svc.model_arch = model_family(cfg)
     svc.answer_room = cfg.get("answer_room") is not False
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images

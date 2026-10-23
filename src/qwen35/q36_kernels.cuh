@@ -1,9 +1,10 @@
 // q36_kernels.cuh - decode kernels of the Qwen3.6 engine (q36_engine.cu), written to give the SAME BITS as the shared
 // kernels they replace (native_small_mmvq_kernel, k_moe_out, k_add_rms, k_group, native_quantize_q8_1) with a layout that
 // keeps more bytes in flight and fewer launches.  Every kernel here is checked bit for bit against the old one on the
-// real activations (STRATA_Q36_VERIFY=1, --no-graph).
+// real activations (STRATA_Q36_VERIFY=1).
 #pragma once
 
+#include "q36_delta.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 
@@ -30,6 +31,11 @@ __device__ __forceinline__ float wsum(float x) {
 __device__ __forceinline__ float wmax(float x) {
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, o, 32));
+    return x;
+}
+__device__ __forceinline__ float wmin(float x) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) x = fminf(x, __shfl_xor_sync(0xffffffffu, x, o, 32));
     return x;
 }
 __device__ __forceinline__ float sigm(float v) { return 1.0f / (1.0f + expf(-v)); }
@@ -162,6 +168,18 @@ inline void launch_q8_rows(const void* w, const half* dpl, const void* x, float*
     launch_q8_rows_t<NC, NJ, PK>(w, dpl, x, y, nb, n_out, 8, 1024, s);
 }
 
+/// Q8 blocks of one launch_q8_rows step (NJ = 1), and the widest row launch_q8_rows_nb serves (NJ = 3: hidden 3072).
+inline constexpr int kQ8RowBlocks = 32;
+inline constexpr int kQ8MaxBlocks = 3 * kQ8RowBlocks;
+
+/// launch_q8_rows with NJ = ceil(nb / kQ8RowBlocks) for rows of up to kQ8MaxBlocks blocks.
+template <int NC, bool PK>
+inline void launch_q8_rows_nb(const void* w, const half* dpl, const void* x, float* y, int nb, int n_out, cudaStream_t s) {
+    if (nb <= kQ8RowBlocks) launch_q8_rows<NC, 1, PK>(w, dpl, x, y, nb, n_out, s);
+    else if (nb <= 2 * kQ8RowBlocks) launch_q8_rows<NC, 2, PK>(w, dpl, x, y, nb, n_out, s);
+    else launch_q8_rows<NC, 3, PK>(w, dpl, x, y, nb, n_out, s);
+}
+
 /// The shared expert's gate and up products and SwiGLU + q8_1 in one launch: 32 rows (one q8_1 block of h) per 1024-thread
 /// block, warp w computing gate row and up row 32 b + w, then warp 0 applying native_swiglu_quantize_q8_1_kernel's body to
 /// the 32 pairs.  Column c of the h image is at hq + c * (n_out / 32).  n_out % 32 == 0.
@@ -219,14 +237,15 @@ __global__ void __launch_bounds__(256) k_add_rms_q(float* x, const float* y, con
     }
 }
 
-/// k_moe_out for T <= 8 rows (decode, verify windows) with n <= 2048 and n % 256 == 0: 1024 threads per row instead of 256
+inline constexpr int kMoeOutSmallN = 3072;   // the widest row it keeps in shared memory
+/// k_moe_out for T <= 8 rows (decode, verify windows) with n <= kMoeOutSmallN and n % 256 == 0: 1024 threads per row instead of 256
 /// (the elements' loads in parallel), the squares summed per old thread (element t, t + 256, ... in order) and the
 /// 256-wide tree as before: the same bits.  x += sum_k w_k part_k (+ gate * shared); h = rms(x) * wn; with hq the q8_1
 /// image of h as well (the next layer's input).
 __global__ void __launch_bounds__(1024) k_moe_out_small(float* x, const float* parts, const int32_t* prow, const float* wts,
                                                         int K_, const float* shared, const float* sgate, int sg_stride,
                                                         const float* wn, float* h, int n, float eps, QB* hq = nullptr) {
-    __shared__ float vv[2048];
+    __shared__ float vv[kMoeOutSmallN];
     __shared__ float sh[256];
     __shared__ const float* pk[16];
     const int t = blockIdx.x;
@@ -305,25 +324,72 @@ __global__ void k_group_small(const int32_t* ids, int n_ent, int K_, const int32
 
 /// route_topk<256, 8> (native_router.cu, copied: the same expressions) for n_tok <= 8 tokens (one warp each) and, in the same
 /// launch, k_group_small's grouping of the picks.  block (32, 8).  HY as k_group_small.
-template <bool HY>
+/// OPT (routing options, off by default; OPT = false is the plain top-k, the arithmetic above untouched):
+///  - cache_prior (HY only): the experts with a VRAM slot get cache_prior * Delta_avg added to the logit the ranking uses
+///    (arXiv 2412.00099, Eq. 9); Delta_avg is the layer's running mean of max(z) - min(z) (delta_avg_step), kept in this
+///    layer's delta_mean / delta_count and updated here, row by row in order: row t ranks with the mean after rows 0 .. t.
+///    The weights stay the unbiased softmax's, renormalised over the picks.
+///  - SER (ser_kmin, ser_t; ik_llama.cpp PR 239): the pick of rank >= ser_kmin is kept only if its probability exceeds
+///    ser_t * the top probability.  A dropped pick becomes a copy of the first pick's id with weight 0 (the expert is read
+///    once, the weights of the kept picks renormalise as before).
+template <bool HY, bool OPT>
 __global__ void __launch_bounds__(256) k_route_group(const float* __restrict__ logits, int32_t* __restrict__ ids,
                                                      float* __restrict__ weights, int n_tok, int ld, const int32_t* slot_of,
                                                      const uint8_t* blobs, unsigned long long blob,
                                                      unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups,
-                                                     int32_t* ent_dst, int32_t* ent_tok) {
+                                                     int32_t* ent_dst, int32_t* ent_tok, float cache_prior, int ser_kmin,
+                                                     float ser_t, float* delta_mean, int32_t* delta_count) {
     constexpr int NE = 256, K = 8, V = NE / 32;
     __shared__ int sids[64], sid[64];
+    __shared__ float row_delta[8];   // OPT, HY: row t's Delta_avg
     const int tk = threadIdx.y;
     const int lane = threadIdx.x;
+    if constexpr (OPT && HY) {
+        if (cache_prior > 0.0f) {   // uniform over the block: every thread reaches the barriers
+            if (tk < n_tok) {
+                const float* lg = logits + (size_t) tk * ld;
+                float maximum = -INFINITY, minimum = INFINITY;
+#pragma unroll
+                for (int i = 0; i < V; ++i) {
+                    maximum = max(maximum, lg[lane + i * 32]);
+                    minimum = min(minimum, lg[lane + i * 32]);
+                }
+                maximum = wmax(maximum);
+                minimum = wmin(minimum);
+                if (lane == 0) row_delta[tk] = maximum - minimum;
+            }
+            __syncthreads();
+            if (tk == 0 && lane == 0) {
+                float mean = *delta_mean;
+                int32_t count = *delta_count;
+                for (int t = 0; t < n_tok; ++t) {
+                    strata::q36::delta_avg_step(mean, count, row_delta[t]);
+                    row_delta[t] = mean;
+                }
+                *delta_mean = mean;
+                *delta_count = count;
+            }
+            __syncthreads();
+        }
+    }
     if (tk < n_tok) {
         const float* lg = logits + (size_t) tk * ld;
         float values[V];
 #pragma unroll
         for (int i = 0; i < V; ++i) values[i] = lg[lane + i * 32];
+        float key[V];   // OPT: the ranking's logits
         float maximum = -INFINITY;
 #pragma unroll
         for (int i = 0; i < V; ++i) maximum = max(maximum, values[i]);
         maximum = wmax(maximum);
+        if constexpr (OPT) {
+            const float bias = (HY && cache_prior > 0.0f) ? cache_prior * row_delta[tk] : 0.0f;
+#pragma unroll
+            for (int i = 0; i < V; ++i) {
+                key[i] = values[i] + ((HY && slot_of[lane + i * 32] >= 0) ? bias : 0.0f);
+                if (__isnanf(key[i])) key[i] = -FLT_MAX;
+            }
+        }
         float sum = 0.0f;
 #pragma unroll
         for (int i = 0; i < V; ++i) {
@@ -337,12 +403,14 @@ __global__ void __launch_bounds__(256) k_route_group(const float* __restrict__ l
             if (__isnanf(values[i])) values[i] = -FLT_MAX;
         }
         float selected = 0.0f, selected_sum = 0.0f;
+        int first = 0;   // OPT: the first pick, the id a dropped pick takes
         for (int rank = 0; rank < K; ++rank) {
-            float best = values[0];
+            float* const rk = OPT ? key : values;
+            float best = rk[0];
             int expert = lane;
 #pragma unroll
             for (int i = 1; i < V; ++i) {
-                if (values[i] > best) { best = values[i]; expert = lane + i * 32; }
+                if (rk[i] > best) { best = rk[i]; expert = lane + i * 32; }
             }
 #pragma unroll
             for (int mask = 16; mask; mask >>= 1) {
@@ -350,10 +418,20 @@ __global__ void __launch_bounds__(256) k_route_group(const float* __restrict__ l
                 const int other_id = __shfl_xor_sync(0xffffffffu, expert, mask, 32);
                 if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
             }
+            int out_id = expert;
+            if constexpr (OPT) {
+                // the pick's probability to every lane; the top probability is 1 / sum (the max logit's exp is 1)
+                const float p = __shfl_sync(0xffffffffu, values[expert / 32], expert & 31, 32);
+                if (rank == 0) first = expert;
+                const bool keep = rank < ser_kmin || p > ser_t * reciprocal;
+                best = keep ? p : 0.0f;
+                if (!keep) out_id = first;
+            }
             if ((expert & 31) == lane) {
+                if constexpr (OPT) key[expert / 32] = -INFINITY;
                 values[expert / 32] = -INFINITY;
-                ids[(size_t) tk * K + rank] = expert;
-                sids[tk * K + rank] = expert;
+                ids[(size_t) tk * K + rank] = out_id;
+                sids[tk * K + rank] = out_id;
                 selected_sum += best;
             }
             if (rank == lane) selected = best;
@@ -393,6 +471,40 @@ __global__ void __launch_bounds__(256) k_route_group(const float* __restrict__ l
         for (int q = 1; q < nv; ++q) G += sid[q - 1] != sid[q] ? 1 : 0;
         grp_start[G] = nv;
         *n_groups = G;
+    }
+}
+
+/// k_route_group's Delta_avg update for the rows it does not serve (a prompt chunk of more than 8 rows, 256 experts): the
+/// layer's running mean takes the ranges of the n_tok rows in row order.  block (32, 8): warp w measures row base + w, then
+/// one thread steps the (up to) 8 rows in order.
+__global__ void __launch_bounds__(256) k_delta_rows(const float* __restrict__ logits, int n_tok, int ld, float* delta_mean,
+                                                    int32_t* delta_count) {
+    constexpr int V = 256 / 32;
+    __shared__ float range[8];
+    float mean = *delta_mean;
+    int32_t count = *delta_count;
+    for (int base = 0; base < n_tok; base += 8) {
+        const int row = base + threadIdx.y;
+        if (row < n_tok) {
+            const float* lg = logits + (size_t) row * ld;
+            float maximum = -INFINITY, minimum = INFINITY;
+#pragma unroll
+            for (int i = 0; i < V; ++i) {
+                maximum = max(maximum, lg[threadIdx.x + i * 32]);
+                minimum = min(minimum, lg[threadIdx.x + i * 32]);
+            }
+            maximum = wmax(maximum);
+            minimum = wmin(minimum);
+            if (threadIdx.x == 0) range[threadIdx.y] = maximum - minimum;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0 && threadIdx.y == 0)
+            for (int t = 0; t < 8 && base + t < n_tok; ++t) strata::q36::delta_avg_step(mean, count, range[t]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        *delta_mean = mean;
+        *delta_count = count;
     }
 }
 

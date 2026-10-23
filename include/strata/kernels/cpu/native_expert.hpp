@@ -13,10 +13,12 @@
 
 namespace strata::kernels::cpu {
 
-/// Bytes of the largest quantized activation any native layer uses (2560 values as Q8_K: 10 x 292).
+/// Bytes of the largest quantized gate/up activation any native layer uses (3072 values as Q8_K: 12 x 292 = 3504).
 inline constexpr size_t kNativeActBytes = 4096;
-/// Bytes of the largest quantized down activation (640 values as Q8_0: 20 x 34, or Q8_K 3 x 292).
-inline constexpr size_t kNativeHBytes = 1024;
+/// Bytes of the largest quantized down activation (1024 values as Q8_K: 4 x 292 = 1168, or Q8_0: 32 x 34 = 1088).
+inline constexpr size_t kNativeHBytes = 2048;
+/// The widest expert intermediate (n_ff) a native layer may have: the pool's gate/up row buffers are this wide.
+inline constexpr int64_t kNativeMaxFF = 1024;
 
 /// One layer's native expert geometry.
 struct NativeFmt {
@@ -32,13 +34,25 @@ struct NativeFmt {
     /// projection's FP32 output: gate * s_gate, up * s_up, down * s_down. Do not fold s_down into up: the hidden
     /// drops to ~1e-5 and its q8 block scale becomes an FP16 subnormal (expert error 2-12% instead of 1.1%).
     size_t tail_off = 0;
+    /// Set by an engine that wants the one-token expert rows: IQ3_XXS gate/up served by iq512_gu_rows for a lone token
+    /// too, an IQ4_XS down served by iq512_rows for any token count, and an IQ4_NL down served by iq4nl256_down_rows (AVX-2)
+    /// for a lone token too.  Off (the default) keeps the selection the Flash-Next path has always had: ggml-cpu's dot
+    /// for one token, and for an IQ4_XS down always.  Their rows round differently from ggml-cpu's (only the order of the
+    /// float additions), so it is a choice of the engine, per layer; the q36 engine sets it only under
+    /// STRATA_Q36_ONE_TOKEN_CPU, since on an AVX-512 CPU the one-token kernels measure slower than ggml-cpu's dots.  Once
+    /// set, STRATA_IQ_MT_MIN takes all three back: the gate/up and IQ4_NL rows go by that variable's token threshold as
+    /// before, and an IQ4_XS down goes back to ggml-cpu's dot for any token count.  STRATA_NO_IQ512=1 takes back the two
+    /// AVX-512 kernels (IQ3_XXS gate/up, IQ4_XS down) but NOT the old selection: the gate/up rows then run on the AVX-2
+    /// multi-token kernel instead of the AVX-512 one, and STRATA_NO_IQ4NL=1 removes the AVX-2 IQ4_NL down kernel, so
+    /// neither reproduces a build without the flag; only STRATA_IQ_MT_MIN (or leaving the flag off) does.
+    bool one_token_512 = false;
 };
 constexpr int kNvfp4Type = 40;
 constexpr size_t kNvfp4Tail = 16;
 
 /// Whether this build has the ggml-cpu path.
 bool native_experts_available() noexcept;
-/// Fills `f` for a layer; false (with a reason) when ggml-cpu has no dot product for a type.
+/// Fills `f` for a layer; false (with a reason) when ggml-cpu has no dot product for a type or n_ff is above kNativeMaxFF.
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err);
 
 /// x (n_embd floats) -> the gate/up activation (act_bytes).
@@ -47,8 +61,8 @@ void native_quant_act(const NativeFmt& f, const float* x, void* dst);
 void native_quant_h(const NativeFmt& f, const float* h, void* dst);
 
 /// From how many tokens native_gu_rows gives this gate/up type to a multi-token kernel (#152; ggml-cpu's per-token dot
-/// below that).  1: a token's rows are the same alone and in any group.
-int native_gu_mt_min(int gu_type);
+/// below that).  1: a token's rows are the same alone and in any group.  `one_token_512`: NativeFmt::one_token_512.
+int native_gu_mt_min(int gu_type, bool one_token_512 = false);
 /// ff[t][r] = silu(gate_r . a[t]) * (up_r . a[t]) for rows r in [r0, r1), `nt` tokens.
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1);

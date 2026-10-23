@@ -1573,6 +1573,30 @@ class SamplingKeys(unittest.TestCase):
         self.assertIn("penalty_last_n=4096", self.keys(repetition_penalty=1.1, penalty_last_n=4096))
         self.assertFalse([k for k in self.keys(temperature=0.7) if k.startswith("penalty")])
 
+    def test_repetition_penalty_must_be_a_finite_number_above_0(self):
+        # the engine divides the positive logits by it: 0, a negative, NaN or infinity is refused before the engine
+        from serve.server import check_request_sampling
+        for bad in (0, -1.2, float("nan"), float("inf"), "0", "-1", "nan"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError) as refused:
+                    check_request_sampling({"repetition_penalty": bad})
+                self.assertIn("repetition_penalty", str(refused.exception))
+        for good in (1, 1.0, 1.15, "1.1"):
+            check_request_sampling({"repetition_penalty": good})
+
+    def test_top_p_must_be_in_0_1(self):
+        # top_p 0 or below would reach the engine as greedy, above 1 is no nucleus: refused as the settings path refuses it
+        from serve.server import check_request_sampling
+        for bad in (0, -0.5, 1.5, float("nan"), float("inf"), "0", "1.5"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError) as refused:
+                    check_request_sampling({"top_p": bad})
+                self.assertEqual(str(refused.exception), "top_p: 0 < top_p <= 1")
+        with self.assertRaises(ValueError):      # a string "nan" is refused by the non-finite check that all numbers share
+            check_request_sampling({"top_p": "nan"})
+        for good in (1, 1.0, 0.95, "0.8"):
+            check_request_sampling({"top_p": good})
+
 
 class SharedPrefix(unittest.TestCase):
     """R1: "strata_prefix" marks the first messages as a shared prefix; the engine gets pin=N."""
@@ -2411,6 +2435,109 @@ class NonFiniteLogits(unittest.TestCase):
         self.assertEqual(got, [5, 6])
         self.assertEqual(eng.last["finish"], "nonfinite")
         self.assertNotIn("STOP", eng.proc.stdin.getvalue())   # the DONE was read: nothing to stop or drain
+
+    def test_engine_err_line_raises(self):
+        """StrataEngine.generate: `ERR ...` (a row with no finite logit) raises ValueError after the tokens before it,
+        and the line ends the read: no STOP is sent to an engine that has already answered."""
+        import queue as queue_
+        eng = object.__new__(StrataEngine)
+        eng.lines = queue_.Queue()
+        for line in ("T 5", "ERR the logits hold no finite maximum or a NaN: no token drawn"):
+            eng.lines.put(line)
+        eng.proc = SimpleNamespace(stdin=io.StringIO())
+        eng.alive = lambda: True
+        eng.silence_s, eng.can_stop, eng.last = 0, True, None
+        got = []
+        with self.assertRaises(ValueError) as cm:
+            for t in eng.generate([1, 2, 3], 10, {}, threading.Event()):
+                got.append(t)
+        self.assertEqual(got, [5])
+        self.assertIn("no finite maximum or a NaN", str(cm.exception))
+        self.assertNotIn("STOP", eng.proc.stdin.getvalue())
+
+
+class NoLogitEngine(MockEngine):
+    """The engine's ERR for a row with no finite logit (q36: a -inf row or a NaN, #87), as StrataEngine.generate raises
+    it: after `cut` tokens, or before the first one when cut is 0.  cut None: the reply runs whole, as usual."""
+
+    def __init__(self, *a, cut=None, **kw):
+        super().__init__(*a, **kw)
+        self.cut = cut
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        if self.cut is None:
+            yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+            return
+        for i, t in enumerate(super().generate(ids, max_new, sampling, cancel, embeddings)):
+            if i >= self.cut:
+                break
+            yield t
+        raise ValueError("the logits hold no finite maximum or a NaN: no token drawn")
+
+
+class NoLogitReply(unittest.TestCase):
+    """#87: the engine's ERR for a row with no finite logit ends the request with an HTTP error, and the next request
+    runs as usual on the same engine (no stuck session)."""
+
+    def test_over_http(self):
+        tok = ByteTokenizer()
+        for cut, stream, code in ((0, False, 400), (0, True, 200), (2, True, 200)):
+            eng = NoLogitEngine(tok, "hello", max_context=CTX, cut=cut)
+            svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+            httpd = serve(svc, port=0)
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            try:
+                def post(body):
+                    req = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                                 headers={"Content-Type": "application/json"})
+                    try:
+                        with urllib.request.urlopen(req, timeout=30) as r:
+                            return r.status, r.read().decode()
+                    except urllib.error.HTTPError as e:
+                        with e:
+                            return e.code, e.read().decode()
+                msgs = [{"role": "user", "content": "hi"}]
+                with contextlib.redirect_stdout(io.StringIO()):
+                    got, text = post({"model": "m", "messages": msgs, "max_tokens": 20, "stream": stream})
+                    self.assertEqual(got, code, text)
+                    self.assertIn("no finite maximum or a NaN", text)
+                    self.assertNotIn("Traceback", text)
+                    eng.cut = None
+                    got, text = post({"model": "m", "messages": msgs, "max_tokens": 20, "stream": False})
+                self.assertEqual(got, 200, text)
+                self.assertIn("hello", text)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
+    def test_responses_and_anthropic_non_stream(self):
+        """#87: without stream, the engine's ERR before the first token is a 400 on /v1/responses and /v1/messages
+        too, with an invalid_request_error body (the same as /v1/chat/completions)."""
+        tok = ByteTokenizer()
+        msgs = [{"role": "user", "content": "hi"}]
+        for path, body in (("/v1/responses", {"model": "m", "input": "hi", "max_output_tokens": 20}),
+                           ("/v1/messages", {"model": "m", "messages": msgs, "max_tokens": 20})):
+            eng = NoLogitEngine(tok, "hello", max_context=CTX, cut=0)
+            svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+            httpd = serve(svc, port=0)
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            try:
+                req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                                             headers={"Content-Type": "application/json"})
+                with contextlib.redirect_stdout(io.StringIO()):
+                    try:
+                        with urllib.request.urlopen(req, timeout=30) as r:
+                            got, text = r.status, r.read().decode()
+                    except urllib.error.HTTPError as e:
+                        with e:
+                            got, text = e.code, e.read().decode()
+                self.assertEqual(got, 400, f"{path}: {text}")
+                self.assertEqual(json.loads(text)["error"]["type"], "invalid_request_error", path)
+                self.assertIn("no finite maximum or a NaN", text, path)
+                self.assertNotIn("Traceback", text, path)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
 
 
 class LayerSplit(unittest.TestCase):

@@ -15,7 +15,10 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <new>
 #include <stdexcept>
+#include <string>
+#include <system_error>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -466,7 +469,14 @@ void restore_thread_affinity(const ThreadAffinity& previous) {
 
 namespace {
 std::atomic<const ExpertPool*> g_diag_pool{nullptr};
+// The diagnostic reads the registered pool under this lock, and the destructor clears the registration under it, so
+// a pool is never read after its destructor has started.  Only the diagnostic and the start and stop paths take it.
+std::mutex& diag_mu() {
+    static std::mutex m;
+    return m;
+}
 void diag_active_pool(std::FILE* f) {
+    std::lock_guard<std::mutex> lk(diag_mu());
     if (const ExpertPool* p = g_diag_pool.load()) p->diag(f);
 }
 int64_t now_ms() {
@@ -496,6 +506,14 @@ void ExpertPool::diag(std::FILE* f) const {
     std::fprintf(f, " for %lld ms\n", (long long) (now_ms() - hstate_ms_.load()));
 }
 
+#ifndef NDEBUG
+// Test hook (tests/core/pool_lifecycle_test.cpp): the worker whose creation fails, -1 for none, and the exception that
+// failure throws (std::bad_alloc when the flag is set, std::system_error otherwise).  Compiled out of release builds,
+// where the start is the plain loop.
+std::atomic<int> g_pool_fail_thread_at{-1};
+std::atomic<bool> g_pool_fail_thread_bad_alloc{false};
+#endif
+
 ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity affinity, int tasks)
     : tasks_(tasks), host_works_(host_works), affinity_(affinity), topo_(detect_cpu_topology(true, affinity)) {
     if (tasks < 0 || tasks > kMaxTasks) throw std::invalid_argument("expert pool tasks must be in 0..4096");
@@ -513,24 +531,52 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     wstate_.reset(new std::atomic<int32_t>[(size_t) n_]);
     for (int i = 0; i < n_; ++i) wstate_[(size_t) i].store(kParked);
     hstate_ms_.store(now_ms());
-    g_diag_pool.store(this);
-    strata::core::diag_pool_fn().store(&diag_active_pool);
     split_.resize((size_t) kMaxSplit);
     split_multi_.resize((size_t) kMaxSplitMulti);
     threads_.reserve((size_t) n_);
-    for (int i = 0; i < n_; ++i) {
-        const int core = pin ? (i < (int) topo_.worker_cores.size() ? topo_.worker_cores[(size_t) i] : -1) : -1;
-        threads_.emplace_back([this, i, core] {
-            strata::aux_cpus::note_owned_thread();   // --aux-cpus never moves a worker
-            pin_this_thread(core, i);
-            worker(i);
-        });
+    // The destructor never runs for a constructor that throws, so the workers already started are stopped here, as the
+    // destructor would stop them, and joined before the error goes out: a joinable thread destroyed would call
+    // std::terminate.
+    auto stop_started = [this] {
+        stop_.store(true, std::memory_order_release);
+        publish();
+        for (auto& t : threads_) t.join();
+    };
+    try {
+        for (int i = 0; i < n_; ++i) {
+            const int core = pin ? (i < (int) topo_.worker_cores.size() ? topo_.worker_cores[(size_t) i] : -1) : -1;
+#ifndef NDEBUG
+            if (i == g_pool_fail_thread_at.load()) {
+                if (g_pool_fail_thread_bad_alloc.load()) throw std::bad_alloc();
+                throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again), "injected");
+            }
+#endif
+            threads_.emplace_back([this, i, core] {
+                strata::aux_cpus::note_owned_thread();   // --aux-cpus never moves a worker
+                pin_this_thread(core, i);
+                worker(i);
+            });
+        }
+    } catch (const std::system_error& e) {
+        stop_started();
+        throw std::runtime_error(std::string("expert pool: thread creation failed: ") + e.what());
+    } catch (...) {
+        stop_started();
+        throw;
     }
+    {
+        std::lock_guard<std::mutex> lk(diag_mu());
+        g_diag_pool.store(this);
+    }
+    strata::core::diag_pool_fn().store(&diag_active_pool);
 }
 
 ExpertPool::~ExpertPool() {
-    const ExpertPool* self = this;
-    g_diag_pool.compare_exchange_strong(self, nullptr);
+    {
+        std::lock_guard<std::mutex> lk(diag_mu());
+        const ExpertPool* self = this;
+        g_diag_pool.compare_exchange_strong(self, nullptr);
+    }
     stop_.store(true, std::memory_order_release);
     // Bump the epoch so a PARKED worker notices the stop flag rather than sleeping through it.
     publish();
@@ -716,7 +762,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 SplitBufMulti& sb = split_multi_[(size_t) e];
                 if (mode_ == 5 && q2_native_kernels(nfmt_->gu_type)) {
                     // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
-                    thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
+                    thread_local float gbuf[MAXT][kNativeMaxFF], ubuf[MAXT][kNativeMaxFF];
                     float* gp[MAXT];
                     float* up[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
@@ -840,6 +886,9 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
 
 void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
     if (n <= 0) return;
+    // The workers' per-token arrays are MAXT long: refuse a count outside them before anything is written.
+    for (int e = 0; e < n; ++e)
+        if (jobs[e].nt < 1 || jobs[e].nt > MAXT) throw std::invalid_argument("expert pool native tokens must be in 1..MAXT");
     const auto t0 = std::chrono::steady_clock::now();
     // more distinct experts than buffers: run them in batches
     for (int b0 = 0; b0 < n; b0 += kMaxSplitMulti) {
@@ -853,7 +902,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         const auto b = std::chrono::steady_clock::now();
         for (int e = 0; e < nb; ++e)
             for (int t = 0; t < mjobs_[e].nt; ++t)
-                if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
+                if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], (int) f.n_ff, split_multi_[(size_t) e].a2[t]);
                 else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
         const auto c = std::chrono::steady_clock::now();
         mrows_ = (int64_t) nb * f.n_embd;

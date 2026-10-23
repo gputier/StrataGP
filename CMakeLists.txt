@@ -277,6 +277,34 @@ if(STRATA_BUILD_TESTS)
   add_executable(gguf_geometry_test tests/core/gguf_geometry_test.cpp)
   target_link_libraries(gguf_geometry_test PRIVATE strata_artifact)
   add_test(NAME gguf_geometry_test COMMAND gguf_geometry_test)
+  # strata-q36's YaRN angles (rope_scaling.hpp) against transformers' _compute_yarn_parameters in float64 (header only)
+  add_executable(rope_yarn_reference_test tests/core/rope_yarn_reference_test.cpp)
+  target_include_directories(rope_yarn_reference_test PRIVATE include)
+  add_test(NAME rope_yarn_reference_test COMMAND rope_yarn_reference_test)
+  # strata-q36's `--kv q4` cache on one KV head (Hadamard rotation, q4_0 cells, rotation back): scores and attention output
+  # against float64 attention on the unrotated values (header only)
+  add_executable(q36_kv_q4_reference_test tests/core/q36_kv_q4_reference_test.cpp)
+  target_include_directories(q36_kv_q4_reference_test PRIVATE include)
+  add_test(NAME q36_kv_q4_reference_test COMMAND q36_kv_q4_reference_test)
+  # strata-q36's hybrid-mode doorbell (host side, header only): rings, answers and replays against a thread playing the graph
+  add_executable(q36_doorbell_test tests/core/q36_doorbell_test.cpp)
+  target_include_directories(q36_doorbell_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35")
+  target_link_libraries(q36_doorbell_test PRIVATE Threads::Threads)
+  add_test(NAME q36_doorbell_test COMMAND q36_doorbell_test)
+  # strata-q36's sampled speculative decoding (host side, header only): a window's picks are the plain sampled text, drafts or not
+  add_executable(q36_spec_sampling_test tests/core/q36_spec_sampling_test.cpp)
+  target_include_directories(q36_spec_sampling_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35")
+  add_test(NAME q36_spec_sampling_test COMMAND q36_spec_sampling_test)
+  # strata-q36's STRATA_Q36_STATS helpers: the expert union over consecutive tokens, the snapshots and the lines (host side)
+  add_executable(q36_stats_test tests/core/q36_stats_test.cpp)
+  target_include_directories(q36_stats_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35")
+  add_test(NAME q36_stats_test COMMAND q36_stats_test)
+  set_tests_properties(q36_stats_test PROPERTIES TIMEOUT 60)
+  # strata-q36's default pool worker count (host side)
+  add_executable(q36_threads_test tests/core/q36_threads_test.cpp)
+  target_include_directories(q36_threads_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35")
+  add_test(NAME q36_threads_test COMMAND q36_threads_test)
+  set_tests_properties(q36_threads_test PROPERTIES TIMEOUT 60)
 
   # the hipBLASLt tuning header's architecture gate: RDNA4 siblings share solution IDs, RDNA3 siblings share
   # theirs, cross-family pairs and version mismatches stay rejected (synthetic tables: no model, no GPU)
@@ -549,13 +577,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # already links `strata_core` - putting `gdn_layer` in core would make the two mutually dependent.  A third
   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
+  # the STRP expert profile (reader, writer, learned ranking): no device code, so strata_qwen35 links it too
+  add_library(strata_expert_profile STATIC src/core/expert_profile.cpp)
+  target_include_directories(strata_expert_profile PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/remote_expert_opt.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
     src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  target_link_libraries(strata_engine PUBLIC strata_expert_profile strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
     add_executable(host_graph_launch_test tests/core/host_graph_launch_test.cu)
     target_include_directories(host_graph_launch_test PRIVATE include)
@@ -614,6 +645,25 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME expert_profile_save_test COMMAND expert_profile_save_test)
     set_tests_properties(expert_profile_save_test PROPERTIES TIMEOUT 60)
   endif()
+  # strata-q36's expert profile: the slots' start from a profile, a round trip of the learned one, and the global choice of
+  # the replacements on a known set of counts (host side, header only plus the STRP reader / writer)
+  add_executable(q36_rebalance_test tests/core/q36_rebalance_test.cpp)
+  target_include_directories(q36_rebalance_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35")
+  target_link_libraries(q36_rebalance_test PRIVATE strata_expert_profile)
+  add_test(NAME q36_rebalance_test COMMAND q36_rebalance_test)
+  set_tests_properties(q36_rebalance_test PROPERTIES TIMEOUT 60)
+  # the profile reader on damaged files: truncated, out of range, version 2, more pairs than slots, hostile counts (CPU only)
+  add_executable(expert_profile_read_test tests/core/expert_profile_read_test.cpp)
+  target_link_libraries(expert_profile_read_test PRIVATE strata_expert_profile)
+  add_test(NAME expert_profile_read_test COMMAND expert_profile_read_test)
+  set_tests_properties(expert_profile_read_test PROPERTIES TIMEOUT 60)
+  # strata-q36's PCIe share of the missed experts: the choice, the plan the graph reads, Flash-Next's refinement rule (host
+  # side; pcie_share.hpp only includes the CUDA runtime header, nothing of it runs)
+  add_executable(q36_pcie_test tests/core/q36_pcie_test.cpp)
+  target_include_directories(q36_pcie_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35" "${CMAKE_CURRENT_SOURCE_DIR}/include")
+  target_link_libraries(q36_pcie_test PRIVATE ${_strata_gpu_runtime_target})
+  add_test(NAME q36_pcie_test COMMAND q36_pcie_test)
+  set_tests_properties(q36_pcie_test PROPERTIES TIMEOUT 60)
   # the profile header's version is enforced: a version other than 1 is refused by its number (CPU only)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/expert_profile_version_test.cpp")
     enable_testing()
@@ -713,7 +763,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # strata-q36 wraps on its own
   add_library(strata_qwen35 STATIC src/qwen35/q36_engine.cu)
   target_include_directories(strata_qwen35 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_strata_gpu_include_directories})
-  target_link_libraries(strata_qwen35 PRIVATE strata_prefill strata_kernels strata_warnings ${_strata_gpu_runtime_target})
+  target_link_libraries(strata_qwen35 PRIVATE strata_prefill strata_kernels strata_expert_profile strata_warnings ${_strata_gpu_runtime_target})
   if(STRATA_NATIVE_EXPERTS)
     # the hybrid mode (experts that do not all fit in VRAM): the CPU expert pool on ggml-cpu's arithmetic
     target_link_libraries(strata_qwen35 PRIVATE strata_kernels_cpu)
@@ -1550,6 +1600,20 @@ if(STRATA_NATIVE_EXPERTS)
     add_test(NAME q8k_quant_parity COMMAND q8k_quant_parity)
     add_test(NAME q8k_quant_parity_avx COMMAND ${CMAKE_COMMAND} -E env STRATA_FORCE_ISA=avx $<TARGET_FILE:q8k_quant_parity>)
   endif()
+  # Ornith-1.5-122B's expert geometry (n_embd 3072, width 1024): native_fmt accepts it (the down activation is above the
+  # pool's old 1024 bytes) and the gate/up and down rows match ggml-cpu's dot
+  add_executable(native_expert_ff1024_test src/kernels/cpu/native_expert_ff1024_test.cpp)
+  target_link_libraries(native_expert_ff1024_test PRIVATE strata_kernels_cpu)
+  if(STRATA_BUILD_TESTS)
+    add_test(NAME native_expert_ff1024_test COMMAND native_expert_ff1024_test)
+  endif()
+  # a token's expert rows are the same alone (decode) and in a verify window's group (MTP): greedy MTP equals MTP 0
+  add_executable(native_expert_row_invariance_test src/kernels/cpu/native_expert_row_invariance_test.cpp)
+  target_link_libraries(native_expert_row_invariance_test PRIVATE strata_kernels_cpu)
+  if(STRATA_BUILD_TESTS)
+    add_test(NAME native_expert_row_invariance_test COMMAND native_expert_row_invariance_test)
+    set_tests_properties(native_expert_row_invariance_test PROPERTIES SKIP_RETURN_CODE 77)   # no AVX-512 CPU: skipped
+  endif()
   set(_strata_mmq_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0)
   # #296: OrcaRouter Q4_K_S's Q5_0 experts (Q4_K and Q5_1 come with STRATA_MMQ_KQUANTS on CUDA, S5's branch)
   if(STRATA_ORCA_Q4KS_MMQ)
@@ -1931,6 +1995,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(pool_stress src/kernels/cpu/pool_stress.cpp)
   target_link_libraries(pool_stress PRIVATE strata_kernels_cpu)
   add_test(NAME pool_stress COMMAND pool_stress 20)
+  # issue #85: the token bound of run_split_multi_native, a refused thread creation, a diagnostic racing a destruction
+  add_executable(pool_lifecycle_test tests/core/pool_lifecycle_test.cpp)
+  target_link_libraries(pool_lifecycle_test PRIVATE strata_kernels_cpu)
+  add_test(NAME pool_lifecycle_test COMMAND pool_lifecycle_test)
 
   # #795: nothing an AVX2-only CPU can reach may hold AVX-512 / AVX-VNNI-class instructions.  (1) the linked test binary
   # (every CPU kernel file plus ggml-cpu; on Linux, the kernel library) is disassembled and any function with such instructions must be a kernel of

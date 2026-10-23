@@ -1,7 +1,8 @@
 // include/strata/artifact/model_family.hpp - which model family a GGUF holds, from its general.architecture.
 //
-// Strata was written for one model (Qwen3.8-Flash-Next, `qwen4exp`).  Qwen3.6-35B-A3B (`qwen35moe`) is a close
-// cousin (same tokenizer, the same Gated-DeltaNet + gated-attention 3:1 layer pattern, the same head dims), so the
+// Strata was written for one model (Qwen3.8-Flash-Next, `qwen4exp`).  Qwen3.6-35B-A3B and Ornith-1.5-122B (a
+// Qwen3.5-122B-A10B fine-tune), both `qwen35moe`, are close cousins (same tokenizer, the same Gated-DeltaNet +
+// gated-attention 3:1 layer pattern, the same head dims), so the
 // reader, the geometry and the layout tables know both.  The ENGINE runs only the families `model_family_runs`
 // names; a recognised family it does not run yet is refused with `model_family_not_supported`, not mis-run.
 //
@@ -15,7 +16,7 @@ namespace strata {
 enum class ModelFamily {
     Unknown = 0,
     Qwen4Exp,    ///< Qwen3.8-Flash-Next and its fine-tunes / pruned variants (Swift 1.5, the Coder)
-    Qwen35Moe,   ///< Qwen3.6-35B-A3B (Unsloth's MTP GGUFs): plain pre-norm residual, dense attention, nextn MTP block
+    Qwen35Moe,   ///< Qwen3.6-35B-A3B (Unsloth's MTP GGUFs), Ornith-1.5-122B: pre-norm residual, dense attention, MTP block
 };
 
 inline ModelFamily model_family_from_arch(const std::string& arch) {
@@ -42,13 +43,13 @@ inline const char* model_family_title(ModelFamily f) {
     case ModelFamily::Qwen4Exp:
         return "Qwen3.8-Flash-Next";
     case ModelFamily::Qwen35Moe:
-        return "Qwen3.6-35B-A3B";
+        return "Qwen3.6-35B-A3B / Ornith-1.5-122B";
     default:
         return "an unknown model";
     }
 }
 
-/// Whether Flash-Next's engine path runs the family.  Qwen3.6 has an engine path of its own (src/qwen35), which the
+/// Whether Flash-Next's engine path runs the family.  Qwen3.6 and Ornith have an engine path of their own (src/qwen35), which the
 /// CUDA and HIP builds of `strata` switch to at the top of main(); the Intel Arc (SYCL) build has none yet, so there
 /// (and on Flash-Next's path) the family is refused with `model_family_not_supported`.
 inline bool model_family_runs(ModelFamily f) { return f == ModelFamily::Qwen4Exp; }
