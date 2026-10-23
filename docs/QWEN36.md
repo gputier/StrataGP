@@ -261,6 +261,12 @@ Not reached: 100 tokens/s. The rate is 30.0 tokens/s at 1,024 tokens. Its open i
 
 MTP is off in the configuration. With `STRATA_Q36_ONE_TOKEN_CPU=1`, its output is identical, but 20 to 35 % slower, with no drop in missed bytes (issue #74).
 
+## Non-finite logits
+
+A row of logits with no finite maximum, or a NaN, draws no token. The engine prints `ERR the logits hold no finite maximum or a NaN: no token drawn` (`src/qwen35/q36_engine.cu:726`, printed at `:4531` and `:4624`) and prints no DONE line for that request. In the batch path the slot ends with `BDONE <slot> <tokens> error <ms>` (`q36_engine.cu:4090`), and the server does not reuse that slot's state (`serve/server.py:1782`).
+
+The server turns the ERR line into HTTP 400 when it comes before the first token, on the non-streaming endpoints of `/v1/chat/completions`, `/v1/messages` and `/v1/responses` (`serve/server.py:5665`, `:6070`). A streaming request has already sent its 200 status and headers, so it gets no 400. It receives an error event, then the stream ends: `data: {"error": {"type": "server_error", ...}}` followed by `data: [DONE]` on chat completions (`serve/server.py:6001`), a `response.failed` event on `/v1/responses` (`:6102`), and an `event: error` on `/v1/messages` (`:6221`).
+
 ## Not done / limits
 
 - Ornith-1.5-122B does not reach 100 tokens/s (30.0 at 1,024 tokens). Its limits and open issues are in its section above.
