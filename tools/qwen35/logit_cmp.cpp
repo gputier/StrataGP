@@ -80,6 +80,17 @@ int parse_vocab(const char* s) {
     }
     return (int) v;
 }
+
+// --steps must be a whole number, 0 or more: 0 keeps every step, as when it is absent.
+int parse_steps(const char* s) {
+    char* end = nullptr;
+    const long v = std::strtol(s, &end, 10);
+    if (end == s || *end != '\0' || v < 0 || v > INT_MAX) {
+        std::fprintf(stderr, "--steps must be a non-negative integer, got '%s'\n", s);
+        std::exit(2);
+    }
+    return (int) v;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -93,7 +104,7 @@ int main(int argc, char** argv) {
         else if (i + 1 < argc && a == "--ref") ref = argv[++i];
         else if (i + 1 < argc && a == "--test") test = argv[++i];
         else if (i + 1 < argc && a == "--vocab") V = parse_vocab(argv[++i]);
-        else if (i + 1 < argc && a == "--steps") max_steps = std::atoi(argv[++i]);
+        else if (i + 1 < argc && a == "--steps") max_steps = parse_steps(argv[++i]);
         else { std::fprintf(stderr, "usage: logit_cmp --ref F --test F --vocab N [--steps N] [--stop-at-divergence] [--per-step]\n"); return 2; }
     }
     const std::vector<float> P = slurp(ref, V), Q = slurp(test, V);

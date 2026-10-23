@@ -51,6 +51,12 @@ def top2(path: Path, n_vocab: int) -> np.ndarray:
     A tie goes to the smallest id, as in logit_cmp.cpp: argmax returns the first maximum, and the second is the
     first maximum of the row once the first is set aside."""
     lg = np.fromfile(path, dtype=np.float32).reshape(-1, n_vocab)
+    bad = np.argwhere(~np.isfinite(lg))
+    if len(bad):
+        step, logit = bad[0]
+        kind = "NaN" if np.isnan(lg[step, logit]) else "infinite"
+        print(f"{path}: step {step}, logit {logit} is {kind}: refusing non-finite logits", file=sys.stderr)
+        sys.exit(2)
     rows = np.arange(len(lg))
     i1 = np.argmax(lg, axis=1)
     v1 = lg[rows, i1].copy()
