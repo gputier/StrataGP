@@ -1995,6 +1995,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(pool_stress src/kernels/cpu/pool_stress.cpp)
   target_link_libraries(pool_stress PRIVATE strata_kernels_cpu)
   add_test(NAME pool_stress COMMAND pool_stress 20)
+  # issue #85: the token bound of run_split_multi_native, a refused thread creation, a diagnostic racing a destruction
+  add_executable(pool_lifecycle_test tests/core/pool_lifecycle_test.cpp)
+  target_link_libraries(pool_lifecycle_test PRIVATE strata_kernels_cpu)
+  add_test(NAME pool_lifecycle_test COMMAND pool_lifecycle_test)
 
   # #795: nothing an AVX2-only CPU can reach may hold AVX-512 / AVX-VNNI-class instructions.  (1) the linked test binary
   # (every CPU kernel file plus ggml-cpu; on Linux, the kernel library) is disassembled and any function with such instructions must be a kernel of
