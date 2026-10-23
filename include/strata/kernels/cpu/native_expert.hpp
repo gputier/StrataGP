@@ -48,6 +48,7 @@ struct NativeFmt {
     bool one_token_512 = false;
 };
 constexpr int kNvfp4Type = 40;
+constexpr int kQ2_0Type = 42;
 constexpr size_t kNvfp4Tail = 16;
 
 /// Whether this build has the ggml-cpu path.

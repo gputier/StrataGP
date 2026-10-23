@@ -2910,6 +2910,7 @@ struct Engine {
             wire_pending.push_back(ws);
         }
         int n_pcie_ent = 0;
+        const bool q2 = C::q2_native_kernels(H.fmt.gu_type);   // the Q2_0 gate/up kernels read an ActQ, not nact
         for (int e = 0; e < n_ent; ++e) {
             const int x = h_ids[e];
             if (!defer && strata::q36::first_of_row(h_ids, e, Kp)) H.count((size_t) x, 1.0);
@@ -2923,7 +2924,7 @@ struct Engine {
             const int t = e / Kp;
             if (!quantized[(size_t) t]) {
                 C::native_quant_act(H.fmt, h_h + (size_t) t * N, acts + (size_t) t * C::kNativeActBytes);
-                if (C::q2_native_kernels(H.fmt.gu_type)) C::act_quant_any(h_h + (size_t) t * N, N, actq[(size_t) t]);
+                if (q2) C::act_quant_any(h_h + (size_t) t * N, N, actq[(size_t) t]);
                 quantized[(size_t) t] = 1;
             }
             auto it = open.find(x);
@@ -2935,7 +2936,7 @@ struct Engine {
             }
             C::ExpertJobMulti& j = jobs[it->second];
             j.nact[j.nt] = acts + (size_t) t * C::kNativeActBytes;
-            if (C::q2_native_kernels(H.fmt.gu_type)) j.act[j.nt] = &actq[(size_t) t];
+            if (q2) j.act[j.nt] = &actq[(size_t) t];
             j.out[j.nt] = cpu_out + (size_t) e * N;
             ++j.nt;
         }

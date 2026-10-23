@@ -30,7 +30,7 @@ namespace {
 // the hidden size of an ActQ (expert.hpp's H, the size act_quant_any writes): the callers quantize with it, so the test does
 constexpr int64_t kH = cpu::H, kFF = 1024;   // n_embd, expert width (kNativeMaxFF)
 constexpr int kT = 2;                      // tokens in the job
-constexpr int kGuType = 42, kDType = 23;   // Q2_0 gate/up (the pool's own kernels), IQ4_XS down (ggml-cpu's rows)
+constexpr int kGuType = cpu::kQ2_0Type, kDType = 23;   // Q2_0 gate/up (the pool's own kernels), IQ4_XS down (ggml-cpu's rows)
 constexpr double kTol = 1e-4;
 constexpr int kSkip = 77;
 
