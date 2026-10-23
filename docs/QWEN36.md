@@ -256,7 +256,7 @@ Attention costs 2.42 ms per token at 1k context, 6.82 ms at 32k and 18.93 ms at 
 
 Other levers measured: `STRATA_DMA_BATCH=1` against 0 has no measurable effect, and neither has `--pcie-frac 0.50` against the automatic share (issue #80). The automatic share now settles at 0.45. The former default settled at 0.80 and gave 22.4 tokens/s, against 24.6. The best fixed value measured is 0.50 to 0.55. The branch also prefetches the experts of the next layer, groups the copies, and drops a single-pass CPU pool per layer, which gave no gain. The pool runs 6 threads by default (`kDefaultPoolWorkers`, `src/qwen35/q36_threads.hpp:10`), capped by the worker processors present.
 
-Not reached: 100 tokens/s. The rate is 30.0 tokens/s at 1,024 tokens. Its open issues are #77 (CPU kernels of ik_llama: the pool stays the first cost, 20.8 ms), #79 (CPU pool), #80 (PCIe share), #81 (attention at long context), #74 (MTP), #75 (REAP), #76 (2 bits) and #78 (speculative decoding).
+Not reached: 100 tokens/s. The rate is 30.0 tokens/s at 1,024 tokens. Its open issues are #77 (CPU kernels of ik_llama: the pool stays the first cost, 20.8 ms), #79 (CPU pool), #80 (PCIe share), #81 (attention at long context), #74 (MTP), #75 (REAP) and #78 (speculative decoding). #76 (experts in 2 bits) was measured and set aside: 40.65 against 28.45 tokens/s, KL 0.4697 against 0.0423 (docs/ORNITH_122B.md).
 
 MTP is off in the configuration. With `STRATA_Q36_ONE_TOKEN_CPU=1`, its output is identical, but 20 to 35 % slower, with no drop in missed bytes (issue #74).
 

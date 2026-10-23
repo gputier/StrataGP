@@ -204,6 +204,25 @@ and the host cost to fall, not only the pool.
 A later attempt ran without the cap, under the guard. The process was stopped at 4,272 MB available, after 28.1 seconds of
 falling memory, before it produced any token. No uncapped throughput exists. The coordinator chose to stop and report; lifting the cap is the owner's decision.
 
+### Lower-bit expert quantization, IQ2_XXS (23 October)
+
+The lower-bit candidate of the open leads (issue #76) was quantized and measured, then set aside. The BF16 source was downloaded again (revision 5514dc9e, checksum matched) and quantized with the importance matrix kept from the earlier work. Gate and up experts are IQ2_XXS, the block 48 gate and up are Q4_K, and down is IQ4_XS. The file is 48,577,355,616 bytes, 3.12 bits per weight over the file, and took 32 minutes on 16 threads.
+
+Quality, same binary `ec3d4b63`, ten prompts of 32 steps against the llama.cpp reference:
+
+| Quant | Mean KL | Top-1 |
+|---|---|---|
+| IQ2_XXS (new) | 0.4697 | 265 of 320 (82.8 %) |
+| Current quant | 0.0423 | 299 of 320 (93.4 %) |
+
+The bar of 0.061 is not met: the new quant is 7.7 times the bar. The worst prompt gives a KL of 1.84 and a top-1 of 19 of 32. The current quant reproduces the task A2 output byte for byte. This confirms the measurement chain.
+
+Throughput, under the 24 GB working-set cap, four code requests of 1,024 tokens, three alternated launches per quant: 40.65 tokens/s (range 40.60 to 41.67) for the new quant, against 28.45 (27.80 to 28.85) for the current quant in the same session. The current quant measured 30.0 tokens/s on 22 and 23 October under the same protocol, so 28.45 is the same-session control.
+
+Source of the gain. Missed expert bytes per token fall from 678 MB to 451 MB (minus 33 %). The pool time falls from 22.1 to 12.9 ms per token (calculated). The host wait on the GPU stays at 9.2 ms. Expert slots per layer in VRAM rise from 76 to 95. The plan had announced a lower bound of about 34 tokens/s without the slot gain; the measured figure sits above it thanks to the 19 extra slots. The quality run, launched with other settings, counted 104 slots per layer for the new quant and 83 for the current one.
+
+Decision of the owner, 23 October 2026: IQ2_XXS is set aside and the current quant stays the default. The BF16 source is kept on the test box for a possible intermediate tier, for example gate and up in IQ2_S (2.5 bits per weight), which is not measured. The IQ2_XXS file stays on disk, unused.
+
 ## Operational pitfalls
 
 - A process started with `Start-Process` from an SSH session dies with the session. Start it detached instead.
@@ -220,7 +239,7 @@ falling memory, before it produced any token. No uncapped throughput exists. The
 
 Estimated gains come from calculations in the sources, not from measurements on the box.
 
-1. Lower-bit expert quantization, issue #76. The owner's first choice. No usable throughput estimate: the 24 to 29 tokens/s of the source assumed a 23 tokens/s base, below the 30.0 measured since. The byte ratio stays useful: about 0.807 of today's expert bytes for gate and up in IQ2_XXS with down in IQ4_XS (calculated from the bits per weight). The source report gives 0.893 without stating its denominator. Cost: a new download of the BF16 source, about 249 GB, then quantization with the kept importance matrix. Quality risk is high, because every expert call is degraded. First measurement: KL and top-1 on the ten prompts against the 0.061 bar, then throughput and bytes on the box.
+1. Lower-bit expert quantization, issue #76. Measured on 23 October and set aside by the owner. Gate and up in IQ2_XXS, down in IQ4_XS: KL 0.4697 against the 0.061 bar (current quant 0.0423), top-1 265 of 320 against 299. Throughput 40.65 tokens/s against 28.45 in the same session, with 95 expert slots per layer in VRAM against 76. The BF16 source is kept for a possible intermediate tier (gate and up in IQ2_S, 2.5 bits per weight), not measured. See the IQ2_XXS section above.
 2. ik_llama CPU kernels, issue #77. No gain measured. The estimated ceiling of 23 to 29 tokens/s rests on a 6.5 GB/s pool, since measured at 20 to 22.5 GB/s, so it no longer applies. Cost: repacking, with about 50 GB of second copy in RAM, which needs the owner's approval. Quality risk: the R8 path changes output bits. First measurement: the one-token bench at six workers, then the existing one-token path.
 3. Host memory, issue #82. No gain estimated. About 28 GB of private memory remains unidentified (calculated: 79.5 GB of private memory less 51.6 GB of pinned experts). First measurement: find its origin before any engine change.
 4. NVMe tier, issue #84. The issue estimates no gain, because about 48 GiB of experts stay pinned in RAM and a storage tier does not lift the rate while they do. First step: confirm the architecture and the ceiling with the NVMe share, then decide.
