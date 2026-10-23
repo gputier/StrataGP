@@ -53,7 +53,9 @@ inline int sample(std::vector<float>& lg, const Sampling& s, const std::vector<i
     const int kk = std::max(1, std::min(s.top_k > 0 ? s.top_k : 64, (int) lg.size()));
     std::vector<int> idx(lg.size());
     for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int) i;
-    std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&](int a, int b) { return lg[a] > lg[b]; });
+    // equal logits are ordered by index: which of them make the top_k cut does not depend on the library's sort
+    std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(),
+                      [&](int a, int b) { return lg[a] > lg[b] || (lg[a] == lg[b] && a < b); });
     idx.resize((size_t) kk);
     // top_p and min_p cut the untempered distribution (llama.cpp's and Flash-Next's order); the temperature only shapes the draw
     std::vector<double> p(idx.size());

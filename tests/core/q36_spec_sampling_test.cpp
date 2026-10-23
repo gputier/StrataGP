@@ -9,11 +9,12 @@
 //  3. with the logits independent of the context, the token drawn at each position (through windows) follows the
 //     softmax within 5 sigma over 20000 seeds, and the acceptance rate of argmax drafts is the argmax' probability;
 //  4. the cut (top_k, top_p, min_p on the untempered distribution, temperature for the draw only) matches a numeric
-//     reference: same support, same frequencies within 5 sigma;
+//     reference: same support, same frequencies within 5 sigma, equal logits at the top_k border included;
 //  5. the penalties (repeat, frequency, presence, over the last_n window, drafts of a verify row included) match a
-//     numeric reference;
-//  6. slots decoded side by side, one token each in turn (the batch rule: the draw of the fed token's position), give
-//     for every seed the text of the same request decoded alone.
+//     numeric reference, as the argmax at top_k 1 and as the distribution at top_k above 1;
+//  6. the batch rule: slots decoded side by side, one token each in turn, with the draw of the fed token's position,
+//     give for every seed the text of the same request decoded alone.  The loop is the test's own (batched()): this
+//     proves the rule, not the engine's batch windows.
 #include "check.hpp"
 #include "q36_sampling.hpp"
 
@@ -116,7 +117,7 @@ std::vector<int32_t> windowed(std::vector<int32_t> seq, int n, int D, const Samp
 }
 
 // the batch rule: S requests advance one token per turn each, the draw of a token being the one of the position that
-// fed it (what the engine's batch windows do), and every request ends with the text it has alone
+// fed it, and every request ends with the text it has alone (the rule only: the engine's batch windows are not run here)
 std::vector<std::vector<int32_t>> batched(const std::vector<Sampling>& ss, const std::vector<int32_t>& prompt, int n) {
     std::vector<std::vector<int32_t>> seq(ss.size(), prompt), out(ss.size());
     for (int i = 0; i < n; ++i)
@@ -135,7 +136,10 @@ std::vector<std::vector<int32_t>> batched(const std::vector<Sampling>& ss, const
 std::vector<double> cut_reference(const std::vector<float>& lg, const Sampling& s) {
     std::vector<int> idx(lg.size());
     for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int) i;
-    std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return lg[(size_t) a] > lg[(size_t) b]; });
+    // the sampler's order: by logit, equal logits by index
+    std::sort(idx.begin(), idx.end(), [&](int a, int b) {
+        return lg[(size_t) a] > lg[(size_t) b] || (lg[(size_t) a] == lg[(size_t) b] && a < b);
+    });
     idx.resize((size_t) std::min<int>(s.top_k > 0 ? s.top_k : 64, (int) lg.size()));
     const double top = lg[(size_t) idx[0]];
     double z = 0;
@@ -168,6 +172,20 @@ std::vector<float> penalty_reference(std::vector<float> lg, const Sampling& s, c
         lg[id] -= (float) c * s.freq + s.present;
     }
     return lg;
+}
+
+// the draws (cnt, N of them) against a reference distribution: the support must be the reference's, and each
+// frequency within 5 sigma of it.  kept: the size of the reference's support; worst: the largest deviation in sigma
+struct Fit { bool support = true; int kept = 0; double worst = 0; };
+Fit fit_draws(const std::vector<int>& cnt, const std::vector<double>& ref, int N) {
+    Fit f;
+    for (int i = 0; i < kV; ++i) {
+        if ((ref[(size_t) i] == 0.0) != (cnt[(size_t) i] == 0)) f.support = false;
+        f.kept += ref[(size_t) i] > 0.0;
+        const double sd = std::sqrt(std::max(ref[(size_t) i] * (1 - ref[(size_t) i]), 1e-12) / N);
+        f.worst = std::max(f.worst, std::fabs(cnt[(size_t) i] / (double) N - ref[(size_t) i]) / sd);
+    }
+    return f;
 }
 }  // namespace
 
@@ -270,6 +288,50 @@ int main() {
             std::snprintf(what, sizeof what, "cut, %s: support is the reference's (%d tokens), worst frequency deviation %.2f sigma (bound 5)", c.name, kept, worst);
             check(support && kept > 1 && worst < 5.0, what);
         }
+    }
+
+    // 4b: equal logits at the top_k border: token i has the logit i % 3, so 13 tokens tie at the top value 2 and 13 at
+    // 1; with top_k 16 the last three candidates are the three lowest of the tied ones at 1, tokens 1, 4 and 7
+    {
+        std::vector<float> lg(kV);
+        for (int i = 0; i < kV; ++i) lg[(size_t) i] = (float) (i % 3);
+        Sampling s;
+        s.temperature = 1.f; s.top_k = 16; s.top_p = 1.f;
+        const std::vector<double> ref = cut_reference(lg, s);
+        constexpr int N = 40000;
+        std::vector<int> cnt(kV, 0);
+        for (uint64_t seed = 1; seed <= N; ++seed) {
+            std::vector<float> row = lg;
+            std::mt19937_64 r = draw_rng(seed, 3);
+            ++cnt[(size_t) sample(row, s, {}, r)];
+        }
+        const Fit f = fit_draws(cnt, ref, N);
+        char what[200];
+        std::snprintf(what, sizeof what, "top_k border tie: the candidates are the reference's (%d tokens, 7 in, 10 out), worst frequency deviation %.2f sigma (bound 5)",
+                      f.kept, f.worst);
+        check(f.support && f.kept == 16 && ref[7] > 0.0 && ref[10] == 0.0 && f.worst < 5.0, what);
+    }
+
+    // 5b: the penalties at top_k above 1, where the pick is a draw: the penalised cut against the numeric reference
+    {
+        const std::vector<float> lg = row_logits({4, 8}, false, 0);
+        const std::vector<int32_t> hist = {4, 8, 4, 12, 30, 2}, tail = {4};
+        Sampling s;
+        s.temperature = 0.9f; s.top_k = 6; s.top_p = 0.95f; s.min_p = 0.02f;
+        s.repeat = 1.3f; s.freq = 0.2f; s.present = 0.4f; s.last_n = -1;
+        const std::vector<double> ref = cut_reference(penalty_reference(lg, s, hist, tail), s);
+        constexpr int N = 40000;
+        std::vector<int> cnt(kV, 0);
+        for (uint64_t seed = 1; seed <= N; ++seed) {
+            std::vector<float> row = lg;
+            std::mt19937_64 r = draw_rng(seed, 3);
+            ++cnt[(size_t) sample(row, s, hist, r, tail.data(), tail.size())];
+        }
+        const Fit f = fit_draws(cnt, ref, N);
+        char what[200];
+        std::snprintf(what, sizeof what, "penalties at top_k 6: the penalised cut is the reference's (%d tokens), worst frequency deviation %.2f sigma (bound 5)",
+                      f.kept, f.worst);
+        check(f.support && f.kept > 1 && f.worst < 5.0, what);
     }
 
     // 5: the penalties against the numeric reference, through the pick (top_k 1: the argmax of the penalised row)

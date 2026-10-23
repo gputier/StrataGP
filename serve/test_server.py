@@ -1573,6 +1573,17 @@ class SamplingKeys(unittest.TestCase):
         self.assertIn("penalty_last_n=4096", self.keys(repetition_penalty=1.1, penalty_last_n=4096))
         self.assertFalse([k for k in self.keys(temperature=0.7) if k.startswith("penalty")])
 
+    def test_repetition_penalty_must_be_a_finite_number_above_0(self):
+        # the engine divides the positive logits by it: 0, a negative, NaN or infinity is refused before the engine
+        from serve.server import check_request_sampling
+        for bad in (0, -1.2, float("nan"), float("inf"), "0", "-1", "nan"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError) as refused:
+                    check_request_sampling({"repetition_penalty": bad})
+                self.assertIn("repetition_penalty", str(refused.exception))
+        for good in (1, 1.0, 1.15, "1.1"):
+            check_request_sampling({"repetition_penalty": good})
+
 
 class SharedPrefix(unittest.TestCase):
     """R1: "strata_prefix" marks the first messages as a shared prefix; the engine gets pin=N."""
