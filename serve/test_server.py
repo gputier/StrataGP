@@ -1584,6 +1584,19 @@ class SamplingKeys(unittest.TestCase):
         for good in (1, 1.0, 1.15, "1.1"):
             check_request_sampling({"repetition_penalty": good})
 
+    def test_top_p_must_be_in_0_1(self):
+        # top_p 0 or below would reach the engine as greedy, above 1 is no nucleus: refused as the settings path refuses it
+        from serve.server import check_request_sampling
+        for bad in (0, -0.5, 1.5, float("nan"), float("inf"), "0", "1.5"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError) as refused:
+                    check_request_sampling({"top_p": bad})
+                self.assertEqual(str(refused.exception), "top_p: 0 < top_p <= 1")
+        with self.assertRaises(ValueError):      # a string "nan" is refused by the non-finite check that all numbers share
+            check_request_sampling({"top_p": "nan"})
+        for good in (1, 1.0, 0.95, "0.8"):
+            check_request_sampling({"top_p": good})
+
 
 class SharedPrefix(unittest.TestCase):
     """R1: "strata_prefix" marks the first messages as a shared prefix; the engine gets pin=N."""

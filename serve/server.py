@@ -6748,8 +6748,9 @@ def check_request_sampling(req) -> None:
     replaced the configured default in run()'s merge and sampling_keys dropped it, so the reply was greedy.  Only
     types are checked: a number (int or float, never bool) for temperature, top_p, min_p and the three penalties; an
     integer (never bool or float) for top_k, penalty_last_n and seed.  Ranges behave as before (a temperature <= 0 is
-    greedy, top_k 0 or above 64 is clamped, a seed <= 0 is unset), except a repetition_penalty that is not a finite
-    number above 0 (the engine divides the logits by it), and an absent or null field is not checked."""
+    greedy, top_k 0 or above 64 is clamped, a seed <= 0 is unset), except a top_p outside 0 < top_p <= 1 (as POST
+    /settings refuses it) and a repetition_penalty that is not a finite number above 0 (the engine divides the logits
+    by it), and an absent or null field is not checked."""
     if isinstance(req, dict):      # #1819: llama.cpp's names; the OpenAI-style field wins when both are sent
         if req.get("repeat_penalty") is not None and req.get("repetition_penalty") is None:
             req["repetition_penalty"] = req["repeat_penalty"]
@@ -6777,6 +6778,8 @@ def check_request_sampling(req) -> None:
             req[key] = value = num
         if isinstance(value, bool) or not isinstance(value, int if integer else (int, float)):
             raise ValueError(f"{key}: {'an integer' if integer else 'a number'}")
+        if key == "top_p" and not (math.isfinite(value) and 0 < value <= 1):      # the same range as POST /settings
+            raise ValueError("top_p: 0 < top_p <= 1")
         if key == "repetition_penalty" and not (math.isfinite(value) and value > 0):
             raise ValueError("repetition_penalty: a number > 0 (1 = off)")
 
