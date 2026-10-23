@@ -69,6 +69,7 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <set>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -1342,6 +1343,84 @@ static size_t kv_cell_bytes_for(bool q4, int64_t head_dim) {
     return q4 ? (size_t) strata::kernels::kv_q4_bytes_per_head((int) head_dim) : (size_t) head_dim * 4;
 }
 
+// VERIFY's checks on the device (Engine::verify_cmp, Engine::group_verify). One block compares the words as bit patterns, as
+// memcmp did; thread 0 counts the call in its slot and, for a mismatching call, keeps the first differing word while the slot
+// has room. The calls of a slot run in stream order, so a slot needs no atomics.
+constexpr int kVerifyBlock = 1024;   // threads of a check
+constexpr int kVerifyRecs = 20;      // mismatching calls kept per slot (a group slot can print kVerifyGroupLines of them)
+constexpr int kVerifyGroupLines = 20;   // group mismatch lines printed in all, as HEAD printed them
+constexpr int kVerifyGroups = 64;    // groups and entries the grouping check takes (route_group and group_entries bound them)
+constexpr long long kNoWord = 0x7fffffffffffffffLL;
+struct VRec { long long idx; unsigned a, b; };   // the first differing word of a mismatching call, both bit patterns
+struct VSlot { unsigned long long calls, bad; VRec rec[kVerifyRecs]; };
+struct VSite { std::string what, tag; long long n; bool group; int shown; };   // host: a slot's check site and lines shown
+struct VGroup {   // the grouping of the routed entries (n: the group count, ptr: two words per group, start, dst, tok: words)
+    const int32_t *n_a, *n_b;
+    const void *ptr_a, *ptr_b;
+    const int32_t *start_a, *start_b, *dst_a, *dst_b, *tok_a, *tok_b;
+};
+__device__ inline void vcmp_words(const uint32_t* a, const uint32_t* b, long long len, long long base, unsigned long long& cnt,
+                                  long long& first) {
+    for (long long i = threadIdx.x; i < len; i += blockDim.x)
+        if (a[i] != b[i]) {
+            ++cnt;
+            first = min(first, base + i);
+        }
+}
+__device__ inline void vcmp_store(VSlot* s, unsigned long long cnt, long long first, unsigned a, unsigned b) {
+    ++s->calls;
+    if (cnt == 0) return;
+    if (s->bad < kVerifyRecs) s->rec[s->bad] = VRec{first, a, b};
+    ++s->bad;
+}
+// The block's reduction of a check's counts, then thread 0 stores the call. words(i) gives the record of the word at i, and is
+// read only for a mismatching call.
+template <class Words>
+__device__ inline void vcmp_block(VSlot* s, unsigned long long c, long long f, Words words) {
+    __shared__ unsigned long long cnt[kVerifyBlock];
+    __shared__ long long first[kVerifyBlock];
+    cnt[threadIdx.x] = c;
+    first[threadIdx.x] = f;
+    __syncthreads();
+    for (unsigned k = blockDim.x / 2; k > 0; k >>= 1) {
+        if (threadIdx.x < k) {
+            cnt[threadIdx.x] += cnt[threadIdx.x + k];
+            first[threadIdx.x] = min(first[threadIdx.x], first[threadIdx.x + k]);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        VRec w{0, 0u, 0u};
+        if (cnt[0]) w = words(first[0]);
+        vcmp_store(s, cnt[0], first[0], w.a, w.b);
+    }
+}
+__global__ void k_vcmp(const uint32_t* a, const uint32_t* b, long long n, VSlot* s) {
+    unsigned long long c = 0;
+    long long f = kNoWord;
+    vcmp_words(a, b, n, 0, c, f);
+    vcmp_block(s, c, f, [a, b](long long i) { return VRec{i, a[i], b[i]}; });
+}
+__global__ void k_vcmp_group(VGroup g, VSlot* s) {
+    const int nn = g.n_a[0], no = g.n_b[0];
+    bool ok = nn == no && nn >= 0 && nn <= kVerifyGroups;   // (every thread reads the same words: the branch is uniform)
+    const int tot = ok ? g.start_a[nn] : 0;
+    ok = ok && tot >= 0 && tot <= kVerifyGroups;
+    if (!ok) {   // the counts differ or a count is past the bound: a mismatch with no word to show
+        if (threadIdx.x == 0) vcmp_store(s, 1, -1, nn, no);
+        return;
+    }
+    unsigned long long c = 0;
+    long long f = kNoWord;
+    const uint32_t* pa = (const uint32_t*) g.ptr_a;
+    const uint32_t* pb = (const uint32_t*) g.ptr_b;
+    vcmp_words(pa, pb, 2LL * nn, 0, c, f);
+    vcmp_words((const uint32_t*) g.start_a, (const uint32_t*) g.start_b, nn + 1, 2LL * nn, c, f);
+    vcmp_words((const uint32_t*) g.dst_a, (const uint32_t*) g.dst_b, tot, 3LL * nn + 1, c, f);
+    vcmp_words((const uint32_t*) g.tok_a, (const uint32_t*) g.tok_b, tot, 3LL * nn + 1 + tot, c, f);
+    vcmp_block(s, c, f, [nn, no](long long) { return VRec{0, (unsigned) nn, (unsigned) no}; });
+}
+
 struct Engine {
     const Model* m = nullptr;
     cudaStream_t st = nullptr;
@@ -1998,22 +2077,80 @@ struct Engine {
     bool verify_k = std::getenv("STRATA_Q36_VERIFY") != nullptr;
     // the verify scratch (vbuf), in floats: the start refuses a model whose matrices would not fit it
     static constexpr size_t kVerifyFloats = (size_t) 8 * 16384;
+    static constexpr int kVerifySlots = 512;   // check sites of VERIFY: the start refuses a model that would need more
     float* vbuf = nullptr;                       // verify scratch
     long long v_calls = 0, v_bad = 0;
     std::map<std::string, long long> v_by;   // mismatches per check
+    // The counters are on the device, so a check runs inside a captured graph: a check site (what, tag, n) binds a slot when
+    // the host code runs (at capture time for a graph), and every launch of its kernel counts, a graph replay too. The host
+    // reads the slots back outside any capture (verify_flush), which keeps v_calls, v_bad and v_by as they were.
+    VSlot* vslots = nullptr;                 // device: kVerifySlots slots
+    std::vector<VSite> v_sites;              // host: the check sites, in slot order
+    std::map<std::string, int> v_slot_of;    // "what tag n" -> slot
+    std::map<std::string, int> v_lines;      // mismatch lines printed, per check name (3 at most)
+    int v_group_lines = 0;                   // group mismatch lines printed (kVerifyGroupLines at most)
+    VSlot* verify_slot(const char* what, const std::string& tag, long long n, bool group) {
+        const std::string key = std::string(what) + " " + tag + " " + std::to_string(n);
+        auto it = v_slot_of.find(key);
+        if (it == v_slot_of.end()) {
+            if ((int) v_sites.size() == kVerifySlots) {
+                std::fprintf(stderr, "strata-q36: STRATA_Q36_VERIFY has more than %d check sites (%s%s): the slot table is full\n",
+                             kVerifySlots, what, tag.c_str());
+                // the bound slots' lines go out first: a capture being recorded ends (its graph is dropped), since the slots
+                // cannot be read while it runs
+                cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+                CK(cudaStreamIsCapturing(st, &cs));
+                if (cs != cudaStreamCaptureStatusNone) {
+                    cudaGraph_t dropped;
+                    CK(cudaStreamEndCapture(st, &dropped));
+                    CK(cudaGraphDestroy(dropped));
+                }
+                verify_flush();
+                std::exit(2);
+            }
+            it = v_slot_of.emplace(key, (int) v_sites.size()).first;
+            v_sites.push_back(VSite{what, tag, n, group, 0});
+        }
+        return vslots + it->second;
+    }
+    /// VERIFY: the bit patterns of a and b compared on the device, the call counted in its check site's slot.
     void verify_cmp(const char* what, const float* a, const float* b, size_t n, const std::string& tag = "") {
+        k_vcmp<<<1, kVerifyBlock, 0, st>>>((const uint32_t*) a, (const uint32_t*) b, (long long) n,
+                                           verify_slot(what, tag, (long long) n, false));
+    }
+    /// VERIFY: the slots read back, outside any capture (the engine's own syncs come first). v_calls, v_bad and v_by take the
+    /// slots' totals; each check's mismatch lines print from the records not yet shown (3 per check, group lines 20 in all).
+    void verify_flush() {
+        if (!verify_k || v_sites.empty()) return;
         CK(cudaStreamSynchronize(st));
-        std::vector<float> ha(n), hb(n);
-        CK(cudaMemcpy(ha.data(), a, n * 4, cudaMemcpyDeviceToHost));
-        CK(cudaMemcpy(hb.data(), b, n * 4, cudaMemcpyDeviceToHost));
-        ++v_calls;
-        if (std::memcmp(ha.data(), hb.data(), n * 4) != 0) {
-            ++v_bad;
-            size_t i = 0;
-            while (i < n && std::memcmp(&ha[i], &hb[i], 4) == 0) ++i;
-            if (++v_by[what] <= 3)
-                std::fprintf(stderr, "strata-q36 VERIFY MISMATCH %s%s: first at %zu of %zu: new %g old %g (bits %08x %08x)\n", what,
-                             tag.c_str(), i, n, (double) ha[i], (double) hb[i], *(unsigned*) &ha[i], *(unsigned*) &hb[i]);
+        std::vector<VSlot> h(v_sites.size());
+        CK(cudaMemcpy(h.data(), vslots, h.size() * sizeof(VSlot), cudaMemcpyDeviceToHost));
+        v_calls = 0;
+        v_bad = 0;
+        v_by.clear();
+        for (size_t i = 0; i < v_sites.size(); ++i) {
+            VSite& s = v_sites[i];
+            v_calls += (long long) h[i].calls;
+            v_bad += (long long) h[i].bad;
+            if (!s.group && h[i].bad) v_by[s.what] += (long long) h[i].bad;
+            const int seen = (int) std::min<unsigned long long>(h[i].bad, kVerifyRecs);
+            for (; s.shown < seen; ++s.shown) {
+                const VRec& r = h[i].rec[s.shown];
+                if (s.group) {
+                    if (v_group_lines < kVerifyGroupLines) {
+                        ++v_group_lines;
+                        std::fprintf(stderr, "strata-q36 VERIFY MISMATCH group (%s, groups %u vs %u)\n", s.tag.c_str(), r.a, r.b);
+                    }
+                    continue;
+                }
+                if (v_lines[s.what] >= 3) continue;
+                ++v_lines[s.what];
+                float fa, fb;
+                std::memcpy(&fa, &r.a, 4);
+                std::memcpy(&fb, &r.b, 4);
+                std::fprintf(stderr, "strata-q36 VERIFY MISMATCH %s%s: first at %lld of %lld: new %g old %g (bits %08x %08x)\n",
+                             s.what.c_str(), s.tag.c_str(), r.idx, s.n, (double) fa, (double) fb, r.a, r.b);
+            }
         }
     }
     /// The Q8_0 matrices q8_small takes, whatever T: fast_k, a shape the kernel reads, not on the packed decode kernel. Only
@@ -2057,33 +2194,7 @@ struct Engine {
         const int N = (int) m->g.n_embd;
         const size_t qb = K::native_q8_1_bytes(N, 1);
         K::native_quantize_q8_1(hsrc, vq, N * T, 1, st);
-        const long long before = v_bad;
         verify_cmp(what, (const float*) xq, (const float*) vq, qb * (size_t) T / 4, tag);
-        if (v_bad != before && std::getenv("STRATA_Q36_VDEBUG") && v_by[what] <= 2) {   // a mismatching block, on the host
-            std::vector<uint8_t> a(qb * (size_t) T), b(qb * (size_t) T);
-            std::vector<float> hv((size_t) N * T);
-            CK(cudaMemcpy(a.data(), xq, a.size(), cudaMemcpyDeviceToHost));
-            CK(cudaMemcpy(b.data(), vq, b.size(), cudaMemcpyDeviceToHost));
-            CK(cudaMemcpy(hv.data(), hsrc, hv.size() * 4, cudaMemcpyDeviceToHost));
-            for (size_t o = 0; o < a.size(); o += 36)
-                if (std::memcmp(&a[o], &b[o], 36) != 0) {
-                    const size_t blk = o / 36;
-                    float v[32], t[32];
-                    for (int l = 0; l < 32; ++l) v[l] = t[l] = hv[blk * 32 + (size_t) l];
-                    for (int off = 16; off > 0; off >>= 1) {   // the xor butterfly, lane by lane
-                        float u[32];
-                        for (int l = 0; l < 32; ++l) u[l] = t[l] + t[l ^ off];
-                        std::memcpy(t, u, sizeof(u));
-                    }
-                    unsigned ds_a, ds_b;
-                    std::memcpy(&ds_a, &a[o], 4);
-                    std::memcpy(&ds_b, &b[o], 4);
-                    std::fprintf(stderr, "VDEBUG block %zu: ds new %08x old %08x, qs bytes %s, cpu butterfly sum %.9g (half %04x)\n",
-                                 blk, ds_a, ds_b, std::memcmp(&a[o + 4], &b[o + 4], 32) == 0 ? "equal" : "DIFFER", (double) t[0],
-                                 (unsigned) __half_as_ushort(__float2half(t[0])));
-                    break;
-                }
-        }
     }
     void prep_in(int T) {
         if (xq_ready && T <= kGemmT) {
@@ -2184,33 +2295,8 @@ struct Engine {
         int32_t* o_dst = o_ng + 2;
         int32_t* o_tok = o_dst + 64;
         group_old(L, slot_of, T, o_ptr, o_start, o_ng, o_dst, o_tok);
-        CK(cudaStreamSynchronize(st));
-        int nn = 0, no = 0;
-        CK(cudaMemcpy(&nn, n_groups, 4, cudaMemcpyDeviceToHost));
-        CK(cudaMemcpy(&no, o_ng, 4, cudaMemcpyDeviceToHost));
-        ++v_calls;
-        bool bad = nn != no;
-        if (!bad) {
-            std::vector<unsigned long long> a((size_t) nn + 1), b((size_t) nn + 1);
-            std::vector<int32_t> sa((size_t) nn + 1), sb((size_t) nn + 1), da(64), dbv(64), ta(64), tb(64);
-            CK(cudaMemcpy(a.data(), grp_ptr, (size_t) nn * 8, cudaMemcpyDeviceToHost));
-            CK(cudaMemcpy(b.data(), o_ptr, (size_t) nn * 8, cudaMemcpyDeviceToHost));
-            CK(cudaMemcpy(sa.data(), grp_start, ((size_t) nn + 1) * 4, cudaMemcpyDeviceToHost));
-            CK(cudaMemcpy(sb.data(), o_start, ((size_t) nn + 1) * 4, cudaMemcpyDeviceToHost));
-            const int tot = sa[(size_t) nn];
-            CK(cudaMemcpy(da.data(), ent_dst, (size_t) tot * 4, cudaMemcpyDeviceToHost));
-            CK(cudaMemcpy(dbv.data(), o_dst, (size_t) tot * 4, cudaMemcpyDeviceToHost));
-            CK(cudaMemcpy(ta.data(), ent_tok, (size_t) tot * 4, cudaMemcpyDeviceToHost));
-            CK(cudaMemcpy(tb.data(), o_tok, (size_t) tot * 4, cudaMemcpyDeviceToHost));
-            bad = std::memcmp(a.data(), b.data(), (size_t) nn * 8) != 0 ||
-                  std::memcmp(sa.data(), sb.data(), ((size_t) nn + 1) * 4) != 0 ||
-                  std::memcmp(da.data(), dbv.data(), (size_t) tot * 4) != 0 ||
-                  std::memcmp(ta.data(), tb.data(), (size_t) tot * 4) != 0;
-        }
-        if (bad) {
-            ++v_bad;
-            if (v_bad <= 20) std::fprintf(stderr, "strata-q36 VERIFY MISMATCH group (T %d, groups %d vs %d)\n", T, nn, no);
-        }
+        const VGroup g{n_groups, o_ng, grp_ptr, o_ptr, grp_start, o_start, ent_dst, o_dst, ent_tok, o_tok};
+        k_vcmp_group<<<1, kVerifyBlock, 0, st>>>(g, verify_slot("group", "T " + std::to_string(T), 0, true));
     }
     /// A prompt chunk route_group does not serve (T > 8) still feeds the hybrid layer's Delta_avg (--cache-prior only).
     void delta_rows(size_t li, int T, int ld) {
@@ -2278,6 +2364,8 @@ struct Engine {
         CK(cudaMalloc((void**) &vgrp, 2048));
         CK(cudaMalloc((void**) &vx_, (size_t) 8 * N * 4));
         CK(cudaMalloc((void**) &vh_, (size_t) 8 * N * 4));
+        CK(cudaMalloc((void**) &vslots, kVerifySlots * sizeof(VSlot)));
+        CK(cudaMemsetAsync(vslots, 0, kVerifySlots * sizeof(VSlot), st));
     }
     /// The MoE block's end (k_moe_out) for T rows.
     void moe_end(int T, const int32_t* prow, const float* shared, const float* sgate, const float* wn, float* hout, int sgs = 1) {
@@ -3175,6 +3263,7 @@ struct Engine {
             CK(cudaMemcpyAsync(hlast, hmain + (size_t) (T - 1) * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
             pos += T;
             CK(cudaStreamSynchronize(st));
+            verify_flush();
             mtab_now = nullptr;
             map_on = false;
             if (!on_chunk(i + T)) {
@@ -3242,6 +3331,7 @@ struct Engine {
         CK(cudaMemcpyAsync(hrow + 32, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
         for (int r = 0; r < T; ++r) rows_pick[r] = hrow[32 + r];
+        verify_flush();   // (the window's graph is out of its capture: the host may read the VERIFY slots)
         if (!verify)
             for (int g = 0; g < G; ++g) sess[(size_t) gr[g].slot].pos += gr[g].n;
         pos = sess[(size_t) cur].pos;
@@ -3447,6 +3537,7 @@ struct Engine {
         rows_deferred = false;
         CK(cudaMemcpyAsync(hpin + 2, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
+        verify_flush();
         int a;
         if (sample_row) {   // sampled: row t's pick is the draw of its position over its own history (q36_sampling.hpp)
             a = strata::q36::spec_accept(drafts.data(), D, picks, [&](int t) { return sample_row(t, drafts.data()); });
@@ -4870,7 +4961,12 @@ int strata::qwen35::run(int argc, char** argv) {
     if (E.verify_k) {   // VERIFY's scratch (vbuf) must hold what the small Q8_0 path and the shared expert's gate and up write
         // the kernels' own predicates decide which matrices write vbuf: the others are not tested
         bool fits = true;
-        const auto q8_fits = [&E](const Mat& w) { return !E.q8_small_shape(w) || 8 * (size_t) w.n_out <= Engine::kVerifyFloats; };
+        std::set<std::pair<int, int>> shapes;   // the small path's Q8_0 shapes: one check site per shape and T
+        const auto q8_fits = [&E, &shapes](const Mat& w) {
+            if (!E.q8_small_shape(w)) return true;
+            shapes.insert({(int) w.n_in, (int) w.n_out});
+            return 8 * (size_t) w.n_out <= Engine::kVerifyFloats;
+        };
         std::vector<const Layer*> layers;   // the MTP block's Mats are empty (type -1) unless it is loaded
         for (const Layer& L : E.m->layers) layers.push_back(&L);
         layers.push_back(&E.m->mtp);
@@ -4885,6 +4981,13 @@ int strata::qwen35::run(int argc, char** argv) {
             std::fprintf(stderr, "strata-q36: STRATA_Q36_VERIFY needs every Q8_0 matrix on the small path to have at most %zu "
                          "outputs and the shared expert at most %zu; this model has more: unset STRATA_Q36_VERIFY to run it\n",
                          Engine::kVerifyFloats / 8, Engine::kVerifyFloats / 12);
+            return 2;
+        }
+        // the check sites: one per shape and T for the small Q8_0 path, and ten fixed checks per T, with T <= kGemmT rows
+        const size_t sites = (shapes.size() + 10) * Engine::kGemmT;
+        if (sites > (size_t) Engine::kVerifySlots) {
+            std::fprintf(stderr, "strata-q36: STRATA_Q36_VERIFY needs %zu check sites (%zu Q8_0 shapes on the small path), the "
+                         "table holds %d: unset STRATA_Q36_VERIFY to run it\n", sites, shapes.size(), Engine::kVerifySlots);
             return 2;
         }
         E.verify_alloc();
@@ -4915,6 +5018,7 @@ int strata::qwen35::run(int argc, char** argv) {
         const std::string& profile_save;
         ~Report() {
             if (!profile_save.empty()) E.save_profile(profile_save);
+            E.verify_flush();
             if (E.verify_k) std::fprintf(stderr, "strata-q36 VERIFY: %lld comparisons, %lld mismatches\n", E.v_calls, E.v_bad);
             if (E.verify_k)
                 for (const auto& kv : E.v_by)

@@ -1,7 +1,7 @@
 // q36_kernels.cuh - decode kernels of the Qwen3.6 engine (q36_engine.cu), written to give the SAME BITS as the shared
 // kernels they replace (native_small_mmvq_kernel, k_moe_out, k_add_rms, k_group, native_quantize_q8_1) with a layout that
 // keeps more bytes in flight and fewer launches.  Every kernel here is checked bit for bit against the old one on the
-// real activations (STRATA_Q36_VERIFY=1, --no-graph).
+// real activations (STRATA_Q36_VERIFY=1).
 #pragma once
 
 #include "q36_delta.hpp"

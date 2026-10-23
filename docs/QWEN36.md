@@ -128,9 +128,11 @@ solo run there too, with and without `--batch-mtp`.
 ## Speed (0.1.45)
 
 Decode and prompt kernels of this engine path were rewritten for speed; **every change on the decode path gives the old kernels' bits**
-(`STRATA_Q36_VERIFY=1 strata ... --no-graph` runs the old kernel beside each new one on the real activations and compares them bit for bit:
-0 mismatches in 18,360 / 8,187 / 6,399 comparisons on the R9700 and the RTX 3060; `STRATA_Q36_OLD_KERNELS=1` switches them all off). With CUDA graphs on, VERIFY stops at load (a buffer allocated during graph capture, issue #92). The
-10 parity prompts (greedy 128) give the base engine's tokens, plain and with `--mtp 2`. Where the prompt's chunk size changes, the numbers
+(`STRATA_Q36_VERIFY=1 strata ...` runs the old kernel beside each new one on the real activations and compares them bit for bit,
+with or without CUDA graphs: the comparisons are counted on the device, so every graph replay counts (issue #92).
+On an RTX 5090, p00 and p05 give 16,599 comparisons and 0 mismatches each, with and without CUDA graphs (this change). The older
+18,360 / 8,187 / 6,399 comparisons, 0 mismatches each, were measured with `--no-graph` before this change, on the R9700 and the RTX 3060;
+`STRATA_Q36_OLD_KERNELS=1` switches them all off). The 10 parity prompts (greedy 128) give the base engine's tokens, plain and with `--mtp 2`. Where the prompt's chunk size changes, the numbers
 change a little: see "Prompt chunk".
 
 **What was slow** (rocprofv3, R9700, UD-Q4_K_XL, plain decode, 11.25 ms of kernel time per token): the big Q8_0 products (attention, GDN
@@ -224,8 +226,7 @@ Environment variables. The q36 engine reads 18 of them: 17 `STRATA_Q36_*` and `S
 - `STRATA_Q36_READ_WINDOWS=N`: default 1, from 0 to 64 (`:3967`). The decode windows run between two chunks of a prompt read.
 - `STRATA_Q36_STATS=1`: off. Prints one line per window, 48 steps then 96: the bytes each path reads and the host's wait on the doorbell (`src/qwen35/q36_stats.hpp:24`, `:1530`).
 - `STRATA_Q36_STREAM_ALL`: off. Set, the whole layer streams from host memory, the first version, PCIe-bound (`:2619`).
-- `STRATA_Q36_VDEBUG`: off. Set with `STRATA_Q36_VERIFY`, prints a mismatching block on the host (`:2043`).
-- `STRATA_Q36_VERIFY`: off. Set, the decode kernels are compared with the old kernel's bits (`:1984`). This also disables the fused router path (`:2441`).
+- `STRATA_Q36_VERIFY`: off. Set, the decode kernels are compared with the old kernel's bits (`:2077`), on the device and with CUDA graphs on; its mismatch lines print at the end of each window (decode window, MTP step or prompt chunk), not at the comparison, so a fatal CUDA error inside a window loses them. This also disables the fused router path (`:2553`).
 - `STRATA_DMA_BATCH=N`: the grouping of PCIe copies, modes 0, 1 and 2 (`include/strata/core/dma_batch.hpp:32`). The q36 default is 1, one `cudaMemcpyBatchAsync` per group (`q36_engine.cu:2697`). 0 gives one copy each.
 
 `STRATA_Q36_CPU_POOL` is a compile-time macro (`q36_engine.cu:46`), not an environment variable.
