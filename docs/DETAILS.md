@@ -673,7 +673,7 @@ cache from the shipped profile, and the adaptive tier (`--adapt-every`) then mov
 With `"expert_profile_save": "expert-profile-learned.bin"` in `strata-<model>.json` the engine saves that as a
 profile - the experts in VRAM first, then the routing it counted since the start, then the shipped order - on a
 clean exit and every 10 minutes between requests (`"expert_profile_save_every": 5` for another interval, `0` for
-exit only), written to a temporary file and renamed, so a crash never leaves half a file. The next start begins from
+exit only), written to a temporary file and renamed, so a crash never leaves half a file (the q36 engine, Qwen3.6 and Ornith, saves at exit only). The next start begins from
 it instead of the config's `--expert-profile` when it is a profile of the same model (else from the config's, as
 before). A relative path is in the Strata folder; one file per model, and a profile per project works the same way
 (point the key at another file). The file is a fingerprint of what you used the model for: it stays on your PC.

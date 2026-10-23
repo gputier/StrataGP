@@ -129,7 +129,7 @@ solo run there too, with and without `--batch-mtp`.
 
 Decode and prompt kernels of this engine path were rewritten for speed; **every change on the decode path gives the old kernels' bits**
 (`STRATA_Q36_VERIFY=1 strata ... --no-graph` runs the old kernel beside each new one on the real activations and compares them bit for bit:
-0 mismatches in 18,360 / 8,187 / 6,399 comparisons on the R9700 and the RTX 3060; `STRATA_Q36_OLD_KERNELS=1` switches them all off). The
+0 mismatches in 18,360 / 8,187 / 6,399 comparisons on the R9700 and the RTX 3060; `STRATA_Q36_OLD_KERNELS=1` switches them all off). With CUDA graphs on, VERIFY stops at load (a buffer allocated during graph capture, issue #92). The
 10 parity prompts (greedy 128) give the base engine's tokens, plain and with `--mtp 2`. Where the prompt's chunk size changes, the numbers
 change a little: see "Prompt chunk".
 
@@ -189,7 +189,7 @@ The server listens on port 8090. The Windows launcher (`start-ornith.ps1`, `stop
 
 Options added by the branch:
 
-- `--expert-profile <file>` starts the expert slots from a learned profile (STRP format, version 1). `--expert-profile-save <file>` writes it at QUIT. The server passes the saved file back as `--expert-profile` at the next start, once it holds a whole header (`serve/test_q36_config.py`). The server also saves every 10 minutes by default (`expert_profile_save_every`, 0 means at QUIT only).
+- `--expert-profile <file>` starts the expert slots from a learned profile (STRP format, version 1). `--expert-profile-save <file>` writes it at QUIT. The server passes the saved file back as `--expert-profile` at the next start, once it holds a whole header (`serve/test_q36_config.py`). On the q36 engine (Qwen3.6, Ornith) the profile is written at QUIT only: the server does not pass `--expert-profile-save-every` there, so a crash loses what was learned since the start.
 - `--pcie-frac F`: the share of the missed experts that are copied over PCIe and computed on the GPU. `0` turns it off. Without the option, the share starts from the probed PCIe bandwidth and is then refined from the CPU pool's speed, between 0 and a cap of 0.95. A fixed value is taken as given, up to 1.
 - `--mtp N`: number of MTP drafts. The start refuses N above 7 with `strata-q36: --mtp takes 0 .. 7 drafts` and exit code 2.
 

@@ -36,6 +36,8 @@ The comparison uses ten prompts of 32 steps and reports the mean KL divergence a
 token agrees. The proposed bar, still to be validated, is a mean KL of 0.061, about 1.5 times the 0.041 of the T7 gate. Two passes on the same
 build are identical to the byte. Between builds the mean KL moved by 0.0032.
 
+Provenance of the KL (0.0423) and top-1 (299 of 320) figures. The reference is `q36_llama_dump` of llama.cpp b11756, on the CPU backend with 16 threads (`STRATA_DUMP_THREADS=16`) and without YaRN, on the same GGUF file. Ten prompts are tokenized with `llama-tokenize --no-bos`, and the reference decodes each one greedily and freely for 32 steps, keeping the full logits. The engine then receives the reference's 32-token greedy continuation through `--force`, so both sides read the same token at every step (teacher forcing on the reference's continuation). The engine runs with its default options and writes a full logit dump. `tools/qwen35/logit_cmp --ref <reference dump> --test <engine dump> --vocab 248320 --steps 32` compares them in default mode, without `--stop-at-divergence`. The KL is the mean over the ten prompts of each prompt's mean KL (0.042317), and the top-1 is counted over the 320 steps. The figures were first measured on 22 October 2026 at commit `93111239` plus the A2 changes. On 23 October the engine at `ec3d4b63`, then at `56f9fafc` (after the final review fixes), gave engine dumps byte-identical to each other on the ten prompts, so the figures hold at `56f9fafc`.
+
 Throughput. Each measurement is several cold launches, alternated between builds, with four requests of 1,024 tokens per
 launch. The reported figure is the median, with the range in brackets. The 128K figure is one launch per build with a
 127,685-token prompt and 128 decoded tokens.
@@ -257,5 +259,7 @@ Estimated gains come from calculations in the sources, not from measurements on 
 
 - Branch `feat/ornith-122b` of this repository. Final measurement commit `ec3d4b63`, starting point `7bf040a5`, installed source `d9d6f634`. Pull request #83.
 - Parity tools are under `tools/qwen35/`: `parity.py`, `logit_cmp.cpp`, `q36_tokfile.cpp`, `q36_llama_dump.cpp`.
+- `STRATA_DUMP_THREADS` sets the CPU threads of the llama.cpp reference dump (`q36_llama_dump`). llama.cpp's default is 4; the reference dumps used 16.
+- `STRATA_DUMP_YARN=FACTOR,ORIG_CTX` sets YaRN in that dump, the reference for `--rope-scaling yarn --rope-scale FACTOR --rope-orig-ctx ORIG_CTX`. Its other YaRN parameters stay at the model's and the library's defaults.
 - The option list, the environment variables and the server settings are in the Ornith section of [QWEN36.md](QWEN36.md).
 - The raw reports and logs of the measurements are kept in the reports folder of the test box, outside this repository: 2,910 files, copied and checked byte for byte.
