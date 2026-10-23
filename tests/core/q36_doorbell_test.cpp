@@ -22,6 +22,8 @@ using strata::q36::HyDoorbell;
 using strata::q36::RingWait;
 using namespace std::chrono_literals;
 
+// one buffer for both views: the replay threads share it, which a CPU address space allows.  The engine's two views of
+// the mapped pinned memory are two addresses; main() checks that bind() wires them apart (split_views).
 struct Words {
     alignas(64) uint32_t w[HyDoorbell::kWords] = {};
     HyDoorbell db;
@@ -53,6 +55,13 @@ void serve(HyDoorbell& db, std::vector<uint32_t>& payload, std::vector<uint32_t>
         rows[(size_t) k] = payload[(size_t) k] + 7;
         db.answer((uint32_t) k + 1);
     }
+}
+
+// the graph's wait for flag k, read through the device view and bounded: true once the flag reaches k
+bool graph_wait_passes(const HyDoorbell& db, uint32_t k) {
+    for (long spin = 0; spin < 10000000; ++spin)
+        if (rd(db.d_flag) >= k) return true;
+    return false;
 }
 }  // namespace
 
@@ -91,8 +100,16 @@ int main() {
     ws.db.arm();
     ws.db.release();
     bool passed = true;
-    for (uint32_t k = 1; k <= 48; ++k) passed = passed && rd(ws.w + 16) >= k;
+    for (uint32_t k = 1; k <= 48; ++k) passed = passed && graph_wait_passes(ws.db, k);
     check(passed, "release() passes the waits of all layers");
+
+    // the engine's views are two buffers: each word is bound to its own side, the flag a cache line after seq on both
+    alignas(64) uint32_t host_words[HyDoorbell::kWords] = {}, dev_words[HyDoorbell::kWords] = {};
+    HyDoorbell split;
+    split.bind(host_words, dev_words);
+    check(split.h_seq == host_words && split.h_flag == host_words + HyDoorbell::kFlagWord && split.d_seq == dev_words &&
+              split.d_flag == dev_words + HyDoorbell::kFlagWord,
+          "bind() takes the host and the device view of each word from their own buffer");
 
     std::printf("%s\n", g_fail == 0 ? "q36 doorbell: all checks passed" : "q36 doorbell: FAILED");
     return g_fail == 0 ? 0 : 1;

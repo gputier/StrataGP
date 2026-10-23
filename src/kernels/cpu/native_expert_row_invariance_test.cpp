@@ -102,6 +102,10 @@ int check_pair(int gu_type, int d_type) {
 int main() {
     ggml_cpu_init();
     std::printf("native_expert_row_invariance_test: ggml-cpu avx512 %d, avx2 %d\n", ggml_cpu_has_avx512(), ggml_cpu_has_avx2());
+    if (!ggml_cpu_has_avx512()) {   // the one-token kernels are AVX-512: without them the test fails by design (see above)
+        std::printf("native_expert_row_invariance_test: no AVX-512: SKIPPED\n");
+        return 77;
+    }
     int failures = 0;
     // the pairs Ornith's quantization uses: IQ3_XXS gate/up with IQ4_XS down, and with IQ4_NL down
     failures += check_pair(18, 23);

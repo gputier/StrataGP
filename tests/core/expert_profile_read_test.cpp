@@ -1,6 +1,8 @@
 // read_expert_profile on damaged files: a truncated header or pair list, a pair out of range, a version 2 file, more
 // ranked pairs than slots, and a hostile header whose counts would size a huge allocation.  Each is refused with a
-// message naming the cause.  CPU only: no device is touched.
+// message naming the cause, and so are a directory given as the profile, a long path, and a write whose rename fails.
+// CPU only: no device is touched.
+#include "check.hpp"
 #include "strata/core/expert_cache.hpp"
 
 #include <cstdint>
@@ -11,13 +13,6 @@
 #include <vector>
 
 namespace {
-int fails = 0;
-void check(bool ok, const char* what) {
-    if (!ok) {
-        std::fprintf(stderr, "FAIL: %s\n", what);
-        ++fails;
-    }
-}
 bool has(const std::string& s, const std::string& what) { return s.find(what) != std::string::npos; }
 
 // STRP, the five header words, then the given (layer, expert) pairs as uint16
@@ -90,7 +85,24 @@ int main() {
               "a profile ranking every pair of the model loads");
     }
 
+    // a directory given as the profile opens and reads nothing: refused with the read's error, not as a short file
+    std::filesystem::create_directories(dir / "a_dir");
+    refused((dir / "a_dir").string(), "cannot read", "a directory given as the profile is refused with its read error");
+
+    // a long path: the version message keeps its tail
+    const std::string long_name(160, 'x');
+    refused(write_file(dir, (long_name + ".bin").c_str(), 2, L, E, 3, 3, {1, 2, 0, 0, 3, 7}), "--expert-profile-save",
+            "the version message is whole for a long path");
+
+    // a write whose rename fails (a directory holds the target name): the message says why
+    const std::string target = (dir / "taken").string();
+    std::filesystem::create_directories(target);
+    std::string werr;
+    const bool wrote = strata::core::write_expert_profile(target, L, E, {{1, 2}}, werr);
+    check(!wrote && has(werr, "write_expert_profile: cannot write " + target + ": "),
+          "a write whose rename fails names its cause");
+
     std::filesystem::remove_all(dir);
-    if (fails == 0) std::puts("expert_profile_read_test: OK");
-    return fails == 0 ? 0 : 1;
+    if (g_fail == 0) std::puts("expert_profile_read_test: OK");
+    return g_fail == 0 ? 0 : 1;
 }

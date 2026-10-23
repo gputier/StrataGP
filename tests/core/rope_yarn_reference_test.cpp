@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -47,6 +48,22 @@ int main() {
     std::printf("  reference correction range [%g, %g], attention factor %.9f\n", low, high, attention_factor);
 
     check(rope_scaling_invalid(cfg) == nullptr, "the resolved configuration is valid");
+    // a NaN passes every range test, so each knob is also tried as NaN and as +inf: the guards must refuse both
+    const double nan = std::nan(""), inf = std::numeric_limits<double>::infinity();
+    double RopeScaling::*knobs[] = {&RopeScaling::freq_base, &RopeScaling::factor,    &RopeScaling::freq_scale_in,
+                                    &RopeScaling::orig_ctx,  &RopeScaling::ext_factor, &RopeScaling::attn_factor,
+                                    &RopeScaling::beta_fast, &RopeScaling::beta_slow};
+    bool all_refused = true;
+    for (double RopeScaling::*knob : knobs)
+        for (const double bad : {nan, inf}) {
+            RopeScaling b = cfg;
+            b.*knob = bad;
+            all_refused = all_refused && rope_scaling_invalid(b) != nullptr;
+        }
+    check(all_refused, "NaN and +inf in any knob of a YaRN configuration are refused");
+    RopeScaling bad_base;   // type none passes with any knob, but the frequency base is checked first
+    bad_base.freq_base = nan;
+    check(rope_scaling_invalid(bad_base) != nullptr, "a NaN frequency base is refused even without scaling");
     double cd[2];
     cfg.corr_dims(dim, cd);
     check(cd[0] == low && cd[1] == high, "corr_dims equal transformers' find_correction_range");

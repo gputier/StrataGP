@@ -3,6 +3,7 @@
 #include "strata/core/expert_cache.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -20,8 +21,12 @@ bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_ex
     char magic[4] = {0, 0, 0, 0};
     uint32_t hdr[5] = {0, 0, 0, 0, 0};
     if (std::fread(magic, 1, 4, f) != 4 || std::fread(hdr, 4, 5, f) != 5) {
+        // a read that fails (a directory, say) is not a short file: its cause is the error the read left
+        const bool read_failed = std::ferror(f) != 0;
+        const int read_errno = errno;
         std::fclose(f);
-        err = "read_expert_profile: " + path + " is too short to hold a header";
+        err = read_failed ? "read_expert_profile: cannot read " + path + ": " + std::strerror(read_errno)
+                          : "read_expert_profile: " + path + " is too short to hold a header";
         return false;
     }
     if (std::memcmp(magic, "STRP", 4) != 0) {
@@ -34,21 +39,16 @@ bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_ex
     // format is refused by its number rather than read as if it were this one
     if (version != 1) {
         std::fclose(f);
-        char buf[256];
-        std::snprintf(buf, sizeof buf,
-                      "read_expert_profile: %s is a version %u profile but this engine reads version 1 - it was "
-                      "written by a different release's tools/make_profile.py or --expert-profile-save",
-                      path.c_str(), version);
-        err = buf;
+        err = "read_expert_profile: " + path + " is a version " + std::to_string(version) +
+              " profile but this engine reads version 1 - it was written by a different release's tools/make_profile.py "
+              "or --expert-profile-save";
         return false;
     }
     if ((int64_t) nl != n_layers || (int64_t) ne != n_expert) {
         std::fclose(f);
-        char buf[256];
-        std::snprintf(buf, sizeof buf,
-                      "read_expert_profile: %s is %ux%u but this model is %lldx%lld - it is a profile for a "
-                      "different artifact", path.c_str(), nl, ne, (long long) n_layers, (long long) n_expert);
-        err = buf;
+        err = "read_expert_profile: " + path + " is " + std::to_string(nl) + "x" + std::to_string(ne) +
+              " but this model is " + std::to_string(n_layers) + "x" + std::to_string(n_expert) +
+              " - it is a profile for a different artifact";
         return false;
     }
     if (n_ranked > want) {
@@ -133,6 +133,7 @@ bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_e
         pairs.push_back((uint16_t) l);
         pairs.push_back((uint16_t) e);
     }
+    // the slot count is the ranking's length: the producer ranks every pair once, so the two agree
     const uint32_t hdr[5] = {1u, (uint32_t) n_layers, (uint32_t) n_expert, (uint32_t) ranked.size(),
                              (uint32_t) ranked.size()};
     const std::string tmp = path + ".tmp";
@@ -142,15 +143,18 @@ bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_e
         return false;
     }
     // the format is little-endian (make_profile.py's "<"): so is every machine this engine runs on
+    errno = 0;
     bool ok = std::fwrite("STRP", 1, 4, f) == 4 && std::fwrite(hdr, 4, 5, f) == 5 &&
               (pairs.empty() || std::fwrite(pairs.data(), 2, pairs.size(), f) == pairs.size()) &&
               std::fwrite(table.data(), 4, table.size(), f) == table.size();
     ok = (std::fclose(f) == 0) && ok;
+    const int io_errno = errno;   // the failing write or close, when there is one
     std::error_code ec;
     if (ok) std::filesystem::rename(tmp, path, ec);   // replaces an existing file (MoveFileEx / rename(2))
     if (!ok || ec) {
+        const std::string why = ok ? ec.message() : std::strerror(io_errno);
         std::filesystem::remove(tmp, ec);
-        err = "write_expert_profile: cannot write " + path;
+        err = "write_expert_profile: cannot write " + path + ": " + why;
         return false;
     }
     return true;

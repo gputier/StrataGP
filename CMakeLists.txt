@@ -1612,6 +1612,7 @@ if(STRATA_NATIVE_EXPERTS)
   target_link_libraries(native_expert_row_invariance_test PRIVATE strata_kernels_cpu)
   if(STRATA_BUILD_TESTS)
     add_test(NAME native_expert_row_invariance_test COMMAND native_expert_row_invariance_test)
+    set_tests_properties(native_expert_row_invariance_test PROPERTIES SKIP_RETURN_CODE 77)   # no AVX-512 CPU: skipped
   endif()
   set(_strata_mmq_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0)
   # #296: OrcaRouter Q4_K_S's Q5_0 experts (Q4_K and Q5_1 come with STRATA_MMQ_KQUANTS on CUDA, S5's branch)

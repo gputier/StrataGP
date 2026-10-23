@@ -372,6 +372,9 @@ UNSLOTH_BIG_SHARDS = {
 UNSLOTH_ENGINE = (0, 1, 32)     # the first engine setup configures for UD-Q4_K_XL (0.1.31 ran it by hand)
 UNSLOTH_RAM_LEFT_GB = 24        # RAM beside the budget: the OS, the engine, and the file cache the rest is read through
 UNSLOTH_MIN_RAM_GB = 48         # the RAM-budget mode below which setup says an Unsloth file does not fit (UD-Q4_K_XL's floor)
+# The trained context of the families the setup installs (the YaRN reference, and the default cap of a family without
+# max_context): one value for every site that reads it.
+TRAINED_CONTEXT = 262144
 # Contexts past 262144 (the model's trained length) extend it by rope scaling: for the context it will
 # serve the setup resolves the method (yarn, or one question when interactive) and derives the factor
 # from the final context (final / 262144, at least 1) itself (below), keeps an explicit
@@ -5542,7 +5545,7 @@ def write_run_script(model, cfg_path, port, open_browser=True):
 
 
 # ------------------------------------------------------------------------------------------------ the rope config
-def derived_factor(ctx: int, trained: int = 262144) -> float:
+def derived_factor(ctx: int, trained: int = TRAINED_CONTEXT) -> float:
     """The automatic extension factor: the FINAL context over the trained one, at least 1.
 
     Factor 1 removes the automatic expansion - the trained angles stand as they are - but it is not a
@@ -5551,7 +5554,7 @@ def derived_factor(ctx: int, trained: int = 262144) -> float:
     return max(1.0, float(ctx) / float(trained))
 
 
-def resolve_rope(ctx: int, scaling, scale, trained: int = 262144):
+def resolve_rope(ctx: int, scaling, scale, trained: int = TRAINED_CONTEXT):
     """The rope config for the context ACTUALLY SERVED: (scaling, scale); scaling None = no scaling flags.
 
     An explicit --rope-scaling/--rope-scale always wins - a user-supplied factor is kept verbatim even
@@ -5569,15 +5572,15 @@ def resolve_rope(ctx: int, scaling, scale, trained: int = 262144):
     if ctx <= trained:
         if scale is not None and scaling in (None, "none"):
             raise ValueError("--rope-scale needs --rope-scaling linear or yarn (the chosen context fits the "
-                             "trained 262144, so there is nothing to scale)")
+                             f"trained {trained}, so there is nothing to scale)")
         if scaling in (None, "none"):
             return None, None          # the stock model, by choice or by default
         return scaling, scale if scale is not None else derived_factor(ctx, trained)
     if scaling == "none":
-        raise ValueError(f"a {ctx // 1024}K context is past the model's trained 262144, and --rope-scaling none "
+        raise ValueError(f"a {ctx // 1024}K context is past the model's trained {trained}, and --rope-scaling none "
                          "keeps the stock angles there - the model has never seen those positions, so the setup "
                          "refuses the combination instead of quietly overriding it. Pick --rope-scaling yarn or "
-                         "linear, or rerun with --context 262144 or lower")
+                         f"linear, or rerun with --context {trained} or lower")
     return scaling or "yarn", scale if scale is not None else derived_factor(ctx, trained)
 
 
@@ -5840,7 +5843,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         ctx = a.context
     else:
         # the model's trained length, or what its static YaRN reaches (factor 2: 524K) where the family has it
-        ctxs = [c for c in CONTEXTS if c <= fam.get("max_context", 262144)]
+        ctxs = [c for c in CONTEXTS if c <= fam.get("max_context", TRAINED_CONTEXT)]
         say()
         say("  Context length = how much text the model can see at once. Its cache takes "
             f"{own_path_kv_bytes_per_token(fam) * 32768 / 2**30:.1f} GB of VRAM per 32K tokens, room the experts would use:")
@@ -5848,19 +5851,19 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
             say(f"  {i}) {c // 1024}K tokens" + ("   (recommended for your GPU)" if c == rec_ctx else ""))
         ctx = ctxs[int(ask("Context?", [str(i) for i in range(1, len(ctxs) + 1)], str(ctxs.index(rec_ctx) + 1),
                            a.yes)) - 1]
-    max_ctx = fam.get("max_context", 262144)
+    max_ctx = fam.get("max_context", TRAINED_CONTEXT)
     if ctx > max_ctx:
         fail(f"{ctx} tokens is past {fam['title']}'s limit of {max_ctx}", f"use --context {max_ctx} or lower")
     rope = None
     if fam.get("rope_scale"):                          # YaRN past the trained range; the card's static factor
         try:
             rope = resolve_rope(ctx, a.rope_scaling, a.rope_scale if a.rope_scale is not None
-                                else fam["rope_scale"] if ctx > 262144 else None)
+                                else fam["rope_scale"] if ctx > TRAINED_CONTEXT else None)
         except ValueError as e:
             fail(str(e))
         if rope[0]:
             ok(f"rope scaling: {rope[0]}, factor {rope[1]:g}")
-    elif ctx > 262144:
+    elif ctx > TRAINED_CONTEXT:
         warn(f"{ctx // 1024}K is past {fam['title']}'s trained 262,144 positions and this engine path has no rope "
              "scaling yet: kept as you chose, but answers past 256K are untested")
     ok(f"context: {ctx} tokens")
@@ -5948,7 +5951,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     step(7, "writing the start script")
     args = ["--native", str(gguf), "--max-context", str(ctx), "--prefill", "auto", "--mtp", str(fam["mtp"])]
     if rope and rope[0]:                           # trained length is the YaRN reference, not the final context
-        args += ["--rope-scaling", rope[0], "--rope-scale", f"{rope[1]:g}", "--rope-orig-ctx", "262144"]
+        args += ["--rope-scaling", rope[0], "--rope-scale", f"{rope[1]:g}", "--rope-orig-ctx", str(TRAINED_CONTEXT)]
     if kv:
         args += ["--kv", kv]
     if a.vram_reserve_mib is not None:             # VRAM left free for other programs: the experts take that much less
@@ -6606,7 +6609,7 @@ def main() -> int:
         for i, c in enumerate(CONTEXTS, 1):
             need_c = ctx_ram_need(model, c, low_ram)
             note = ("   (recommended for your GPU)" if c == rec_ctx else "") + \
-                   ("   (experimental: setup adds rope scaling)" if c > 262144 else "") + \
+                   ("   (experimental: setup adds rope scaling)" if c > TRAINED_CONTEXT else "") + \
                    (f"   (needs ~{need_c:.0f} GB RAM, this PC has {ram:.0f}: may run out of memory)"
                     if c > 131072 and need_c is not None and need_c > ram else "")
             say(f"  {i}) {c // 1024}K tokens{note}")
@@ -6621,7 +6624,7 @@ def main() -> int:
              f"{ram:.0f}. Kept as you chose: it may be slower or run out of RAM under load. {rec_ctx // 1024}K is the "
              "recommended size.")
     scaling = a.rope_scaling
-    if ctx > 262144 and scaling is None and not a.yes:
+    if ctx > TRAINED_CONTEXT and scaling is None and not a.yes:
         # the interactive path: one question, yarn preselected (llama.cpp's extension method, recall-tested
         # here at 512K).  With --yes nothing prints: resolve_rope takes yarn below and the ok() line says so.
         say()

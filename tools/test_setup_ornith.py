@@ -64,6 +64,60 @@ class OrnithEntry(unittest.TestCase):
         self.assertEqual((ch["family"], ch["model"], ch["context"]), ("ornith", "IQ3XXS-IQ4XS", 409600))
 
 
+class ResolveRope(unittest.TestCase):
+    def test_inside_the_trained_range_there_is_no_scaling(self):
+        self.assertEqual(setup.resolve_rope(131072, None, None), (None, None))
+        self.assertEqual(setup.resolve_rope(131072, "none", None), (None, None))
+
+    def test_inside_the_trained_range_an_asked_method_takes_factor_1_unless_given(self):
+        self.assertEqual(setup.resolve_rope(131072, "yarn", None), ("yarn", 1.0))
+        self.assertEqual(setup.resolve_rope(131072, "linear", 2.0), ("linear", 2.0))
+
+    def test_a_scale_with_no_method_inside_the_trained_range_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "--rope-scale needs --rope-scaling linear or yarn"):
+            setup.resolve_rope(131072, None, 2.0)
+
+    def test_past_the_trained_range_yarn_is_the_default_and_the_factor_is_derived(self):
+        self.assertEqual(setup.resolve_rope(524288, None, None), ("yarn", 2.0))
+        self.assertEqual(setup.resolve_rope(393216, "linear", None), ("linear", 1.5))
+
+    def test_an_asked_factor_is_kept_verbatim(self):
+        self.assertEqual(setup.resolve_rope(524288, None, 4.0), ("yarn", 4.0))
+
+    def test_none_past_the_trained_range_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "past the model's trained 262144"):
+            setup.resolve_rope(524288, "none", None)
+
+    def test_a_factor_below_one_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "below 1"):
+            setup.resolve_rope(131072, "yarn", 0.5)
+
+    def test_the_trained_length_is_one_constant(self):
+        self.assertEqual(setup.TRAINED_CONTEXT, 262144)
+        self.assertEqual(setup.derived_factor(setup.TRAINED_CONTEXT), 1.0)
+        self.assertEqual(setup.derived_factor(524288), 2.0)
+
+
+class OrnithParallelSlots(unittest.TestCase):
+    def setUp(self):
+        self.fam = setup.OWN_PATH_FAMILIES["ornith"]
+
+    def test_a_slot_takes_its_kv_cache_and_its_recurrent_state(self):
+        self.assertAlmostEqual(setup.own_path_parallel_slot_gb(self.fam, 262144),
+                               262144 * 13 * 2 * 2 * 144 / 1e9 + self.fam["state_gb"])
+
+    def test_four_slots_beside_every_expert_on_a_96_gb_card(self):
+        self.assertEqual(setup.own_path_parallel_recommend(self.fam, "IQ3XXS-IQ4XS", 96.0, 262144), 4)
+
+    def test_the_count_stops_at_the_last_one_that_keeps_every_expert_in_vram(self):
+        self.assertEqual(setup.own_path_parallel_recommend(self.fam, "IQ3XXS-IQ4XS", 64.0, 262144), 3)
+
+    def test_a_small_card_is_offered_a_share_of_its_room(self):
+        self.assertEqual(setup.own_path_parallel_recommend(self.fam, "IQ3XXS-IQ4XS", 12.0, 4096), 4)
+        self.assertEqual(setup.own_path_parallel_recommend(self.fam, "IQ3XXS-IQ4XS", 12.0, 131072), 2)
+        self.assertEqual(setup.own_path_parallel_recommend(self.fam, "IQ3XXS-IQ4XS", 12.0, 524288), 0)
+
+
 class InstallOrnith(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
