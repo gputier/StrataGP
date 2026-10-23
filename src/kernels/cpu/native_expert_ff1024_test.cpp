@@ -308,6 +308,9 @@ int main(int argc, char** argv) {
             bench_pair(18, 23);
             bench_pair(18, 20);
         }
+    // without AVX-512 the IQ4_XS down rows take ggml's path, so the AVX-512 kernel above was not run: say so in the report
+    if (!cpu::cpu_avx512_ok())
+        std::printf("SKIP avx512 IQ4_XS kernel not executed: this CPU has no AVX-512, IQ4_XS down rows ran ggml's path\n");
     std::printf("native_expert_ff1024_test: %d failures\n", failures);
     return failures == 0 ? 0 : 1;
 }
