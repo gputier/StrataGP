@@ -97,6 +97,15 @@ int main(int argc, char** argv) {
     const int nctx = cx ? std::atoi(cx) : 4096;
     cp.n_ctx = nctx;
     cp.n_batch = cp.n_ubatch = nctx;
+    // STRATA_DUMP_THREADS: the CPU threads (llama.cpp's default is 4; a 122B file on the CPU backend wants the box's cores)
+    if (const char* th = std::getenv("STRATA_DUMP_THREADS")) cp.n_threads = cp.n_threads_batch = std::atoi(th);
+    // STRATA_DUMP_YARN=FACTOR,ORIG_CTX: llama.cpp's YaRN (the reference for strata-q36's --rope-scaling yarn --rope-scale FACTOR
+    // --rope-orig-ctx ORIG_CTX); its other YaRN parameters stay at the model's / library's defaults
+    if (const char* y = std::getenv("STRATA_DUMP_YARN")) {
+        cp.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_YARN;
+        cp.rope_freq_scale = 1.0f / (float) std::atof(y);
+        if (const char* c = std::strchr(y, ',')) cp.yarn_orig_ctx = (uint32_t) std::atoi(c + 1);
+    }
     cp.op_offload = ngl > 0;   // --ngl 0 is the CPU backend: no prompt matmuls offloaded to a GPU either
     cp.cb_eval = on_tensor;
     cp.cb_eval_user_data = &cap;
