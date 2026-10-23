@@ -46,13 +46,18 @@ def ids_of(out: str, key: str) -> list[int]:
 
 
 def top2(path: Path, n_vocab: int) -> np.ndarray:
-    """[step][id1, logit1, id2, logit2] of a full-logits file ([step][vocab] f32)."""
+    """[step][id1, logit1, id2, logit2] of a full-logits file ([step][vocab] f32).
+
+    A tie goes to the smallest id, as in logit_cmp.cpp: argmax returns the first maximum, and the second is the
+    first maximum of the row once the first is set aside."""
     lg = np.fromfile(path, dtype=np.float32).reshape(-1, n_vocab)
-    i2 = np.argpartition(-lg, 1, axis=1)[:, :2]
-    v2 = np.take_along_axis(lg, i2, axis=1)
-    o = np.argsort(-v2, axis=1)
-    i2, v2 = np.take_along_axis(i2, o, axis=1), np.take_along_axis(v2, o, axis=1)
-    return np.stack([i2[:, 0], v2[:, 0], i2[:, 1], v2[:, 1]], axis=1).astype(np.float32)
+    rows = np.arange(len(lg))
+    i1 = np.argmax(lg, axis=1)
+    v1 = lg[rows, i1].copy()
+    lg[rows, i1] = -np.inf
+    i2 = np.argmax(lg, axis=1)
+    v2 = lg[rows, i2]
+    return np.stack([i1, v1, i2, v2], axis=1).astype(np.float32)
 
 
 def main() -> int:
@@ -66,13 +71,15 @@ def main() -> int:
     ap.add_argument("--lock", default="", help="a command prefix for the GPU runs (the box's flock)")
     ap.add_argument("--prompts", default=str(HERE / "parity_prompts.json"))
     ap.add_argument("--skip-ref", action="store_true", help="reuse strata-q36ref's outputs in --out")
-    ap.add_argument("--n-embd", type=int, default=2048, help="the model's hidden size (layer mode)")
-    ap.add_argument("--n-layer", type=int, default=40, help="the model's layer count (layer mode)")
+    ap.add_argument("--n-embd", type=int, help="the model's hidden size (layer mode, required there)")
+    ap.add_argument("--n-layer", type=int, help="the model's layer count (layer mode, required there)")
     ap.add_argument("--vocab", type=int, default=248320, help="the logits row size (--logits-only)")
     ap.add_argument("--logits-only", action="store_true", help="compare the logits of every step, no layer outputs")
     ap.add_argument("--ref-args", default="", help="extra arguments for the strata binary")
     ap.add_argument("--past-eos", action="store_true", help="compare all --n tokens, not only up to the answer's end")
     a = ap.parse_args()
+    if not a.logits_only and (a.n_embd is None or a.n_layer is None):
+        ap.error("the layer mode needs --n-embd and --n-layer (Qwen3.6-35B-A3B: 2048 / 40)")
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     prompts = json.loads(Path(a.prompts).read_text(encoding="utf-8"))

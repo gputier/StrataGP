@@ -9,10 +9,13 @@
 // max); --per-step adds one line per step.  --stop-at-divergence keeps only the steps before the first top-1 disagreement (free-running greedy: after it the
 // two engines read different tokens).
 #include <algorithm>
+#include <climits>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -38,16 +41,44 @@ void log_softmax(const float* x, int v, std::vector<double>& out) {
     for (int j = 0; j < v; ++j) out[j] = (double) x[j] - l;
 }
 
-std::vector<float> slurp(const std::string& p) {
+std::vector<float> slurp(const std::string& p, int v) {
     FILE* f = std::fopen(p.c_str(), "rb");
     if (!f) { std::fprintf(stderr, "cannot open %s\n", p.c_str()); std::exit(2); }
-    std::fseek(f, 0, SEEK_END);
-    const long n = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
-    std::vector<float> d((size_t) n / 4);
+    std::error_code ec;
+    const std::uintmax_t bytes = std::filesystem::file_size(p, ec);
+    if (ec) { std::fprintf(stderr, "cannot size %s: %s\n", p.c_str(), ec.message().c_str()); std::exit(2); }
+    const std::uintmax_t row = 4 * (std::uintmax_t) v;
+    if (bytes % row) {
+        std::fprintf(stderr, "%s is %ju bytes, not a multiple of one logits row (%d floats, %ju bytes): truncated or not a logits file\n",
+                     p.c_str(), bytes, v, row);
+        std::exit(2);
+    }
+    std::vector<float> d(bytes / 4);
     if (std::fread(d.data(), 4, d.size(), f) != d.size()) { std::fprintf(stderr, "short read %s\n", p.c_str()); std::exit(2); }
     std::fclose(f);
     return d;
+}
+
+// A NaN or infinite logit would make its step's KL 0 (NaN fails the e > 0 test) and count as a top-1 agreement: refuse it.
+void check_finite(const std::vector<float>& d, int v, int n, const char* role, const std::string& p) {
+    for (size_t i = 0; i < (size_t) n * (size_t) v; ++i) {
+        if (!std::isfinite(d[i])) {
+            std::fprintf(stderr, "%s %s: step %zu, logit %zu is %s: refusing non-finite logits\n", role, p.c_str(), i / (size_t) v,
+                         i % (size_t) v, std::isnan(d[i]) ? "NaN" : "infinite");
+            std::exit(2);
+        }
+    }
+}
+
+// --vocab must be a whole number of at least 2: top2 needs two entries.
+int parse_vocab(const char* s) {
+    char* end = nullptr;
+    const long v = std::strtol(s, &end, 10);
+    if (end == s || *end != '\0' || v < 2 || v > INT_MAX) {
+        std::fprintf(stderr, "--vocab must be an integer of at least 2, got '%s'\n", s);
+        std::exit(2);
+    }
+    return (int) v;
 }
 }  // namespace
 
@@ -61,14 +92,19 @@ int main(int argc, char** argv) {
         else if (a == "--per-step") per_step = true;
         else if (i + 1 < argc && a == "--ref") ref = argv[++i];
         else if (i + 1 < argc && a == "--test") test = argv[++i];
-        else if (i + 1 < argc && a == "--vocab") V = std::atoi(argv[++i]);
+        else if (i + 1 < argc && a == "--vocab") V = parse_vocab(argv[++i]);
         else if (i + 1 < argc && a == "--steps") max_steps = std::atoi(argv[++i]);
         else { std::fprintf(stderr, "usage: logit_cmp --ref F --test F --vocab N [--steps N] [--stop-at-divergence] [--per-step]\n"); return 2; }
     }
-    const std::vector<float> P = slurp(ref), Q = slurp(test);
-    if (P.size() % (size_t) V || Q.size() % (size_t) V) { std::fprintf(stderr, "a file is not a multiple of the vocab %d\n", V); return 2; }
-    int n = (int) (std::min(P.size(), Q.size()) / (size_t) V);
+    const std::vector<float> P = slurp(ref, V), Q = slurp(test, V);
+    const int steps_p = (int) (P.size() / (size_t) V), steps_q = (int) (Q.size() / (size_t) V);
+    int n = std::min(steps_p, steps_q);
     if (max_steps > 0) n = std::min(n, max_steps);
+    if (steps_p != steps_q)
+        std::fprintf(stderr, "warning: ref %s has %d steps (%zu bytes), test %s has %d steps (%zu bytes): comparing the first %d\n",
+                     ref.c_str(), steps_p, P.size() * 4, test.c_str(), steps_q, Q.size() * 4, n);
+    check_finite(P, V, n, "ref", ref);
+    check_finite(Q, V, n, "test", test);
     std::vector<double> lp, lq, kls;
     int agree = 0, ident = 0, first = -1;
     double maxabs = 0;
