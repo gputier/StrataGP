@@ -181,6 +181,8 @@ were not attempted.
 
 ## Ornith-1.5-122B (hybrid, 400K context)
 
+Full engineering record (protocols, experiments in order, open leads): [ORNITH_122B.md](ORNITH_122B.md).
+
 Ornith-1.5-122B runs on the q36 engine path (`src/qwen35`), in hybrid mode: the experts that do not fit in VRAM run on the CPU pool, or are copied over PCIe and computed on the GPU. It is a mixture of experts of 48 layers, 256 experts per layer, top-8 routing, about 10B active parameters per token. The measured file is `Ornith-1.5-122B-IQ3XXS-IQ4XS.gguf` (58,241,032,032 bytes): IQ3_XXS for the gate and up experts, IQ4_XS for the down experts, and the MTP block (blk.48) at Q4_K for its gate and up.
 
 The server listens on port 8090. The Windows launcher (`start-ornith.ps1`, `stop-ornith.ps1`, `stratagp-ornith.json`) passes `--native <gguf> --max-context 409600 --prefill auto --rope-scaling yarn --rope-scale 2 --rope-orig-ctx 262144 --kv q4`. MTP is off in its config (see below).
