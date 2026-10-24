@@ -18,7 +18,7 @@ import partition_summary as ps  # noqa: E402
 
 # 300 tokens in 10,000 ms: 30.00 tokens/s, 33.33 ms per token. Pool 6,000 ms (3,000 + 1,000 + 2,000) = 20 ms per token.
 # GPU wait 2,400 ms = 8 ms per token, so the host outside the pool is 33.33 - 20 - 8 = 5.33 ms per token.
-# Two wire windows: 48 steps with 480,000 us busy, then 96 steps with 960,000 us busy: 1,440,000 us over 144 steps = 10 ms.
+# Two wire windows: 480,000 us and 960,000 us busy: 1,440,000 us over the stats line's 300 decode steps = 4.8 ms per step.
 # The engine prints them during the decode, before the request's own lines (generated, experts, stats).
 ENGINE_LOG = (
     "strata-q36: loading the experts\n"
@@ -64,7 +64,7 @@ class ParseEngineLog(unittest.TestCase):
         self.assertAlmostEqual(launch.gpu_mb, 150.0)
         self.assertAlmostEqual(launch.pcie_mb, 70.0)
         self.assertAlmostEqual(launch.cpu_mb, 180.0)
-        self.assertAlmostEqual(launch.pcie_busy_ms, 10.0)
+        self.assertAlmostEqual(launch.pcie_busy_ms, 4.8)
         self.assertAlmostEqual(launch.host_outside_ms, 10000.0 / 300 - 6000.0 / 300 - 2400.0 / 300)
 
     def test_the_last_complete_request_is_read(self):
@@ -95,11 +95,33 @@ class ParseEngineLog(unittest.TestCase):
 
 
     def test_wire_windows_of_the_request_before_are_not_read(self):
-        # the warm-up's windows (a busy time that would give 100 ms per step) are left out: only the measured request's count
+        # the warm-up's windows (a busy time that would give 16 times more) are left out: only the measured request's count
         first = ENGINE_LOG.replace("busy 480000 us", "busy 4800000 us").replace("busy 960000 us", "busy 9600000 us")
         launch = ps.Launch("x")
         ps.parse_engine_log(first + ENGINE_LOG, launch)
-        self.assertAlmostEqual(launch.pcie_busy_ms, 10.0)
+        self.assertAlmostEqual(launch.pcie_busy_ms, 4.8)
+
+    def test_a_window_that_is_not_printed_lowers_the_figure(self):
+        # the engine counts every window but prints only those with copies: with window 2 not printed the busy time is
+        # 480,000 us over the stats line's 300 steps = 1.6 ms, not 480,000 us over the 48 steps of the printed window (10 ms)
+        log = "\n".join(line for line in ENGINE_LOG.splitlines() if "wire window 2" not in line) + "\n"
+        launch = ps.Launch("x")
+        ps.parse_engine_log(log, launch)
+        self.assertAlmostEqual(launch.pcie_busy_ms, 1.6)
+
+    def test_busy_time_is_over_the_stats_line_steps(self):
+        # the same busy time over a request of 600 tokens (stats line and generated line agree): half the figure
+        log = ENGINE_LOG.replace("300 generated", "600 generated").replace("(300 tokens)", "(600 tokens)")
+        launch = ps.Launch("x")
+        ps.parse_engine_log(log, launch)
+        self.assertAlmostEqual(launch.pcie_busy_ms, 2.4)
+
+    def test_no_stats_line_gives_na_for_the_copy_time(self):
+        log = "\n".join(line for line in ENGINE_LOG.splitlines() if ": stats: pool " not in line) + "\n"
+        launch = ps.Launch("x")
+        ps.parse_engine_log(log, launch)
+        self.assertIsNone(launch.pcie_busy_ms)
+        self.assertEqual(ps.fmt(launch.pcie_busy_ms, "{:.2f}"), "n/a")
 
     def test_share_of_the_measured_request_and_the_one_before(self):
         first = ENGINE_LOG.replace("PCIe share 0.45", "PCIe share 0.55")

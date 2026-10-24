@@ -21,6 +21,9 @@ Engine lines read (src/qwen35/q36_engine.cu and src/qwen35/q36_stats.hpp):
 The stats line is printed only for a single decoding session, right after its request's generated line: the one read is the
 first of the same session after the last generated line. The wire window K covers 48 steps for K = 1 and 96 after; only
 the windows printed during the measured request are read (a window that straddles the warm-up's end is counted whole).
+The "PCIe copies ms per decode step" figure is the busy time of those windows over the decode steps of the measured request,
+taken from its stats line (the "(T tokens)" count: one step per token with --mtp 0), not over the printed windows' steps: the
+engine counts every window and prints only those with copies. It is n/a without the stats line or without a wire window.
 
 chunks.tsv: one line per streamed chunk that carried text, "index<TAB>t_ms<TAB>chars", t_ms counted from the moment the
 request was sent. The inter-token time is the time between two consecutive such chunks (one chunk per token when the chunk
@@ -40,8 +43,6 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-
-WINDOW_STEPS_FIRST, WINDOW_STEPS_NEXT = 48, 96   # wire windows: 48 steps, then 96 each (wire_logs in q36_engine.cu)
 
 NUM = r"(-?[\d.]+)"
 RE_GEN = re.compile(
@@ -92,7 +93,7 @@ class Launch:
     gpu_mb: Optional[float] = None      # bytes per token read by the GPU path
     pcie_mb: Optional[float] = None
     cpu_mb: Optional[float] = None
-    pcie_busy_ms: Optional[float] = None   # copy streams' busy time per token (overlaps the rest; not additive)
+    pcie_busy_ms: Optional[float] = None   # copy streams' busy time per decode step (overlaps the rest; not additive)
     rb_swaps: Optional[int] = None         # the decode rebalances of the request: slot swaps (None: an older stats line)
     rb_mb: Optional[float] = None          # their copies and slot table uploads, MB
     rb_ms: Optional[float] = None          # their host time, ms
@@ -209,19 +210,20 @@ def parse_engine_log(text: str, launch: Launch) -> None:
     else:
         launch.stats_tied = True
     # the copy streams' busy time over the wire windows of the measured request (after the request before it), per decode step
+    # of the request: the step count is the stats line's, because the engine counts every window and prints only those with
+    # copies (the printed windows' steps would leave the others out); one decode step is one token with --mtp 0
     begin = gens[-2].end() if len(gens) >= 2 else 0
     busy_us = 0.0
-    steps = 0
+    wires = 0
     for m in RE_WIRE.finditer(text):
         if m.start() < begin or m.start() > stats.end():
             continue
-        k = int(m.group(1))
         busy_us += float(m.group(6))
-        steps += WINDOW_STEPS_FIRST if k == 1 else WINDOW_STEPS_NEXT
-    if steps:
-        launch.pcie_busy_ms = busy_us / 1000.0 / steps
+        wires += 1
+    if wires and launch.tokens > 0:
+        launch.pcie_busy_ms = busy_us / 1000.0 / launch.tokens
     else:
-        launch.problems.append("no wire window line: the PCIe copy time is not measured")
+        launch.problems.append("no wire window line or no step count in the stats line: the PCIe copy time is not measured")
 
 
 def parse_mem_log(text: str, mem: Mem) -> None:
@@ -328,7 +330,7 @@ METRICS = [
     ("host wait for GPU ms per token", lambda l: (l.wait_ms / l.tokens) if l.wait_ms is not None and l.tokens else None,
      "{:.2f}"),
     ("host outside pool ms per token", lambda l: l.host_outside_ms, "{:.2f}"),
-    ("PCIe copies ms per token (overlaps)", lambda l: l.pcie_busy_ms, "{:.2f}"),
+    ("PCIe copies ms per decode step (overlaps)", lambda l: l.pcie_busy_ms, "{:.2f}"),
     ("GPU path MB per token", lambda l: l.gpu_mb, "{:.1f}"),
     ("PCIe MB per token", lambda l: l.pcie_mb, "{:.1f}"),
     ("CPU pool MB per token", lambda l: l.cpu_mb, "{:.1f}"),

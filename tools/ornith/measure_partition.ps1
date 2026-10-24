@@ -200,6 +200,15 @@ function Stop-ServerTree([int]$Root, $RootStart, [string]$ExePath) {
     # meanwhile is caught) until a snapshot finds none. Throws when one is still alive, or when a process runs from the engine
     # binary's path outside the tree: it is reported by PID and not stopped (the next pre-flight refuses to start while it
     # runs). Returns the PIDs stopped.
+    # Without a start time ($RootStart null: StartTime could not be read) the root cannot be verified, so no tree is built. The
+    # fail-safe is to throw with the PID while a process of that Id is alive, so the operator stops it by hand: rooting the tree
+    # at the bare PID would kill whatever holds that Id if it was reused, and a silent empty stop would leave the server running.
+    if ($null -eq $RootStart) {
+        $alive = Get-Process -Id $Root -ErrorAction SilentlyContinue
+        $running = $false
+        if ($alive) { try { $running = -not $alive.HasExited } catch { $running = $true } }
+        if ($running) { throw "the server's start time is unknown, so its process tree cannot be verified and was not stopped: PID $Root is still alive; stop it and its children by hand before another launch" }
+    }
     $stopped = New-Object System.Collections.Generic.List[int]
     for ($pass = 1; $pass -le 5; $pass++) {
         $snap = Get-ServerProcs $Root $RootStart $ExePath
@@ -515,7 +524,7 @@ for ($n = 1; $n -le $Launches; $n++) {
                     ForEach-Object { ConvertTo-ProcessArg $_ }) -join ' '
         $srv = Start-Process -FilePath $Python -ArgumentList $srvArgs -WorkingDirectory $BuildDir -NoNewWindow -PassThru `
             -RedirectStandardOutput (Join-Path $dir 'server.out') -RedirectStandardError (Join-Path $dir 'server.err')
-        try { $srvStart = $srv.StartTime } catch { Write-Warning "launch ${n}: no start time for the server (PID $($srv.Id)): $($_.Exception.Message); the stop will find no tree" }
+        try { $srvStart = $srv.StartTime } catch { Write-Warning "launch ${n}: no start time for the server (PID $($srv.Id)): $($_.Exception.Message); the stop will throw while it is alive" }
         Write-Host "server pid $($srv.Id)"
 
         $sampler = Start-Job -ScriptBlock $SamplerBlock -ArgumentList $srv.Id, $memLog, $SampleMs
@@ -568,7 +577,8 @@ for ($n = 1; $n -le $Launches; $n++) {
         if ($srv) {
             try {
                 $stopped = Stop-ServerTree $srv.Id $srvStart $exePath
-                Write-Host "server stopped: PID $($stopped -join ',')"
+                if ($stopped.Count -gt 0) { Write-Host "server stopped: PID $($stopped -join ',')" }
+                else { Write-Warning "launch ${n}: no server process was left to stop (PID $($srv.Id) had already exited)" }
                 Wait-GpuFree $stopped 60
             } catch { $stopError = $_ }
         }
