@@ -3945,8 +3945,6 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     E.pool = std::make_unique<C::ExpertPool>(strata::q36::pool_workers(threads, (int) C::detect_cpu_topology(true).worker_cores.size()));
     if (pcie_frac == 0.0) {
         std::fprintf(stderr, "strata-q36: PCIe share off (--pcie-frac 0)\n");
-        if (std::getenv("STRATA_Q36_PCIE_AUTO_STEP") != nullptr)
-            std::fprintf(stderr, "strata-q36: STRATA_Q36_PCIE_AUTO_STEP ignored (--pcie-frac given or probe failed)\n");
     } else if (pcie_bytes > 0 && !pinned) {
         std::fprintf(stderr, "strata-q36: the PCIe share is off: the experts are in pageable host memory\n");
     } else if (pcie_bytes > 0) {
@@ -4001,11 +3999,11 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         else
             std::fprintf(stderr, "strata-q36: PCIe probe failed -> PCIe share %.2f of the missed experts (--pcie-frac N fixes it, "
                          "0 turns it off)\n", frac);
-        // the step search runs only on the automatic share of a probed link (the branch above): with --pcie-frac or a failed
-        // probe the variable does nothing, and the log says so
-        if ((pcie_frac >= 0.0 || !(link_gbps > 0.0)) && std::getenv("STRATA_Q36_PCIE_AUTO_STEP") != nullptr)
-            std::fprintf(stderr, "strata-q36: STRATA_Q36_PCIE_AUTO_STEP ignored (--pcie-frac given or probe failed)\n");
     }
+    // one place for every branch above (--pcie-frac 0, pageable memory, no PCIe bytes, --pcie-frac N, failed probe, or a value
+    // that does not switch it on): the step search is off, and the log says the variable did nothing
+    if (std::getenv("STRATA_Q36_PCIE_AUTO_STEP") != nullptr && !E.pcie_step_on)
+        std::fprintf(stderr, "strata-q36: STRATA_Q36_PCIE_AUTO_STEP ignored (the PCIe share is not automatic here, or the value is not 1)\n");
     CK(cudaDeviceSynchronize());
     if (mtp_only)
         std::fprintf(stderr, "strata-q36: every main layer's routed experts in VRAM (%.2f GiB); the MTP block's: %d of "
