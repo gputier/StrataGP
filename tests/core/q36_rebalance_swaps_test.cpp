@@ -143,7 +143,7 @@ int main() {
     }
     {
         // a layer with every expert in a slot, and one with none: rebalance() gives them no view, and choose_swaps given
-        // their tables would replace nothing either (no candidate, no victim)
+        // their tables would replace nothing either (the full layer has no candidate, the empty one no victim)
         std::mt19937 r(3);
         TestLayer full = make_layer(r, 8, 8), none = make_layer(r, 8, 0);
         for (double& v : full.score) v = 5.0;
@@ -196,9 +196,29 @@ int main() {
               "replacements tied on gain across layers, a budget of 1: the lower layer's is kept");
     }
 
+    {
+        // one slot, held by expert 1 at 0.0; expert 0 outside at exactly kRebalanceMinCount (2.0), a gain of 2.0 above
+        // kRebalanceMinGain: only the count gate is at its boundary, and a count equal to it passes
+        const std::vector<double> score = {2.0, 0.0};
+        const std::vector<int> slot_of = {-1, 0};
+        const std::vector<SlotSwap> w = choose_swaps({{&score, &slot_of}}, kNoBudget);
+        check(w.size() == 1 && w[0].in == 0 && w[0].out == 1 && w[0].gain == 2.0,
+              "a candidate at exactly kRebalanceMinCount is taken");
+    }
+    {
+        // one slot, held by expert 1 at 1.0; expert 0 outside at 2.5, above kRebalanceMinCount, a gain of exactly
+        // kRebalanceMinGain (2.5 - 1.0 = 1.5): only the gain gate is at its boundary, and a gain equal to it passes
+        const std::vector<double> score = {2.5, 1.0};
+        const std::vector<int> slot_of = {-1, 0};
+        const std::vector<SlotSwap> w = choose_swaps({{&score, &slot_of}}, kNoBudget);
+        check(w.size() == 1 && w[0].in == 0 && w[0].out == 1 && w[0].gain == 1.5,
+              "a pair whose gain is exactly kRebalanceMinGain is taken");
+    }
+
     std::printf("generated rounds:\n");
     bool safe = true, kept = true, ranked = true, prefix = true, settled = true, decayed = true;
-    long long applied = 0, budget_cut = 0, took_all_calls = 0;   // took_all_calls: the calls the last two checks ran on
+    // took_all_calls: the calls that took every pair, counted only when `all` is not empty
+    long long applied = 0, budget_cut = 0, took_all_calls = 0;
     const int sizes[] = {8, 16, 256};
     const int budgets[] = {1, 2, 3, 8, kNoBudget};
     std::mt19937 r(0x5eed);
@@ -230,7 +250,7 @@ int main() {
             for (const TestLayer& L : layers)
                 if (!consistent(L)) kept = false;
             const bool took_all = w.size() == all.size();
-            if (took_all) ++took_all_calls;
+            if (took_all && !all.empty()) ++took_all_calls;
             if (took_all && replaces_any()) settled = false;
             for (TestLayer& L : layers)
                 for (double& v : L.score) v *= kRebalanceDecay;
@@ -242,7 +262,8 @@ int main() {
     check(kept, "after each call every slot is held by one expert and holds that expert's blob");
     check(ranked, "the replacements are ranked by gain, each gain is count(in) - count(out) and passes both thresholds");
     check(prefix, "a budget keeps the first replacements of the full list, in the same order");
-    check(took_all_calls > 0, "some calls took every pair, so the two checks below ran");
+    check(took_all_calls > 0,
+          "some calls took every pair of a non-empty list, so the two checks below ran after real replacements");
     check(settled, "a call that took every pair: a second call on the same counts replaces nothing");
     check(decayed, "nor does a call after the decay alone (no replacement back and forth without new routing)");
     std::printf("%s\n", g_fail ? "FAILED" : "all passed");
