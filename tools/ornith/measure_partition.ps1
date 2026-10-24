@@ -141,13 +141,13 @@ function Assert-PreFlight([string]$ExePath) {
     $freeKiB = [long](Get-CimInstance -ClassName Win32_OperatingSystem).FreePhysicalMemory
     $freeGiB = $freeKiB / 1024.0 / 1024.0
     if ($freeGiB -lt $MinFreeGiB) { throw ("pre-flight: {0:F1} GiB of free physical memory, below -MinFreeGiB {1}" -f $freeGiB, $MinFreeGiB) }
-    $gpuEngines = @(Get-GpuEngineProcs)
+    $gpuEngines = Get-GpuEngineProcs   # (returned whole by the function: a second @() would wrap it into one element)
     if ($gpuEngines.Count -gt 0) { throw "pre-flight: an engine process runs: $($gpuEngines -join '; '); stop it first" }
     $usedMiB = Get-GpuUsedMiB
     if ($usedMiB -gt $MaxIdleGpuMiB) { throw "pre-flight: the GPU has $usedMiB MiB in use (memory.used), above -MaxIdleGpuMiB $MaxIdleGpuMiB; free it first" }
     $gpu = Get-GpuComputeApps
     if ($gpu.Lines.Count -gt 0) { Write-Host "pre-flight: compute processes listed (information only, not counted): $($gpu.Lines -join '; ')" }
-    $engines = @(Get-EngineProcs $ExePath)
+    $engines = Get-EngineProcs $ExePath   # (returned whole, as above)
     if ($engines.Count -gt 0) { throw "pre-flight: a process already runs from ${ExePath}: PID $($engines -join ','); stop it first" }
     Assert-PortFree
     Write-Host ("pre-flight ok: {0:F1} GiB free, no gitlab-runner VM running, no strata.exe or llama-server.exe running, GPU {1} MiB in use (at most {2})" -f $freeGiB, $usedMiB, $MaxIdleGpuMiB)
@@ -238,7 +238,7 @@ function Wait-GpuFree([int[]]$Stopped, [int]$Seconds) {
     # of the stopped PIDs may still be listed as a compute process. Polls, then throws.
     $deadline = (Get-Date).AddSeconds($Seconds)
     while ($true) {
-        $gpuEngines = @(Get-GpuEngineProcs)
+        $gpuEngines = Get-GpuEngineProcs   # (returned whole)
         $usedMiB = Get-GpuUsedMiB
         $gpu = Get-GpuComputeApps
         $ours = @($gpu.Pids | Where-Object { $Stopped -contains $_ })
