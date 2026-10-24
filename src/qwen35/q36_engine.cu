@@ -40,6 +40,7 @@
 #include "q36_kernels.cuh"
 #include "q36_pcie.hpp"
 #include "q36_rebalance.hpp"
+#include "q36_rules.hpp"
 #include "q36_sampling.hpp"
 #include "q36_stats.hpp"
 #include "q36_threads.hpp"
@@ -3067,11 +3068,10 @@ struct Engine {
         for (const strata::q36::SlotSwap& w : swaps) {
             Hy& H = hy[(size_t) w.layer];
             const Layer& L = layer_at(w.layer);
-            const int s = H.slot_of[(size_t) w.out];
-            H.slot_of[(size_t) w.out] = -1;
-            H.slot_of[(size_t) w.in] = s;
-            CK(cudaMemcpyAsync(L.blobs + (size_t) s * L.stride, L.hblobs + (size_t) w.in * L.stride, L.L.bytes,
-                               cudaMemcpyHostToDevice, st));
+            strata::q36::apply_slot_swap(H.slot_of, w, [&](int s, int in) {
+                CK(cudaMemcpyAsync(L.blobs + (size_t) s * L.stride, L.hblobs + (size_t) in * L.stride, L.L.bytes,
+                                   cudaMemcpyHostToDevice, st));
+            });
             changed[(size_t) w.layer] = 1;
             ++hy_swaps;
         }
@@ -3741,7 +3741,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     if (!E.use_mmq) E.hybrid_t = E.tmax;   // no streamed prompt path: every batch on slots + the pool
     // the graphs (a decode step, a verify window) run the hybrid layers through the doorbell; a window over hybrid_t
     // rows would stream the layer's experts with host syncs in the middle, which a capture cannot hold
-    if (E.main_hybrid && E.hybrid_t < Engine::kVerify) E.use_graph = false;
+    if (strata::q36::hybrid_graph_off(E.main_hybrid, E.hybrid_t, Engine::kVerify)) E.use_graph = false;
     // the two staging buffers: a streamed forward over the main layers alternates between them, and the MTP block (the
     // widest layer where its gate / up are Q4_K: 1.24 GiB against 0.97 GiB for a main layer on Ornith) is streamed alone,
     // so it only ever takes the first (stream_begin with one layer): the second holds a main layer

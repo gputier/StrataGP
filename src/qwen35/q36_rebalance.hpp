@@ -80,4 +80,15 @@ inline std::vector<SlotSwap> choose_swaps(const std::vector<LayerCounts>& layers
     return swaps;
 }
 
+/// The placement change of one replacement: `in` takes the slot `out` held, and that slot's blob is then filled from the
+/// host copy of expert `in`, which the caller does through copy(slot, in).  Returns the slot.
+template <class Copy>
+inline int apply_slot_swap(std::vector<int>& slot_of, const SlotSwap& w, Copy&& copy) {
+    const int s = slot_of[(size_t) w.out];
+    slot_of[(size_t) w.out] = -1;
+    slot_of[(size_t) w.in] = s;
+    copy(s, w.in);
+    return s;
+}
+
 }  // namespace strata::q36
