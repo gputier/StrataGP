@@ -6,7 +6,8 @@ Reads, per launch_NN folder: engine.log (the engine's stderr), mem.log (the pass
 measured request (the last one of the launch, after the warm-up) response.json and chunks.tsv (response_NN.json and
 chunks_NN.tsv, the highest NN, with several prompts). Writes text to stdout.
 The minimum free RAM is reported only: no launch is left out for its memory. A launch whose completion has fewer tokens than
-asked is flagged SHORT and left out of the medians (issue #95 asks for 200 tokens or more).
+asked is flagged SHORT and left out of the medians (issue #95 asks for 200 tokens or more). A launch whose measured request
+has no stats line of its own, or whose stats line counts other tokens than its generated line, is not measured either.
 
     python -I tools/ornith/partition_summary.py <run folder>
 
@@ -15,8 +16,10 @@ Engine lines read (src/qwen35/q36_engine.cu and src/qwen35/q36_stats.hpp):
   strata serve: session S: experts on the GPU ..., N slot replacements, PCIe share H
   strata serve: session S: stats: pool ... ms (gate/up ..., quantize ..., down ...), ... bytes per token: GPU ... MB,
       PCIe ... MB, CPU ... MB (T tokens); host wait on the doorbell W ms over L layer steps (...), host serving ...
+      ...; decode rebalances: N slot swaps, B MB copied, H ms of host time   (this last part is optional: older lines lack it)
   strata-q36: stats: wire window K: share ..., B blobs chosen for PCIe (...), busy U us on the copy streams: ...
-The stats line is printed only for a single decoding session. The wire window K covers 48 steps for K = 1 and 96 after; only
+The stats line is printed only for a single decoding session, right after its request's generated line: the one read is the
+first of the same session after the last generated line. The wire window K covers 48 steps for K = 1 and 96 after; only
 the windows printed during the measured request are read (a window that straddles the warm-up's end is counted whole).
 
 chunks.tsv: one line per streamed chunk that carried text, "index<TAB>t_ms<TAB>chars", t_ms counted from the moment the
@@ -51,7 +54,8 @@ RE_STATS = re.compile(
     r"GPU " + NUM + r" MB, PCIe " + NUM + r" MB, CPU " + NUM + r" MB \((\d+) tokens\); host wait on the doorbell " + NUM +
     r" ms over (\d+) layer steps \(" + NUM + r" us each\), host serving " + NUM + r" ms \(" + NUM + r" us each\); "
     r"PCIe blobs per token: on demand " + NUM + r", prefetched " + NUM + r", prefetch hits " + NUM + r" \(" + NUM +
-    r"% of the prefetched\)")
+    r"% of the prefetched\)"
+    r"(?:; decode rebalances: (\d+) slot swaps, " + NUM + r" MB copied, " + NUM + r" ms of host time)?")
 RE_WIRE = re.compile(
     r"strata-q36: stats: wire window (\d+): share " + NUM + r", (\d+) blobs chosen for PCIe \((\d+) on demand, (\d+) "
     r"prefetched\), busy " + NUM + r" us on the copy streams: " + NUM + r" us per chosen blob, " + NUM +
@@ -89,6 +93,11 @@ class Launch:
     pcie_mb: Optional[float] = None
     cpu_mb: Optional[float] = None
     pcie_busy_ms: Optional[float] = None   # copy streams' busy time per token (overlaps the rest; not additive)
+    rb_swaps: Optional[int] = None         # the decode rebalances of the request: slot swaps (None: an older stats line)
+    rb_mb: Optional[float] = None          # their copies and slot table uploads, MB
+    rb_ms: Optional[float] = None          # their host time, ms
+    stats_tied: bool = False               # the stats line is the measured request's (after its generated line, same session
+                                           # and same token count)
     share: Optional[float] = None          # the PCIe share at the end of the measured request
     share_before: Optional[float] = None   # the PCIe share at the end of the request before it (the warm-up)
     asked: Optional[int] = None            # max_tokens of the measured request
@@ -154,24 +163,32 @@ class Launch:
 
     @property
     def measured(self) -> bool:
-        return self.tok_s is not None and not self.short
+        return self.tok_s is not None and self.stats_tied and not self.short
 
 
 def parse_engine_log(text: str, launch: Launch) -> None:
-    """Fills `launch` from one engine log; the last complete request of the log is the one measured."""
+    """Fills `launch` from one engine log; the last request of the log (its generated line) is the one measured, and its stats
+    line is the first one of the same session after that generated line (the engine prints it right after). No such line, or
+    a token count that differs from the generated line's, leaves the launch not measured."""
     gens = list(RE_GEN.finditer(text))
-    stats = None
-    for m in RE_STATS.finditer(text):
-        stats = m
     shares = list(RE_SHARE.finditer(text))
     if shares:
         launch.share = float(shares[-1].group(2))
         if len(shares) >= 2:
             launch.share_before = float(shares[-2].group(2))
-    if not gens or stats is None:
-        launch.problems.append("no complete request in the engine log (generated and stats lines)")
+    if not gens:
+        launch.problems.append("no complete request in the engine log (no generated line)")
         return
     gen = gens[-1]
+    stats = None
+    for m in RE_STATS.finditer(text, gen.end()):
+        if m.group(1) == gen.group(1):
+            stats = m
+            break
+    if stats is None:
+        launch.problems.append("no stats line after the measured request's generated line (another session decoded at the "
+                               "same time, or the stats are off): not measured")
+        return
     decode_ms = float(gen.group(8))
     launch.decode_ms = decode_ms
     launch.tok_s = float(gen.group(9))
@@ -183,8 +200,14 @@ def parse_engine_log(text: str, launch: Launch) -> None:
     launch.cpu_mb = float(g[10])
     launch.tokens = int(g[11])
     launch.wait_ms = float(g[12])
+    if g[21] is not None:
+        launch.rb_swaps = int(g[21])
+        launch.rb_mb = float(g[22])
+        launch.rb_ms = float(g[23])
     if int(gen.group(7)) != launch.tokens:
-        launch.problems.append(f"token counts differ: {gen.group(7)} generated, {launch.tokens} in the stats line")
+        launch.problems.append(f"token counts differ: {gen.group(7)} generated, {launch.tokens} in the stats line: not measured")
+    else:
+        launch.stats_tied = True
     # the copy streams' busy time over the wire windows of the measured request (after the request before it), per decode step
     begin = gens[-2].end() if len(gens) >= 2 else 0
     busy_us = 0.0
@@ -309,6 +332,9 @@ METRICS = [
     ("GPU path MB per token", lambda l: l.gpu_mb, "{:.1f}"),
     ("PCIe MB per token", lambda l: l.pcie_mb, "{:.1f}"),
     ("CPU pool MB per token", lambda l: l.cpu_mb, "{:.1f}"),
+    ("decode rebalances: slot swaps", lambda l: l.rb_swaps, "{:.0f}"),
+    ("decode rebalances: MB copied", lambda l: l.rb_mb, "{:.1f}"),
+    ("decode rebalances: host ms", lambda l: l.rb_ms, "{:.1f}"),
     ("TTFT ms (streamed)", lambda l: l.ttft_ms, "{:.0f}"),
     ("inter-token p50 ms", lambda l: l.itl_p50, "{:.2f}"),
     ("inter-token p95 ms", lambda l: l.itl_p95, "{:.2f}"),
@@ -331,7 +357,7 @@ def summary(folders: list) -> str:
         if l.short:
             got = l.completion_tokens if l.completion_tokens is not None else l.tokens
             status = f"SHORT ({got} of {l.asked} tokens, finish_reason {l.finish_reason or 'n/a'}): left out of the medians"
-        elif l.tok_s is None:
+        elif not l.measured:
             status = "not measured"
         else:
             status = "measured"

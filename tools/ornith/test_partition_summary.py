@@ -40,6 +40,10 @@ ENGINE_LOG = (
     "strata serve: session 1: stats: expert union (distinct / (window * top-k)) w2 0.890 w3 0.800 w4 0.750\n"
 )
 
+# the stats line's tail as the engine prints it since issue #96 (q36_stats.hpp): the decode rebalances' cost
+REB_OLD = "(12.3% of the prefetched)\n"
+REB_NEW = "(12.3% of the prefetched); decode rebalances: 42 slot swaps, 12.5 MB copied, 3.2 ms of host time\n"
+
 MEM_LOG = (
     "0.0 30000000 -1 -1\n"
     "2.5 20000000 15000 32607\n"
@@ -107,6 +111,55 @@ class ParseEngineLog(unittest.TestCase):
         ps.parse_engine_log(ENGINE_LOG, one)
         self.assertAlmostEqual(one.share, 0.45)
         self.assertIsNone(one.share_before)
+
+    def test_stats_line_of_the_request_before_is_not_used(self):
+        # the measured request printed no stats line (another session decoded at the same time): the warm-up's stats line,
+        # earlier in the log, is not taken for it, and the launch is not measured
+        measured = "\n".join(line for line in ENGINE_LOG.splitlines() if ": stats: pool " not in line) + "\n"
+        launch = ps.Launch("x")
+        ps.parse_engine_log(ENGINE_LOG + measured, launch)
+        self.assertIsNone(launch.tok_s)
+        self.assertFalse(launch.measured)
+        self.assertTrue(any("no stats line after the measured request" in p for p in launch.problems))
+
+    def test_stats_line_of_another_session_is_not_used(self):
+        other = ENGINE_LOG.replace("strata serve: session 1: stats: pool", "strata serve: session 2: stats: pool")
+        launch = ps.Launch("x")
+        ps.parse_engine_log(other, launch)
+        self.assertFalse(launch.measured)
+        self.assertTrue(any("no stats line after the measured request" in p for p in launch.problems))
+
+    def test_token_count_mismatch_is_not_measured(self):
+        launch = ps.Launch("x")
+        ps.parse_engine_log(ENGINE_LOG.replace("(300 tokens)", "(299 tokens)"), launch)
+        self.assertIsNotNone(launch.tok_s)
+        self.assertFalse(launch.short)
+        self.assertFalse(launch.measured)
+        self.assertTrue(any("token counts differ: 300 generated, 299 in the stats line" in p for p in launch.problems))
+
+    def test_matching_stats_line_is_measured(self):
+        launch = ps.Launch("x")
+        ps.parse_engine_log(ENGINE_LOG, launch)
+        self.assertTrue(launch.stats_tied)
+        self.assertTrue(launch.measured)
+
+    def test_rebalance_cost_is_read(self):
+        launch = ps.Launch("x")
+        ps.parse_engine_log(ENGINE_LOG.replace(REB_OLD, REB_NEW), launch)
+        self.assertEqual(launch.problems, [])
+        self.assertEqual(launch.rb_swaps, 42)
+        self.assertAlmostEqual(launch.rb_mb, 12.5)
+        self.assertAlmostEqual(launch.rb_ms, 3.2)
+        self.assertEqual(launch.tokens, 300)
+        self.assertEqual(ps.RE_STATS.search(ENGINE_LOG.replace(REB_OLD, REB_NEW)).group(21), "12.3")
+
+    def test_old_stats_line_without_rebalances_still_parses(self):
+        launch = ps.Launch("x")
+        ps.parse_engine_log(ENGINE_LOG, launch)
+        self.assertTrue(launch.measured)
+        self.assertIsNone(launch.rb_swaps)
+        self.assertIsNone(launch.rb_mb)
+        self.assertIsNone(launch.rb_ms)
 
 
 class ParseMemLog(unittest.TestCase):
@@ -206,12 +259,17 @@ class Short(unittest.TestCase):
 
 class Summary(unittest.TestCase):
     def make_launch(self, root: Path, name: str, tok_s: float, free_kib: int, completion: int = 300,
-                    finish: str = "length", times: list = CHUNK_MS, warmup_share: str = "0.45") -> Path:
+                    finish: str = "length", times: list = CHUNK_MS, warmup_share: str = "0.45",
+                    own_stats: bool = True, rebalances: str = "") -> Path:
         d = root / name
         d.mkdir()
         # a warm-up request, then the measured one of 300 tokens at the given rate: decode time = 300 / rate seconds
         decode_ms = 300000.0 / tok_s
         text = ENGINE_LOG.replace("in 10000 ms (30.0 tok/s)", f"in {decode_ms:.0f} ms ({tok_s:.1f} tok/s)")
+        if rebalances:   # the measured request's stats line with its decode rebalances (the tail after the prefetch hits)
+            text = text.replace(REB_OLD, "(12.3% of the prefetched); decode rebalances: " + rebalances + "\n")
+        if not own_stats:   # the measured request printed no stats line: only the warm-up's is in the log
+            text = "\n".join(line for line in text.splitlines() if ": stats: pool " not in line) + "\n"
         warm = ENGINE_LOG.replace("PCIe share 0.45", "PCIe share " + warmup_share)
         (d / "engine.log").write_text(warm + text, encoding="utf-8")
         (d / "mem.log").write_text(f"0.0 {free_kib} 16000 32607\n", encoding="utf-8")
@@ -261,6 +319,34 @@ class Summary(unittest.TestCase):
         line = [l for l in text.splitlines() if l.startswith("launch_01")][0]
         self.assertIn("the PCIe share moved during the measured request (0.55 -> 0.45)", line)
         self.assertIn("10 text chunks for 300 tokens", line)
+
+    def test_launch_without_its_own_stats_line_is_left_out(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            gib13 = 13 * 1024 * 1024
+            self.make_launch(root, "launch_01", 30.0, gib13, rebalances="10 slot swaps, 2.0 MB copied, 1.0 ms of host time")
+            self.make_launch(root, "launch_02", 32.0, gib13, rebalances="20 slot swaps, 4.0 MB copied, 2.0 ms of host time")
+            self.make_launch(root, "launch_03", 50.0, gib13, own_stats=False)   # only the warm-up's stats line
+            text = ps.summary(sorted(root.glob("launch_*")))
+        self.assertIn("median over the measured launches (2 of 3)", text)
+        line3 = [l for l in text.splitlines() if l.startswith("launch_03")][0]
+        self.assertIn("not measured; no stats line after the measured request", line3)
+        tok_line = [l for l in text.splitlines() if l.strip().startswith("tokens/s (engine)")][0]
+        self.assertIn("31.00", tok_line)
+        swaps = [l for l in text.splitlines() if l.strip().startswith("decode rebalances: slot swaps")][0]
+        self.assertEqual(swaps.split()[-1], "15")
+        mb = [l for l in text.splitlines() if l.strip().startswith("decode rebalances: MB copied")][0]
+        self.assertEqual(mb.split()[-1], "3.0")
+        host = [l for l in text.splitlines() if l.strip().startswith("decode rebalances: host ms")][0]
+        self.assertEqual(host.split()[-1], "1.5")
+
+    def test_rebalances_of_older_lines_read_na(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_launch(root, "launch_01", 30.0, 13 * 1024 * 1024)
+            text = ps.summary(sorted(root.glob("launch_*")))
+        swaps = [l for l in text.splitlines() if l.strip().startswith("decode rebalances: slot swaps")][0]
+        self.assertEqual(swaps.split()[-1], "n/a")
 
 
 if __name__ == "__main__":

@@ -9,18 +9,24 @@ memory.used by nvidia-smi above -MaxIdleGpuMiB (per-process used_memory reads [N
 already running from the engine binary's path, or a server already answering on the port). Then a passive sampler (free RAM and
 VRAM every 2.5 s into mem.log; it never stops anything: the engine runs with no memory guard), serve/server.py with the strata
 engine, STRATA_Q36_STATS=1 and no working-set cap, a wait for /health, one throw-away warm-up request of -WarmupTokens tokens
-(240 or more, so the automatic PCIe share has made its last update, after 48, 144 and 240 decode windows), then one greedy
-streamed chat request of -Tokens tokens per prompt, each text chunk timestamped on arrival (chunks.tsv). A completion with
+(241 or more: the first token comes from the prompt, so 241 tokens run 240 decode windows and the automatic PCIe share
+(PcieAuto) has made its last update, after 48, 144 and 240 windows; this guarantee covers PcieAuto only: under
+-ExtraEnv STRATA_Q36_PCIE_AUTO_STEP=1 the step search may still move the share during the measured requests, and the script
+warns), then one greedy streamed chat request of -Tokens tokens per prompt, each text chunk timestamped on arrival (chunks.tsv). A completion with
 fewer tokens than asked is flagged (usage.completion_tokens, finish_reason) in response.json and by the summary. The PCIe
 share the engine reports after each request is logged. In a finally block the server's processes are stopped (its process
-tree by parent PID and any process running from the engine binary's path, the snapshot taken again until none is left),
-each is waited for, and the script throws when one is still alive or when, after up to 60 s, a strata.exe or llama-server.exe
+tree by parent PID only, rooted at the started process when its CreationDate matches the StartTime Start-Process gave,
+each child created at or after its parent; the snapshot taken again until none is left), each is waited for, and the
+script throws when one is still alive, when a process runs from the engine binary's path outside that tree (its PID is
+reported, it is not stopped), or when, after up to 60 s, a strata.exe or llama-server.exe
 still runs, the GPU's memory.used is still above -MaxIdleGpuMiB or a stopped PID is still listed as a compute process.
-Afterwards it runs partition_summary.py on the output folder.
+Afterwards it runs partition_summary.py on the output folder and throws when it exits non-zero. A failed launch prints its
+full error record and script stack; a failed stop after it throws with both errors.
 
 The Hyper-V VMs are only listed with Get-VM (name, state, CPU usage, memory, uptime), never changed; Get-VM needs an elevated
 shell, which the pre-flight checks. Inputs (binary, build folder, GGUF, expert profile) are only read. The output folder must
-not exist yet or must hold no launch_* folder.
+not exist yet or must hold no launch_* folder. A path parameter that holds a double quote is refused: Windows PowerShell 5.1
+joins Start-Process arguments with spaces and quotes nothing, so the script quotes each server argument itself.
 
 .EXAMPLE
 pwsh -File tools\ornith\measure_partition.ps1 -Binary C:\b\strata.exe -BuildDir C:\b -Gguf D:\m\Ornith-1.5-122B-IQ3XXS-IQ4XS.gguf -RankFile D:\m\profile.strp -OutDir D:\runs\issue95
@@ -34,7 +40,7 @@ param(
     [Parameter(Mandatory = $true)][string]$OutDir,                # new folder for the logs of this run
     [int]$Port = 8090,
     [int]$Tokens = 300,
-    [int]$WarmupTokens = 256,                                     # the throw-away request before the measured one (240 or more)
+    [int]$WarmupTokens = 256,                                     # the throw-away request before the measured one (241 or more)
     [int]$Launches = 3,
     [double]$MinFreeGiB = 100,                                    # the pre-flight refuses to launch below this free physical memory
     [int]$MaxIdleGpuMiB = 4096,                                   # the pre-flight refuses above this GPU memory.used (963 MiB at idle)
@@ -51,7 +57,7 @@ $ErrorActionPreference = 'Stop'
 if ($ServerScript -eq '') { $ServerScript = Join-Path $PSScriptRoot '..\..\serve\server.py' }
 
 $SampleMs = 2500
-$MinWarmupTokens = 240        # PcieAuto's last update comes after 240 decode windows (one token each without MTP)
+$MinWarmupTokens = 241        # PcieAuto's last update comes after 240 decode windows (one token each without MTP); the first token comes from the prompt, not from a decode step
 
 # A fixed prompt, the same for every launch, and the warm-up's (ASCII only, so the script reads the same in Windows PowerShell 5.1).
 $Prompt = 'Write a Python function that parses an ISO 8601 date-time string without the standard library, then explain ' +
@@ -61,6 +67,14 @@ $WarmupPrompt = 'Describe in detail, step by step, how a hash table handles coll
 
 function Assert-File([string]$Path, [string]$What) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "$What not found: $Path" }
+}
+
+function ConvertTo-ProcessArg([string]$Value) {
+    # One argument of a Windows command line for Start-Process: Windows PowerShell 5.1 joins -ArgumentList with spaces and
+    # quotes nothing, so the value is wrapped in double quotes here, a trailing run of backslashes doubled (it would escape
+    # the closing quote). A value that holds a double quote is refused (the path parameters are checked for it at the start).
+    if ($Value.Contains('"')) { throw "a process argument holds a double quote: $Value" }
+    return '"' + ($Value -replace '(\\+)$', '$1$1') + '"'
 }
 
 function Get-GpuComputeApps {
@@ -139,45 +153,67 @@ function Assert-PreFlight([string]$ExePath) {
     Write-Host ("pre-flight ok: {0:F1} GiB free, no gitlab-runner VM running, no strata.exe or llama-server.exe running, GPU {1} MiB in use (at most {2})" -f $freeGiB, $usedMiB, $MaxIdleGpuMiB)
 }
 
-function Get-ServerProcs([int]$Root, [datetime]$Since, [string]$ExePath) {
-    # The server's processes alive in one Win32_Process snapshot: the root and its descendants by parent PID, created at or
-    # after $Since (a PID reused by an older process is not taken; a child whose parent died keeps its ParentProcessId, so it
-    # is still found), and every process running from the engine binary's path. Deepest first.
+function Get-ServerProcs([int]$Root, $RootStart, [string]$ExePath) {
+    # One Win32_Process snapshot, two lists. Tree: the server's processes by parent PID only, deepest first. The root seeds
+    # the walk only when it is alive with a CreationDate that matches $RootStart, the StartTime of the process Start-Process
+    # returned (within 1 ms: WMI keeps microseconds, the process object 100 ns), so a reused PID is not taken; a child is taken
+    # only when created at or after its parent, so the older processes of a reused parent PID are not taken either. A child
+    # whose parent has died is not found (its parent is not in the snapshot). Strays: the processes running from the engine
+    # binary's path that are not in the tree; this script never stops them, it reports them.
     $rows = @(Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId, ExecutablePath, CreationDate)
-    $parents = New-Object System.Collections.Generic.List[int]
-    $found = New-Object System.Collections.Generic.List[int]
-    $parents.Add($Root)
-    foreach ($r in $rows) { if ([int]$r.ProcessId -eq $Root -and $r.CreationDate -ge $Since) { $found.Add($Root) } }
-    for ($i = 0; $i -lt $parents.Count; $i++) {
+    $tree = New-Object System.Collections.Generic.List[int]
+    $born = New-Object System.Collections.Generic.List[datetime]
+    if ($null -ne $RootStart) {
         foreach ($r in $rows) {
-            $id = [int]$r.ProcessId
-            if ([int]$r.ParentProcessId -eq $parents[$i] -and -not $parents.Contains($id) -and $r.CreationDate -ge $Since) {
-                $parents.Add($id)
-                $found.Add($id)
+            if ([int]$r.ProcessId -eq $Root -and $null -ne $r.CreationDate -and
+                [math]::Abs(($r.CreationDate - [datetime]$RootStart).TotalMilliseconds) -le 1.0) {
+                $tree.Add($Root)
+                $born.Add($r.CreationDate)
+                break
             }
         }
     }
-    $ids = New-Object System.Collections.Generic.List[int]
-    for ($i = $found.Count - 1; $i -ge 0; $i--) { $ids.Add($found[$i]) }
+    for ($i = 0; $i -lt $tree.Count; $i++) {
+        foreach ($r in $rows) {
+            $id = [int]$r.ProcessId
+            if ([int]$r.ParentProcessId -eq $tree[$i] -and -not $tree.Contains($id) -and $null -ne $r.CreationDate -and
+                $r.CreationDate -ge $born[$i]) {
+                $tree.Add($id)
+                $born.Add($r.CreationDate)
+            }
+        }
+    }
+    $deep = New-Object System.Collections.Generic.List[int]
+    $deepBorn = New-Object System.Collections.Generic.List[datetime]
+    for ($i = $tree.Count - 1; $i -ge 0; $i--) { $deep.Add($tree[$i]); $deepBorn.Add($born[$i]) }
+    $strays = New-Object System.Collections.Generic.List[int]
     foreach ($r in $rows) {
         $id = [int]$r.ProcessId
         if ($r.ExecutablePath -and [string]::Equals([string]$r.ExecutablePath, $ExePath, [StringComparison]::OrdinalIgnoreCase) -and
-            -not $ids.Contains($id)) { $ids.Insert(0, $id) }
+            -not $tree.Contains($id)) { $strays.Add($id) }
     }
-    return , $ids.ToArray()
+    return [pscustomobject]@{ Tree = $deep.ToArray(); Born = $deepBorn.ToArray(); Strays = $strays.ToArray() }
 }
 
-function Stop-ServerTree([int]$Root, [datetime]$Since, [string]$ExePath) {
-    # Stops the server's processes (Get-ServerProcs), waits for each to exit, then takes the snapshot again (a process started
-    # meanwhile is caught) until a snapshot finds none. Throws when one is still alive. Returns the PIDs stopped.
+function Stop-ServerTree([int]$Root, $RootStart, [string]$ExePath) {
+    # Stops the server's process tree (Get-ServerProcs), waits for each to exit, then takes the snapshot again (a child started
+    # meanwhile is caught) until a snapshot finds none. Throws when one is still alive, or when a process runs from the engine
+    # binary's path outside the tree: it is reported by PID and not stopped (the next pre-flight refuses to start while it
+    # runs). Returns the PIDs stopped.
     $stopped = New-Object System.Collections.Generic.List[int]
     for ($pass = 1; $pass -le 5; $pass++) {
-        $ids = @(Get-ServerProcs $Root $Since $ExePath)
+        $snap = Get-ServerProcs $Root $RootStart $ExePath
+        $ids = @($snap.Tree)
         if ($ids.Count -eq 0) { break }
         $procs = @()
-        foreach ($id in $ids) {
+        for ($j = 0; $j -lt $ids.Count; $j++) {
+            $id = $ids[$j]
             $p = Get-Process -Id $id -ErrorAction SilentlyContinue
             if (-not $p) { continue }   # exited since the snapshot
+            # the PID must still be the process of the snapshot (same start time), not a process that reused it since
+            $same = $false
+            try { $same = [math]::Abs(($p.StartTime - $snap.Born[$j]).TotalMilliseconds) -le 1.0 } catch { $same = $false }
+            if (-not $same) { continue }
             $procs += $p
             if (-not $stopped.Contains($id)) { $stopped.Add($id) }
             try { $p.Kill() }
@@ -188,8 +224,12 @@ function Stop-ServerTree([int]$Root, [datetime]$Since, [string]$ExePath) {
             catch { Write-Warning "PID $($p.Id): wait failed: $($_.Exception.Message)" }
         }
     }
-    $left = @(Get-ServerProcs $Root $Since $ExePath)
-    if ($left.Count -gt 0) { throw "server processes still alive after the stop: PID $($left -join ','); stop them by hand before another launch" }
+    $left = Get-ServerProcs $Root $RootStart $ExePath
+    if ($left.Tree.Count -gt 0) { throw "server processes still alive after the stop: PID $($left.Tree -join ','); stop them by hand before another launch" }
+    if ($left.Strays.Count -gt 0) {
+        throw ("processes running from ${ExePath} outside the server's process tree, not stopped: PID $($left.Strays -join ','); " +
+               "check what they are and stop them by hand before another launch (stopped from the tree: PID $($stopped -join ','))")
+    }
     return , $stopped.ToArray()
 }
 
@@ -364,13 +404,20 @@ $SamplerBlock = {
 }
 
 # ---- inputs and output folder ------------------------------------------------------------------------------------------
+# A path parameter that holds a double quote is refused: the server's arguments are quoted for Start-Process, and a
+# double quote inside one would end the quoting and add arguments.
+$pathParams = [ordered]@{ Binary = $Binary; BuildDir = $BuildDir; Gguf = $Gguf; RankFile = $RankFile; OutDir = $OutDir
+                          Python = $Python; ServerScript = $ServerScript; Tokenizer = $Tokenizer; PromptsFile = $PromptsFile }
+foreach ($name in @($pathParams.Keys)) {
+    if ([string]$pathParams[$name] -match '"') { throw "-$name holds a double quote, which is refused: $($pathParams[$name])" }
+}
 Assert-File $Binary 'engine binary'
 Assert-File $Gguf 'GGUF'
 Assert-File $RankFile 'expert profile'
 Assert-File $ServerScript 'serve/server.py'
 if (-not (Test-Path -LiteralPath $BuildDir -PathType Container)) { throw "build folder not found: $BuildDir" }
 if ($Tokens -lt 1 -or $Launches -lt 1) { throw 'Tokens and Launches must be at least 1' }
-if ($WarmupTokens -lt $MinWarmupTokens) { throw "WarmupTokens must be at least $MinWarmupTokens (the automatic PCIe share's last update)" }
+if ($WarmupTokens -lt $MinWarmupTokens) { throw "WarmupTokens must be at least $MinWarmupTokens (PcieAuto's last update comes after 240 decode windows, and the first token comes from the prompt)" }
 if ((Test-Path -LiteralPath $OutDir) -and @(Get-ChildItem -LiteralPath $OutDir -Filter 'launch_*' -ErrorAction SilentlyContinue).Count -gt 0) {
     throw "$OutDir already holds launch folders; choose a new folder"
 }
@@ -388,6 +435,13 @@ $engineEnv = [ordered]@{ STRATA_Q36_STATS = '1' }
 foreach ($pair in ($ExtraEnv -split ';' | Where-Object { $_.Trim() -ne '' })) {
     if ($pair -notmatch '^\s*(STRATA_[A-Z0-9_]+)=(.*)$') { throw "ExtraEnv entry is not NAME=value with a STRATA_ name: $pair" }
     $engineEnv[$Matches[1]] = $Matches[2].Trim()
+}
+foreach ($key in @($engineEnv.Keys)) {
+    # the warm-up covers PcieAuto's three updates only: the step search moves the share every 32 decode tokens until its
+    # second reversal (6 to 8 windows or more from 0.80), so it may still be moving during the measured requests
+    if ($key -eq 'STRATA_Q36_PCIE_AUTO_STEP' -and $engineEnv[$key] -eq '1') {
+        Write-Warning ('STRATA_Q36_PCIE_AUTO_STEP=1: the warm-up of {0} tokens covers PcieAuto only; the step search may still be moving the PCIe share during the measured requests (the summary flags a share that moved)' -f $WarmupTokens)
+    }
 }
 $Prompts = @($Prompt)
 if ($PromptsFile -ne '') {
@@ -453,11 +507,15 @@ for ($n = 1; $n -le $Launches; $n++) {
 
     $srv = $null
     $sampler = $null
-    $since = (Get-Date).AddSeconds(-5)   # the processes of this launch are created after this (a little slack for the clock)
+    $srvStart = $null   # the StartTime of the started process: the stop's tree is rooted at it only while it matches
+    $launchError = $null
     try {
-        $srvArgs = @($ServerScript, '--engine', 'strata', '--config', $cfgPath, '--port', "$Port")
+        # each argument quoted by hand (Windows PowerShell 5.1 joins -ArgumentList with spaces and quotes nothing), one string
+        $srvArgs = (@($ServerScript, '--engine', 'strata', '--config', $cfgPath, '--port', "$Port") |
+                    ForEach-Object { ConvertTo-ProcessArg $_ }) -join ' '
         $srv = Start-Process -FilePath $Python -ArgumentList $srvArgs -WorkingDirectory $BuildDir -NoNewWindow -PassThru `
             -RedirectStandardOutput (Join-Path $dir 'server.out') -RedirectStandardError (Join-Path $dir 'server.err')
+        try { $srvStart = $srv.StartTime } catch { Write-Warning "launch ${n}: no start time for the server (PID $($srv.Id)): $($_.Exception.Message); the stop will find no tree" }
         Write-Host "server pid $($srv.Id)"
 
         $sampler = Start-Job -ScriptBlock $SamplerBlock -ArgumentList $srv.Id, $memLog, $SampleMs
@@ -477,7 +535,8 @@ for ($n = 1; $n -le $Launches; $n++) {
         }
         Write-Host 'ready'
 
-        # the throw-away warm-up: the automatic PCIe share makes its last update during it, not during the measured request
+        # the throw-away warm-up: the automatic PCIe share (PcieAuto) makes its last update during it, not during the measured
+        # request (the step search of STRATA_Q36_PCIE_AUTO_STEP=1 may still be moving: warned at the start)
         $w = Invoke-ChatStream $WarmupPrompt $WarmupTokens
         $share = Get-ShareAfter $engineLog 1
         # (named apart from response*.json and chunks*.tsv, which the summary reads as the measured request)
@@ -497,19 +556,21 @@ for ($n = 1; $n -le $Launches; $n++) {
         }
     }
     catch {
-        Write-Warning "launch ${n} failed: $($_.Exception.Message)"
+        # the full error record (message, position) and the script stack, kept for the finally's error too
+        $launchError = $_
+        Write-Warning ("launch ${n} failed: " + ($_ | Out-String) + $_.ScriptStackTrace)
         throw
     }
     finally {
-        # the server's processes, verified; then the sampler. A failed stop throws (it replaces an error of the launch, which
-        # the warning above has printed).
+        # the server's processes, verified; then the sampler. A failed stop throws, and its error carries the launch's error
+        # record and stack too when the launch had failed first (the finally's throw replaces the launch's).
         $stopError = $null
         if ($srv) {
             try {
-                $stopped = Stop-ServerTree $srv.Id $since $exePath
+                $stopped = Stop-ServerTree $srv.Id $srvStart $exePath
                 Write-Host "server stopped: PID $($stopped -join ',')"
                 Wait-GpuFree $stopped 60
-            } catch { $stopError = $_.Exception.Message }
+            } catch { $stopError = $_ }
         }
         if ($sampler) {
             Wait-Job -Job $sampler -Timeout 15 | Out-Null
@@ -517,7 +578,11 @@ for ($n = 1; $n -le $Launches; $n++) {
             Stop-Job -Job $sampler -ErrorAction SilentlyContinue
             Remove-Job -Job $sampler -Force -ErrorAction SilentlyContinue
         }
-        if ($stopError) { throw "launch ${n}: the server was not stopped cleanly: $stopError" }
+        if ($stopError) {
+            $msg = "launch ${n}: the server was not stopped cleanly: " + ($stopError | Out-String) + $stopError.ScriptStackTrace
+            if ($launchError) { $msg += "`nthe launch had failed first: " + ($launchError | Out-String) + $launchError.ScriptStackTrace }
+            throw $msg
+        }
     }
     if (-not (Select-String -LiteralPath $engineLog -Pattern 'stats: pool' -Quiet -ErrorAction SilentlyContinue)) {
         Write-Warning "launch ${n}: no stats line in $engineLog (the engine log is kept for reading)"
@@ -527,3 +592,5 @@ Write-HyperV $hyper 'after the last launch'
 
 # ---- summary -----------------------------------------------------------------------------------------------------------
 & $Python -I $summaryPy $OutDir | Tee-Object -FilePath (Join-Path $OutDir 'summary.txt')
+# a native command's exit code does not throw in Windows PowerShell 5.1
+if ($LASTEXITCODE -ne 0) { throw "partition_summary.py failed (exit $LASTEXITCODE); see $(Join-Path $OutDir 'summary.txt')" }
