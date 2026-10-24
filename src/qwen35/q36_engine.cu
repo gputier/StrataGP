@@ -1644,10 +1644,10 @@ struct Engine {
         return d;
     }
     // decode / verify rows: their routing is counted once the rows are kept (commit), so a verify window's rejected
-    // drafts never move the slots; a single session's slots follow the counts at every kRebalanceEvery-th position
+    // drafts never move the slots; a single session's slots follow the counts at every rebalance_every-th position
     // exactly (a window never steps over one), so plain and speculative decoding see the same slot tables at every
-    // position; the batch windows (run_rows) rebalance every kRebalanceEvery-th window instead, positions being per session
-    static constexpr int kRebalanceEvery = 32;
+    // position; the batch windows (run_rows) rebalance every rebalance_every-th window instead, positions being per session
+    int rebalance_every = strata::q36::kRebalanceEveryDefault;   // STRATA_Q36_REBALANCE_EVERY, read by init()
     bool rows_deferred = false;          // set while a decode step or a verify window runs
     std::vector<std::vector<int32_t>> row_ids;   // [main layer][row * top_k + k] of the last such call
     void count_rows(int n) {
@@ -1749,10 +1749,15 @@ struct Engine {
         if (!m->hybrid) return;
         count_rows(n);
         pcie_window();
-        if (pos % kRebalanceEvery == 0) {
-            CK(cudaStreamSynchronize(st));
-            rebalance(8);
-        }
+        if (pos % rebalance_every == 0) rebalance_cadence(true);
+    }
+    /// A rebalance of the decode cadence (after_rows, run_rows): at most 8 replacements.  The stats count its swaps, bytes and
+    /// host time (rb_ms), the stream synchronisation before it (`sync`) and its own included; the default path reads no clock.
+    void rebalance_cadence(bool sync) {
+        const auto r0 = stats_on ? Clock::now() : Clock::time_point();
+        if (sync) CK(cudaStreamSynchronize(st));
+        rebalance(8, stats_on);
+        if (stats_on) stat_acc.rb_ms += ms_since(r0);
     }
 
     void alloc_session(Sess& ss) const {
@@ -1810,6 +1815,9 @@ struct Engine {
         n_sess = std::max(1, std::min(n_sessions, kVerify));
         vision = vision_;
         tmax = std::max(tmax_, kVerify);
+        std::string every_err;   // STRATA_Q36_REBALANCE_EVERY: read once, here (the rebalance cadence and the draft bound follow it)
+        rebalance_every = strata::q36::rebalance_every_from_env(std::getenv("STRATA_Q36_REBALANCE_EVERY"), &every_err);
+        if (!every_err.empty()) std::fprintf(stderr, "strata-q36: %s\n", every_err.c_str());
         const auto& g = m->g;
         const size_t T = (size_t) tmax, N = (size_t) g.n_embd, Kp = (size_t) m->top_k, FF = (size_t) g.n_ff;
         const size_t C = (size_t) g.ssm_conv_channels;
@@ -3054,8 +3062,9 @@ struct Engine {
 
     /// The slots to the experts the routing used most: the replacements with the best gain over all layers (q36_rebalance.hpp),
     /// at most max_swaps of them, between forwards (the copies are on the engine's stream).  Every layer's counts decay
-    /// afterwards, those of the layers it did not touch too.  Returns the replacements made.
-    int rebalance(int max_swaps) {
+    /// afterwards, those of the layers it did not touch too.  Returns the replacements made.  `count`: the stats count its swaps
+    /// and bytes (the decode cadence's rebalances, rebalance_cadence; not the one after a prompt).
+    int rebalance(int max_swaps, bool count = false) {
         static const bool off = std::getenv("STRATA_Q36_FIXED_SLOTS") != nullptr;   // the slots as placed (tests)
         if (!m->hybrid || off || warming) return 0;
         std::vector<strata::q36::LayerCounts> views(hy.size());
@@ -3074,13 +3083,17 @@ struct Engine {
             });
             changed[(size_t) w.layer] = 1;
             ++hy_swaps;
+            if (count) stat_acc.rb_bytes += (long long) L.L.bytes;
         }
         for (size_t li = 0; li < hy.size(); ++li) {
-            if (changed[li])
+            if (changed[li]) {
                 CK(cudaMemcpyAsync(hy[li].slot_of_d, hy[li].slot_of.data(), (size_t) m->g.n_expert * 4,
                                    cudaMemcpyHostToDevice, st));
+                if (count) stat_acc.rb_bytes += (long long) m->g.n_expert * 4;
+            }
             for (double& v : hy[li].score) v *= strata::q36::kRebalanceDecay;
         }
+        if (count) stat_acc.rb_swaps += (long long) swaps.size();
         CK(cudaStreamSynchronize(st));   // slot_of's host copy is pageable: the upload is done before it changes
         return (int) swaps.size();
     }
@@ -3344,7 +3357,7 @@ struct Engine {
         if (m->hybrid) {
             count_rows(T);
             pcie_window();
-            if (++win_count % kRebalanceEvery == 0) rebalance(8);
+            if (++win_count % rebalance_every == 0) rebalance_cadence(false);
         }
     }
     /// One window for the next token of each of the rows' sessions (no proposals): the greedy picks in rows_pick.
@@ -3474,8 +3487,9 @@ struct Engine {
     }
     int hybrid_swaps_after_prompt = 2048;
     /// The prompt's routing moves the slots at once; the decode windows' rebalances add up in hy_swaps (the request's log line).
+    /// Its swaps, bytes and time stay out of the stats' rebalance counters, which count the decode cadence's only (issue #96).
     void rebalance_after_prompt() {
-        const int n = rebalance(hybrid_swaps_after_prompt);
+        const int n = rebalance(hybrid_swaps_after_prompt, false);
         if (!warming)
             std::fprintf(stderr, "strata-q36: rebalance after the prompt: %d slot replacements (%lld since the start)\n", n,
                          hy_swaps);
@@ -3496,7 +3510,7 @@ struct Engine {
                   const std::atomic<bool>* cancel = nullptr,
                   const std::function<int32_t(int, const int32_t*)>& sample_row = nullptr) {
         const int N = (int) m->g.n_embd;
-        if (main_hybrid) D = std::min<int>(D, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
+        if (main_hybrid) D = strata::q36::draft_depth_limit(pos, rebalance_every, D);
         const int T0 = (int) fix.size() + 1;   // the redo rows and the row of x
         CK(cudaStreamSynchronize(st));
         // rows of the first MTP call: (hmain row i, fix[i]) at positions pos - fix.size() + i, then (hlast, x) at pos
