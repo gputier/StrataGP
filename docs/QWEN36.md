@@ -210,27 +210,29 @@ Refusals at start (exit code 2, messages prefixed by `strata-q36:`):
 - `--ser` not given as `Kmin,t` with 1 <= Kmin <= 8 and 0 <= t <= 1: "--ser must be Kmin,t".
 - `--cache-prior` outside [0, 1]: "--cache-prior must be in [0, 1]".
 
-Environment variables. The q36 engine reads 18 of them: 17 `STRATA_Q36_*` and `STRATA_DMA_BATCH`. Unset means the default shown.
+Environment variables. The q36 engine reads 20 of them: 19 `STRATA_Q36_*` and `STRATA_DMA_BATCH`. Unset means the default shown.
 
-- `STRATA_Q36_BLAS_F32`: off. Set, the router product uses the hipBLAS / cuBLAS SGEMM instead of the native kernel (`q36_engine.cu:1933`, A/B check).
-- `STRATA_Q36_CHUNK=N`: forces the prompt chunk, from 256 to 4096 (`:4768`). Unset, `--chunk auto` picks it from the free VRAM (`:4721`).
-- `STRATA_Q36_DRAFT_VOCAB=N`: the MTP drafts pick among the first N token ids, used when `--draft-vocab` is absent (`:4835`). Unset, 0: the whole vocabulary (`:2548`).
-- `STRATA_Q36_FIXED_SLOTS=1`: freezes the expert slots as placed. The identity gate uses it (`:2942`).
-- `STRATA_Q36_KEEP_PACKED`: unset, the packed Q8_0 copies are freed when that gives more expert slots (`:3541`). Set, they are kept.
-- `STRATA_Q36_NO_EXT`: unset, a decode batch of up to 8 rows takes the router and the shared expert's gate in one product (`:2441`). Set, separate products.
-- `STRATA_Q36_NO_MMQ`: unset, the MMQ kernels are used when built (`:1749`). Set, they are not.
-- `STRATA_Q36_NO_MTP_CPU`: unset, the experts of the MTP block may go to the CPU pool (`:3519`, `:3570`). Set, they may not.
-- `STRATA_Q36_NO_PREFETCH`: unset, the experts of the next layer are prefetched (`:3771`). Set, no prefetch.
-- `STRATA_Q36_OLD_KERNELS`: unset, the fast decode kernels and the fast routing path are used (`:1971`). Set, the old kernels, and `--cache-prior` and `--ser` are refused.
-- `STRATA_Q36_ONE_TOKEN_CPU`: off. Set, the one-token AVX-512 CPU kernels are used. They ran slower than ggml-cpu on the Ornith box (comment at `:3716`, `native_expert_ff1024_test --bench`).
-- `STRATA_Q36_PLACE_DEBUG`: off. Set, prints the placement (`:4769`).
-- `STRATA_Q36_READ_WINDOWS=N`: default 1, from 0 to 64 (`:3967`). The decode windows run between two chunks of a prompt read.
-- `STRATA_Q36_STATS=1`: off. Prints one line per window, 48 steps then 96: the bytes each path reads and the host's wait on the doorbell (`src/qwen35/q36_stats.hpp:24`, `:1530`).
-- `STRATA_Q36_STREAM_ALL`: off. Set, the whole layer streams from host memory, the first version, PCIe-bound (`:2619`).
-- `STRATA_Q36_VERIFY`: off. Set, the decode kernels are compared with the old kernel's bits (`:2077`), on the device and with CUDA graphs on; its mismatch lines print at the end of each window (decode window, MTP step or prompt chunk), not at the comparison, so a fatal CUDA error inside a window loses them. This also disables the fused router path (`:2553`).
-- `STRATA_DMA_BATCH=N`: the grouping of PCIe copies, modes 0, 1 and 2 (`include/strata/core/dma_batch.hpp:32`). The q36 default is 1, one `cudaMemcpyBatchAsync` per group (`q36_engine.cu:2697`). 0 gives one copy each.
+- `STRATA_Q36_BLAS_F32`: off. Set, the router product uses the hipBLAS / cuBLAS SGEMM instead of the native kernel (`q36_engine.cu:2078`, A/B check).
+- `STRATA_Q36_CHUNK=N`: forces the prompt chunk, from 256 to 4096 (`:5004`). Unset, `--chunk auto` picks it from the free VRAM (`:4961`).
+- `STRATA_Q36_DRAFT_VOCAB=N`: the MTP drafts pick among the first N token ids, used when `--draft-vocab` is absent (`:5113`). Unset, 0: the whole vocabulary (`:2713`).
+- `STRATA_Q36_FIXED_SLOTS=1`: freezes the expert slots as placed. The identity gate uses it (`:3109`).
+- `STRATA_Q36_KEEP_PACKED`: unset, the packed Q8_0 copies are freed when that gives more expert slots (`:3723`). Set, they are kept.
+- `STRATA_Q36_NO_EXT`: unset, a decode batch of up to 8 rows takes the router and the shared expert's gate in one product (`:2605`). Set, separate products.
+- `STRATA_Q36_NO_MMQ`: unset, the MMQ kernels are used when built (`:1894`). Set, they are not.
+- `STRATA_Q36_NO_MTP_CPU`: unset, the experts of the MTP block may go to the CPU pool (`:3701`, `:3752`). Set, they may not.
+- `STRATA_Q36_NO_PREFETCH`: unset, the experts of the next layer are prefetched (`:3956`). Set, no prefetch.
+- `STRATA_Q36_OLD_KERNELS`: unset, the fast decode kernels and the fast routing path are used (`:2116`). Set, the old kernels, and `--cache-prior` and `--ser` are refused.
+- `STRATA_Q36_ONE_TOKEN_CPU`: off. Set, the one-token AVX-512 CPU kernels are used. They ran slower than ggml-cpu on the Ornith box (comment at `:3898`, `native_expert_ff1024_test --bench`).
+- `STRATA_Q36_PCIE_AUTO_STEP=1`: with the automatic PCIe share only (no `--pcie-frac`), the share moves by 0.05 every 32 decode tokens against the measured wall time per decode token, between 0.30 and 0.90. A change under 3 percent does not move it, and the search stops on the best share seen after two reversals. PcieAuto's refinement is off then. Unset, the default behaviour is unchanged (`q36_pcie.hpp:118` to `:126`, `PcieStepSearch` at `q36_pcie.hpp:166`, `pcie_step_window` at `q36_engine.cu:1764`, enabled at `q36_engine.cu:3980`).
+- `STRATA_Q36_PLACE_DEBUG`: off. Set, prints the placement (`:5005`).
+- `STRATA_Q36_READ_WINDOWS=N`: default 1, from 0 to 64 (`:4156`). The decode windows run between two chunks of a prompt read.
+- `STRATA_Q36_REBALANCE_EVERY=N`: the positions between two rebalances of the hybrid expert slots, decimal digits only, 1 to 1024. Unset, 32. Any other value prints a line and uses 32. The MTP draft depth stops short of the next rebalance position (`rebalance_every_from_env` at `q36_rebalance.hpp:29`, `draft_depth_limit` at `q36_rebalance.hpp:42`, read in `q36_engine.cu:1860`, applied at `q36_engine.cu:3556`).
+- `STRATA_Q36_STATS=1`: off. Prints one line per window, 48 steps then 96: the bytes each path reads and the host's wait on the doorbell (`src/qwen35/q36_stats.hpp:24`, `:1727`). The line also reports the decode-cadence rebalances: slot swaps, MB copied and host time (`rb_swaps`, `rb_bytes`, `rb_ms` in `q36_stats.hpp:109` to `:111`), not the rebalance after a prompt.
+- `STRATA_Q36_STREAM_ALL`: off. Set, the whole layer streams from host memory, the first version, PCIe-bound (`:2783`).
+- `STRATA_Q36_VERIFY`: off. Set, the decode kernels are compared with the old kernel's bits (`:2129`), on the device and with CUDA graphs on; its mismatch lines print at the end of each window (decode window, MTP step or prompt chunk), not at the comparison, so a fatal CUDA error inside a window loses them. This also disables the fused router path (`:2605`).
+- `STRATA_DMA_BATCH=N`: the grouping of PCIe copies, modes 0, 1 and 2 (`include/strata/core/dma_batch.hpp:32`). The q36 default is 1, one `cudaMemcpyBatchAsync` per group (`q36_engine.cu:102`). 0 gives one copy each.
 
-`STRATA_Q36_CPU_POOL` is a compile-time macro (`q36_engine.cu:46`), not an environment variable.
+`STRATA_Q36_CPU_POOL` is a compile-time macro (`q36_engine.cu:47`), not an environment variable.
 
 Measured on 22 and 23/10/2026, on an RTX 5090 32 GB with 128 GB of RAM, three runner VMs running. Commit ec3d4b63 is compared with 7bf040a5, the start of the work, and with 9ce40dca. The working set is capped at 24 GB per process, unless noted.
 
@@ -264,7 +266,7 @@ MTP is off in the configuration. With `STRATA_Q36_ONE_TOKEN_CPU=1`, its output i
 
 ## Non-finite logits
 
-A row of logits with no finite maximum, or a NaN, draws no token. The engine prints `ERR the logits hold no finite maximum or a NaN: no token drawn` (`src/qwen35/q36_engine.cu:726`, printed at `:4531` and `:4624`) and prints no DONE line for that request. In the batch path the slot ends with `BDONE <slot> <tokens> error <ms>` (`q36_engine.cu:4090`), and the server does not reuse that slot's state (`serve/server.py:1782`).
+A row of logits with no finite maximum, or a NaN, draws no token. The engine prints `ERR the logits hold no finite maximum or a NaN: no token drawn` (`src/qwen35/q36_engine.cu:727`, printed at `:4603` and `:4696`) and prints no DONE line for that request. In the batch path the slot ends with `BDONE <slot> <tokens> error <ms>` (`q36_engine.cu:4161`), and the server does not reuse that slot's state (`serve/server.py:1782`).
 
 The server turns the ERR line into HTTP 400 when it comes before the first token, on the non-streaming endpoints of `/v1/chat/completions`, `/v1/messages` and `/v1/responses` (`serve/server.py:5665`, `:6070`). A streaming request has already sent its 200 status and headers, so it gets no 400. It receives an error event, then the stream ends: `data: {"error": {"type": "server_error", ...}}` followed by `data: [DONE]` on chat completions (`serve/server.py:6001`), a `response.failed` event on `/v1/responses` (`:6102`), and an `event: error` on `/v1/messages` (`:6221`).
 

@@ -111,6 +111,84 @@ inline void pcie_plan(const int32_t* ids, int n_ent, int top_k, const int32_t* p
     plan[kPlanStart + m] = entries;
 }
 
+// STRATA_Q36_PCIE_AUTO_STEP=1 (automatic share only): the share moves by one step every kPcieStepPositions decode tokens,
+// against the wall time per decode token, instead of PcieAuto's refinement.  The rule works in 256ths, the unit the engine
+// stores the share in (pcie_num), so a step and a bound compare what the engine really runs.  The bounds, the margin and the
+// number of reversals are choices of the search; none is fitted to a machine's measure.
+inline constexpr double kPcieStep = 0.05;            // the share's step
+inline constexpr double kPcieStepMin = 0.30;         // the lowest share the step may set
+inline constexpr double kPcieStepMax = 0.90;         // the highest share the step may set
+inline constexpr int kPcieStepNum = 13;              // kPcieStep in 256ths (12.8 rounded)
+inline constexpr int kPcieStepNumMin = 77;           // kPcieStepMin in 256ths (76.8 rounded up: the lowest 256th in range)
+inline constexpr int kPcieStepNumMax = 230;          // kPcieStepMax in 256ths (230.4 rounded down: the highest 256th in range)
+inline constexpr int kPcieStepPositions = 32;        // decode tokens between two steps
+inline constexpr double kPcieStepMargin = 0.03;      // a window is slower or faster than the one before only past 3 %
+inline constexpr int kPcieStepTurns = 2;             // reversals after which the search stops on the best share seen
+static_assert(kPcieStepNum * 2 - 1 <= kPcieStep * 512 && kPcieStep * 512 < kPcieStepNum * 2 + 1, "kPcieStepNum is kPcieStep rounded");
+static_assert(kPcieStepNumMin >= kPcieStepMin * 256 && kPcieStepNumMin - 1 < kPcieStepMin * 256, "the lowest 256th in range");
+static_assert(kPcieStepNumMax <= kPcieStepMax * 256 && kPcieStepNumMax + 1 > kPcieStepMax * 256, "the highest 256th in range");
+
+/// STRATA_Q36_PCIE_AUTO_STEP: "1" is on, anything else (or no variable) is off.
+inline bool pcie_step_enabled(const char* v) { return v != nullptr && v[0] == '1' && v[1] == '\0'; }
+
+struct PcieStep {
+    int num = 0;          // the new share in 256ths (what the engine stores in pcie_num)
+    int dir = -1;         // the direction now: -1 lowers the share, +1 raises it
+    double share() const { return num / 256.0; }
+};
+
+/// The next share under the step rule.  `cur`: the share now, in 256ths.  `t_prev`, `t_cur`: the wall time per decode token
+/// over the window before the last step and over the window since it (t_prev < 0: no window before, the first step).
+/// `dir_last`: the direction of the last step.  The first step moves in dir_last.  Afterwards a time that rose by more than
+/// kPcieStepMargin (relative) turns the direction, one that fell by more than that keeps it, and anything in between (a tie,
+/// or a time that is not a number) leaves the share where it is.  A move is one kPcieStepNum, kept in [kPcieStepNumMin,
+/// kPcieStepNumMax]; a move the bound blocks turns the direction, so the search moves back inside the range.
+inline PcieStep pcie_auto_step(int cur, double t_prev, double t_cur, int dir_last) {
+    const auto clamp_num = [](int n) { return std::min(kPcieStepNumMax, std::max(kPcieStepNumMin, n)); };
+    PcieStep out;
+    out.num = cur;
+    out.dir = dir_last < 0 ? -1 : 1;
+    if (t_prev >= 0.0) {
+        if (t_cur > t_prev * (1.0 + kPcieStepMargin)) out.dir = -out.dir;
+        else if (!(t_cur < t_prev * (1.0 - kPcieStepMargin))) return out;   // within the margin: no move
+    }
+    out.num = clamp_num(cur + out.dir * kPcieStepNum);
+    if (out.num == cur) {
+        out.dir = -out.dir;
+        out.num = clamp_num(cur + out.dir * kPcieStepNum);
+    }
+    return out;
+}
+
+/// The search the engine runs, one call per window of kPcieStepPositions decode tokens: pcie_auto_step until the direction has
+/// turned kPcieStepTurns times (a slower window or a bound), then the best share seen (the window with the lowest time per
+/// token) for good.  A window whose time is not a finite positive number changes nothing.
+struct PcieStepSearch {
+    int dir = -1;              // the last step's direction (the first step lowers the share)
+    double t_prev = -1.0;      // the time per token of the window before the last move, ms (< 0: none yet)
+    int turns = 0;             // reversals so far
+    bool done = false;         // the search has stopped: the share stays
+    int best_num = -1;         // the share of the fastest window seen, in 256ths (< 0: none yet)
+    double best_ms = 0.0;      // that window's time per token, ms
+    /// The window just ended ran at share `cur` (256ths) and took `t_ms` per decode token: the share for the next window.
+    int next(int cur, double t_ms) {
+        if (done || !(t_ms > 0.0 && t_ms < 1e300)) return cur;
+        if (best_num < 0 || t_ms < best_ms) {
+            best_num = cur;
+            best_ms = t_ms;
+        }
+        const PcieStep s = pcie_auto_step(cur, t_prev, t_ms, dir);
+        if (s.num == cur) return cur;   // a tie: the share and the window before stay
+        if (s.dir != (dir < 0 ? -1 : 1) && ++turns >= kPcieStepTurns) {
+            done = true;
+            return best_num;
+        }
+        dir = s.dir;
+        t_prev = t_ms;
+        return s.num;
+    }
+};
+
 /// The time the copy streams are busy: the length of the union of the copies' [begin, end] intervals (ms), so two streams
 /// copying at once count once.  Sorts `iv`.
 inline double interval_union_ms(std::vector<std::pair<double, double>>& iv) {
