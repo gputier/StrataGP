@@ -161,27 +161,39 @@ inline PcieStep pcie_auto_step(int cur, double t_prev, double t_cur, int dir_las
 }
 
 /// The search the engine runs, one call per window of kPcieStepPositions decode tokens: pcie_auto_step until the direction has
-/// turned kPcieStepTurns times (a slower window or a bound), then the best share seen (the window with the lowest time per
-/// token) for good.  A window whose time is not a finite positive number changes nothing.
+/// turned kPcieStepTurns times (a slower window or a bound), then the best share seen for good: the share whose windows have
+/// the lowest mean time per token (every window measured at that share counts, so one fast window does not decide it; on
+/// equal means the lower share wins).  A window whose time is not a finite positive number changes nothing.
 struct PcieStepSearch {
     int dir = -1;              // the last step's direction (the first step lowers the share)
     double t_prev = -1.0;      // the time per token of the window before the last move, ms (< 0: none yet)
     int turns = 0;             // reversals so far
     bool done = false;         // the search has stopped: the share stays
-    int best_num = -1;         // the share of the fastest window seen, in 256ths (< 0: none yet)
-    double best_ms = 0.0;      // that window's time per token, ms
+    int best_num = -1;         // the share with the lowest mean time per token so far, in 256ths (< 0: none yet)
+    double best_ms = 0.0;      // that share's mean time per token over its windows, ms
+    double sum_ms[257] = {};   // per share in 256ths (0 to 256, what pcie_num holds): the sum of its windows' times per token, ms
+    int windows[257] = {};     // per share in 256ths: the windows measured at it
     /// The window just ended ran at share `cur` (256ths) and took `t_ms` per decode token: the share for the next window.
     int next(int cur, double t_ms) {
         if (done || !(t_ms > 0.0 && t_ms < 1e300)) return cur;
-        if (best_num < 0 || t_ms < best_ms) {
-            best_num = cur;
-            best_ms = t_ms;
+        if (cur >= 0 && cur <= 256) {
+            sum_ms[cur] += t_ms;
+            ++windows[cur];
+            best_num = -1;
+            for (int n = 0; n <= 256; ++n) {
+                if (windows[n] == 0) continue;
+                const double mean = sum_ms[n] / windows[n];
+                if (best_num < 0 || mean < best_ms) {
+                    best_num = n;
+                    best_ms = mean;
+                }
+            }
         }
         const PcieStep s = pcie_auto_step(cur, t_prev, t_ms, dir);
         if (s.num == cur) return cur;   // a tie: the share and the window before stay
         if (s.dir != (dir < 0 ? -1 : 1) && ++turns >= kPcieStepTurns) {
             done = true;
-            return best_num;
+            return best_num >= 0 ? best_num : cur;
         }
         dir = s.dir;
         t_prev = t_ms;

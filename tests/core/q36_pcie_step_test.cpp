@@ -1,6 +1,6 @@
 // tests/core/q36_pcie_step_test.cpp - STRATA_Q36_PCIE_AUTO_STEP, the step rule of strata-q36's automatic PCIe share
 // (src/qwen35/q36_pcie.hpp), no GPU: the switch's value, one step's direction in the 256ths the engine stores, its bounds,
-// its margin, the stop after two reversals, and the search on synthetic times per token whose minimum lies at a share of 0.55.
+// its margin, the stop after two reversals on the share of lowest mean time per token, and the search on synthetic times per token whose minimum lies at a share of 0.55.
 #include "check.hpp"
 #include "q36_pcie.hpp"
 
@@ -111,16 +111,16 @@ int main() {
         const int d = st.next(c, 9.5);
         check(a == 141 && b == 128 && c == 141 && d == 154 && st.turns == 1 && !st.done, "the path down, the first turn, back up");
         const int e = st.next(d, 10.0);
-        check(st.done && st.turns == 2 && e == 141, "the second turn stops the search on the best share seen (141, 9.0 ms)");
+        check(st.done && st.turns == 2 && e == 141, "the second turn stops the search on the best share seen (141, mean of 9.0 and 9.5 ms)");
         check(st.next(e, 1.0) == 141 && st.next(141, 50.0) == 141, "once stopped, no window moves the share");
     }
     {
         // the stop returns the best share seen, not the step pcie_auto_step would take (154 here, the best is 141):
         //   next(154, 10.0): best 154 @ 10.0; first step down -> 141 (dir -1), t_prev 10.0
-        //   next(141,  9.0): best 141 @ 9.0; 9.0 < 10.0 * 0.97 = 9.7, keep down -> 128, t_prev 9.0
+        //   next(141,  9.0): best 141 @ mean 9.0; 9.0 < 10.0 * 0.97 = 9.7, keep down -> 128, t_prev 9.0
         //   next(128, 10.0): 10.0 > 9.0 * 1.03 = 9.27, turn 1, up -> 141, t_prev 10.0
-        //   next(141,  9.5): 9.5 < 10.0 * 0.97 = 9.7, keep up -> 154, t_prev 9.5
-        //   next(154,  9.1): 9.1 < 9.5 * 0.97 = 9.215, keep up -> 167, t_prev 9.1 (9.1 > 9.0: best stays 141)
+        //   next(141,  9.5): 9.5 < 10.0 * 0.97 = 9.7, keep up -> 154, t_prev 9.5 (141 means 9.25)
+        //   next(154,  9.1): 9.1 < 9.5 * 0.97 = 9.215, keep up -> 167, t_prev 9.1 (154 now means 9.55 > 9.25 at 141: best stays 141)
         //   next(167, 10.0): 10.0 > 9.1 * 1.03 = 9.373, turn 2: pcie_auto_step says 154 (dir -1), the search stops on 141
         PcieStepSearch st;
         const int a = st.next(154, 10.0);
@@ -132,7 +132,7 @@ int main() {
               "down to 128, one turn, up past the best share (141) to 167");
         check(same(pcie_auto_step(167, 9.1, 10.0, 1), 154, -1), "at the stopping window the step alone would go to 154");
         const int f = st.next(e, 10.0);
-        check(st.done && st.turns == 2 && f == 141, "the second turn stops on the best share seen (141, 9.0 ms), not on 154");
+        check(st.done && st.turns == 2 && f == 141, "the second turn stops on the best share seen (141, mean 9.25 ms), not on 154");
         check(st.next(f, 1.0) == 141 && st.next(f, 50.0) == 141, "once stopped, the share stays 141");
     }
     {
@@ -142,6 +142,52 @@ int main() {
         const int b = st.next(a, 10.1);
         check(a == 141 && b == 141 && st.t_prev == 10.0 && st.turns == 0, "a tie (1 %) holds 141 and keeps 10.0 as the window before");
         check(st.next(b, 9.0) == 128, "a later window 10 % faster than that one moves on down");
+    }
+    {
+        // the best share is the one of lowest mean over its windows, not the one of the single fastest window:
+        //   next(154, 10.0): first step down -> 141, t_prev 10.0
+        //   next(141,  8.0): 8.0 < 10.0 * 0.97 = 9.7, keep down -> 128, t_prev 8.0
+        //   next(128,  9.0): 9.0 > 8.0 * 1.03 = 8.24, turn 1, up -> 141, t_prev 9.0 (best so far 141 @ 8.0)
+        //   next(141, 11.0): 11.0 > 9.0 * 1.03 = 9.27, turn 2: the search stops
+        // means then: 154 10.0, 141 (8.0 + 11.0) / 2 = 9.5, 128 9.0: the search stops on 128, the fastest window (8.0) was at 141
+        PcieStepSearch st;
+        const int a = st.next(154, 10.0);
+        const int b = st.next(a, 8.0);
+        const int c = st.next(b, 9.0);
+        check(a == 141 && b == 128 && c == 141 && st.turns == 1 && !st.done && st.best_num == 141 && st.best_ms == 8.0,
+              "one fast window at 141 (8.0 ms) makes it the best share while it is the only window there");
+        const int d = st.next(c, 11.0);
+        check(st.done && st.turns == 2 && d == 128 && st.best_num == 128 && std::fabs(st.best_ms - 9.0) < 1e-12,
+              "a second, slow window at 141 (mean 9.5 ms) hands the stop to 128 (9.0 ms), not to the fastest window's 141");
+    }
+    {
+        // a tie's window counts in its share's mean, and the mean is not the share's last window:
+        //   next(154, 10.0): first step down -> 141, t_prev 10.0
+        //   next(141,  8.8): 8.8 < 9.7, keep down -> 128, t_prev 8.8
+        //   next(128,  9.6): 9.6 > 8.8 * 1.03 = 9.064, turn 1, up -> 141, t_prev 9.6
+        //   next(141,  9.4): within 3 % of 9.6 (9.312 to 9.888), a tie: 141 holds
+        //   next(141, 10.5): 10.5 > 9.888, turn 2: the search stops
+        // means: 154 10.0, 141 (8.8 + 9.4 + 10.5) / 3 = 9.567, 128 9.6: 141; without the tie's window 141 would mean 9.65
+        // (128 then), and on the last window per share 141 (10.5) would lose to 128 (9.6)
+        PcieStepSearch st;
+        const int a = st.next(154, 10.0);
+        const int b = st.next(a, 8.8);
+        const int c = st.next(b, 9.6);
+        const int d = st.next(c, 9.4);
+        check(a == 141 && b == 128 && c == 141 && d == 141 && st.turns == 1 && !st.done, "down to 128, one turn, a tie at 141");
+        const int e = st.next(d, 10.5);
+        check(st.done && st.turns == 2 && e == 141 && st.windows[141] == 3 && std::fabs(st.best_ms - 28.7 / 3.0) < 1e-12,
+              "the stop takes 141, the mean of its three windows (9.567 ms) under 128's 9.6 ms");
+    }
+    {
+        // equal means: next(154, 10.0) -> 141, next(141, 9.0) -> 128 (9.0 < 9.7), next(128, 9.0) a tie, 128 holds; 141 and
+        // 128 both mean 9.0 ms, the lower share is the best
+        PcieStepSearch st;
+        const int a = st.next(154, 10.0);
+        const int b = st.next(a, 9.0);
+        const int c = st.next(b, 9.0);
+        check(a == 141 && b == 128 && c == 128 && st.best_num == 128 && st.best_ms == 9.0,
+              "two shares with the same mean time per token: the lower share (128) is the best");
     }
     {
         // a flat basin: every window within the margin of the first, so after the first step the share never moves

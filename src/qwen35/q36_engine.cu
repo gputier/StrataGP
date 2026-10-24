@@ -1784,8 +1784,13 @@ struct Engine {
     }
     /// STRATA_Q36_PCIE_AUTO_STEP: the next decode step opens a new interval instead of closing one, so the time since the
     /// last decode step (a prompt chunk, another session's prefill, the rebalance after a prompt, a new request, the warm-up)
-    /// is no decode token's.  The window's tokens and time so far are kept: both left the same steps out.
-    void pcie_step_break() { step_open = false; }
+    /// is no decode token's.  The window's tokens and time so far are dropped too, so a window never spans two prompts or two
+    /// requests (the content alone moves the time per token by more than the step's margin).
+    void pcie_step_break() {
+        step_open = false;
+        step_ms = 0.0;
+        step_tokens = 0;
+    }
     void after_rows(int n) {   // a decode step / verify window kept n rows: count them, rebalance at the boundary
         if (!m->hybrid) return;
         count_rows(n);
@@ -3636,9 +3641,7 @@ struct Engine {
         }
         CK(cudaStreamSynchronize(st));
         warming = false;
-        pcie_step_break();   // the warm-up's steps are not the decode's (the PCIe step)
-        step_ms = 0.0;
-        step_tokens = 0;
+        pcie_step_break();   // the warm-up's steps are not the decode's (the PCIe step; the break also empties the window)
         for (Hy& H : hy) {
             std::fill(H.score.begin(), H.score.end(), 0.0);
             std::fill(H.heat.begin(), H.heat.end(), 0.0);
@@ -3942,6 +3945,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     E.pool = std::make_unique<C::ExpertPool>(strata::q36::pool_workers(threads, (int) C::detect_cpu_topology(true).worker_cores.size()));
     if (pcie_frac == 0.0) {
         std::fprintf(stderr, "strata-q36: PCIe share off (--pcie-frac 0)\n");
+        if (std::getenv("STRATA_Q36_PCIE_AUTO_STEP") != nullptr)
+            std::fprintf(stderr, "strata-q36: STRATA_Q36_PCIE_AUTO_STEP ignored (--pcie-frac given or probe failed)\n");
     } else if (pcie_bytes > 0 && !pinned) {
         std::fprintf(stderr, "strata-q36: the PCIe share is off: the experts are in pageable host memory\n");
     } else if (pcie_bytes > 0) {
@@ -3996,6 +4001,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         else
             std::fprintf(stderr, "strata-q36: PCIe probe failed -> PCIe share %.2f of the missed experts (--pcie-frac N fixes it, "
                          "0 turns it off)\n", frac);
+        // the step search runs only on the automatic share of a probed link (the branch above): with --pcie-frac or a failed
+        // probe the variable does nothing, and the log says so
+        if ((pcie_frac >= 0.0 || !(link_gbps > 0.0)) && std::getenv("STRATA_Q36_PCIE_AUTO_STEP") != nullptr)
+            std::fprintf(stderr, "strata-q36: STRATA_Q36_PCIE_AUTO_STEP ignored (--pcie-frac given or probe failed)\n");
     }
     CK(cudaDeviceSynchronize());
     if (mtp_only)

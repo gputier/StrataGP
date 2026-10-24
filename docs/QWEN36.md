@@ -210,7 +210,7 @@ Refusals at start (exit code 2, messages prefixed by `strata-q36:`):
 - `--ser` not given as `Kmin,t` with 1 <= Kmin <= 8 and 0 <= t <= 1: "--ser must be Kmin,t".
 - `--cache-prior` outside [0, 1]: "--cache-prior must be in [0, 1]".
 
-Environment variables. The q36 engine reads 20 of them: 19 `STRATA_Q36_*` and `STRATA_DMA_BATCH`. Unset means the default shown.
+Environment variables. The q36 engine reads 19 of its own: 18 `STRATA_Q36_*` and `STRATA_DMA_BATCH`. It also reads `STRATA_BATCH_MTP`, `STRATA_MMQ_KQ` and `STRATA_Q8_PACKED`, which other engines share (on Windows it sets the last two to 1 when unset). Unset means the default shown.
 
 - `STRATA_Q36_BLAS_F32`: off. Set, the router product uses the hipBLAS / cuBLAS SGEMM instead of the native kernel (`q36_engine.cu:2078`, A/B check).
 - `STRATA_Q36_CHUNK=N`: forces the prompt chunk, from 256 to 4096 (`:5004`). Unset, `--chunk auto` picks it from the free VRAM (`:4961`).
