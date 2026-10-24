@@ -44,6 +44,7 @@
 #include "q36_stats.hpp"
 #include "q36_threads.hpp"
 #if defined(STRATA_Q36_CPU_POOL)
+#include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #endif
@@ -1550,6 +1551,7 @@ struct Engine {
 #if defined(STRATA_Q36_CPU_POOL)
     std::unique_ptr<strata::kernels::cpu::ExpertPool> pool;
     std::vector<strata::kernels::cpu::ExpertJobMulti> jobs;
+    std::vector<strata::kernels::cpu::ActQ> actq;   // per token: its ActQ, the Q2_0 gate/up kernels' activation (the pool reads it)
 #endif
     float *h_h = nullptr, *cpu_out = nullptr, *ecpu = nullptr;
     int32_t *h_ids = nullptr, *h_miss = nullptr, *d_miss = nullptr, *h_cnt = nullptr;
@@ -2909,6 +2911,7 @@ struct Engine {
             wire_pending.push_back(ws);
         }
         int n_pcie_ent = 0;
+        const bool q2 = C::q2_native_kernels(H.fmt.gu_type);   // the Q2_0 gate/up kernels read an ActQ, not nact
         for (int e = 0; e < n_ent; ++e) {
             const int x = h_ids[e];
             if (!defer && strata::q36::first_of_row(h_ids, e, Kp)) H.count((size_t) x, 1.0);
@@ -2922,6 +2925,7 @@ struct Engine {
             const int t = e / Kp;
             if (!quantized[(size_t) t]) {
                 C::native_quant_act(H.fmt, h_h + (size_t) t * N, acts + (size_t) t * C::kNativeActBytes);
+                if (q2) C::act_quant_any(h_h + (size_t) t * N, N, actq[(size_t) t]);
                 quantized[(size_t) t] = 1;
             }
             auto it = open.find(x);
@@ -2933,6 +2937,7 @@ struct Engine {
             }
             C::ExpertJobMulti& j = jobs[it->second];
             j.nact[j.nt] = acts + (size_t) t * C::kNativeActBytes;
+            if (q2) j.act[j.nt] = &actq[(size_t) t];
             j.out[j.nt] = cpu_out + (size_t) e * N;
             ++j.nt;
         }
@@ -3859,6 +3864,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     CK(cudaMalloc(&E.ecpu, T * Kp * N * 4));
     CK(cudaMalloc(&E.d_miss, T * Kp * 4));
     E.acts = (uint8_t*) std::malloc(T * C::kNativeActBytes + 64);
+#if defined(STRATA_Q36_CPU_POOL)
+    E.actq.resize((size_t) T);
+#endif
     CK(cudaEventCreateWithFlags(&E.ev_route, cudaEventDisableTiming));
     if (staging) {
         CK(cudaStreamCreateWithFlags(&E.cst, cudaStreamNonBlocking));

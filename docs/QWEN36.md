@@ -199,6 +199,7 @@ Options that change the output (off by default):
 
 - `--cache-prior L` (0 to 1, 0 is off) biases the logits of resident experts, with the Delta_avg version of arXiv 2412.00099. Measured: L 0.02 gives KL 0.0707 at 23.1 and 29.4 tokens/s; L 0.05 gives KL 0.1453 at 30.2 and 35.4; L 0.1 gives KL 0.1893 at 32.5 and 44.2. No value falls under the bar of 0.061. The earlier version of this option reached 75 to 77 tokens/s at L 0.25 and 0.5, with KL 0.64 and 0.91, and altered the text.
 - `--ser Kmin,t` keeps a lower-ranked pick only when its probability is above t times the top probability. `--ser 7,0.4` gives KL 0.086 and `--ser 6,0.4` gives KL 0.168. The speed gain is within run-to-run noise.
+- `--kv q4` (set by the Windows launcher) stores the KV cache in 4 bits. Measured during gate T7 on the .99, branch `feat/ornith-122b` at `e82d1fc3`, fp32 against q4 on the same model and the same prompts. On 10 short prompts of 33 steps, top-1 agreement is 93.3 % (308/330) and the mean KL is 0.079 (0.013 to 0.361). On a prompt of 20,914 tokens, agreement is 30/32 and KL 0.093. On a prompt of 65,760 tokens, agreement is 31/32 and KL 0.073. The engine against llama.cpp gives KL 0.041, so q4 adds about 0.04, with no growth in KL as the context gets longer. The error comes from the prompt pass in q4: on the 20,914-token prompt, the output already diverges at step 0. The gap was accepted on 23 October 2026. The fp32 cache is unchanged.
 
 Refusals at start (exit code 2, messages prefixed by `strata-q36:`):
 
