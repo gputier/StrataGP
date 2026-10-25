@@ -188,6 +188,13 @@ class ParseEngineLog(unittest.TestCase):
         self.assertAlmostEqual(launch.rb_slot_kb, 287.7)
         self.assertAlmostEqual(launch.rb_ms, 37.1)
 
+    def test_unknown_rebalance_format_is_reported(self):
+        launch = ps.Launch("x")
+        broken = REB_SPLIT.replace(", 37.1 ms of host time", "")
+        ps.parse_engine_log(ENGINE_LOG.replace(REB_OLD, broken), launch)
+        self.assertIsNone(launch.rb_swaps)
+        self.assertEqual(launch.problems, ["the decode rebalances of the stats line are in an unknown format: not read"])
+
     def test_old_stats_line_without_rebalances_still_parses(self):
         launch = ps.Launch("x")
         ps.parse_engine_log(ENGINE_LOG, launch)

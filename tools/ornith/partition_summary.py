@@ -297,6 +297,8 @@ def parse_engine_log(text: str, launch: Launch) -> None:
         if g[24] is not None:
             launch.rb_slot_kb = float(g[24])
         launch.rb_ms = float(g[25])
+    elif text.startswith("; decode rebalances:", stats.end()):
+        launch.problems.append("the decode rebalances of the stats line are in an unknown format: not read")
     if int(gen.group(7)) != launch.tokens:
         launch.problems.append(f"token counts differ: {gen.group(7)} generated, {launch.tokens} in the stats line: not measured")
     else:
