@@ -5,6 +5,7 @@
 #pragma once
 
 #include "q36_delta.hpp"
+#include "q36_rules.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 
@@ -383,10 +384,11 @@ __global__ void __launch_bounds__(256) k_route_group(const float* __restrict__ l
         for (int i = 0; i < V; ++i) maximum = max(maximum, values[i]);
         maximum = wmax(maximum);
         if constexpr (OPT) {
-            const float bias = (HY && cache_prior > 0.0f) ? cache_prior * row_delta[tk] : 0.0f;
+            // row_delta is read only where the bias is used, as before: it may be null without HY or cache-prior
+            const float delta = (HY && cache_prior > 0.0f) ? row_delta[tk] : 0.0f;
 #pragma unroll
             for (int i = 0; i < V; ++i) {
-                key[i] = values[i] + ((HY && slot_of[lane + i * 32] >= 0) ? bias : 0.0f);
+                key[i] = values[i] + strata::q36::cache_prior_bias(HY, HY && slot_of[lane + i * 32] >= 0, cache_prior, delta);
                 if (__isnanf(key[i])) key[i] = -FLT_MAX;
             }
         }
@@ -423,7 +425,7 @@ __global__ void __launch_bounds__(256) k_route_group(const float* __restrict__ l
                 // the pick's probability to every lane; the top probability is 1 / sum (the max logit's exp is 1)
                 const float p = __shfl_sync(0xffffffffu, values[expert / 32], expert & 31, 32);
                 if (rank == 0) first = expert;
-                const bool keep = rank < ser_kmin || p > ser_t * reciprocal;
+                const bool keep = strata::q36::ser_keep(rank, ser_kmin, p, ser_t, reciprocal);
                 best = keep ? p : 0.0f;
                 if (!keep) out_id = first;
             }

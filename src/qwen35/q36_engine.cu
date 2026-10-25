@@ -40,6 +40,7 @@
 #include "q36_kernels.cuh"
 #include "q36_pcie.hpp"
 #include "q36_rebalance.hpp"
+#include "q36_rules.hpp"
 #include "q36_sampling.hpp"
 #include "q36_stats.hpp"
 #include "q36_threads.hpp"
@@ -1581,6 +1582,14 @@ struct Engine {
     bool pcie_on = false;          // the graph carries the PCIe call of each hybrid layer; fixed before the first capture
     int pcie_num = 0;              // the share of the missed experts, in 256ths (0 with pcie_on: nothing goes that way)
     strata::core::PcieAuto pcie_auto;
+    // STRATA_Q36_PCIE_AUTO_STEP=1 with the automatic share (q36_pcie.hpp's PcieStepSearch): the share moves a step every
+    // kPcieStepPositions decode tokens on the wall time per decode token; PcieAuto is off then (both would move the same share)
+    bool pcie_step_on = false;
+    strata::q36::PcieStepSearch pcie_step;   // the search: direction, window before, reversals, best share seen
+    Clock::time_point step_t{};    // the end of the last decode step counted (valid with step_open)
+    bool step_open = false;        // false: the next decode step only opens an interval (a prompt chunk or a new request ran)
+    double step_ms = 0.0;          // the wall time of the window's decode steps, ms (each from the end of the step before)
+    int step_tokens = 0;           // the tokens those steps kept
     uint8_t* pc_stage = nullptr;   // kPcieSlots blobs of pc_blob bytes
     size_t pc_blob = 0;
     cudaStream_t pcs = nullptr;    // the staging copies (the host issues them, the graph never waits for them)
@@ -1643,10 +1652,10 @@ struct Engine {
         return d;
     }
     // decode / verify rows: their routing is counted once the rows are kept (commit), so a verify window's rejected
-    // drafts never move the slots; a single session's slots follow the counts at every kRebalanceEvery-th position
+    // drafts never move the slots; a single session's slots follow the counts at every rebalance_every-th position
     // exactly (a window never steps over one), so plain and speculative decoding see the same slot tables at every
-    // position; the batch windows (run_rows) rebalance every kRebalanceEvery-th window instead, positions being per session
-    static constexpr int kRebalanceEvery = 32;
+    // position; the batch windows (run_rows) rebalance every rebalance_every-th window instead, positions being per session
+    int rebalance_every = strata::q36::kRebalanceEveryDefault;   // STRATA_Q36_REBALANCE_EVERY, read by init()
     bool rows_deferred = false;          // set while a decode step or a verify window runs
     std::vector<std::vector<int32_t>> row_ids;   // [main layer][row * top_k + k] of the last such call
     void count_rows(int n) {
@@ -1725,10 +1734,14 @@ struct Engine {
     }
     /// After a decode step / verify window: the PCIe share refined from the pool's speed (PcieAuto, Flash-Next's rule: three
     /// updates at most, after 48 then 96 and 96 more windows).
-    void pcie_window() {
-        if ((!pcie_auto.on && !stats_on) || warming) return;
+    void pcie_window(int n) {   // n: the tokens (rows) the window kept
+        if ((!pcie_auto.on && !stats_on && !pcie_step_on) || warming) return;
         wire_resolve();
         if (stats_on) wire_stats();
+        if (pcie_step_on) {
+            pcie_step_window(n);
+            return;
+        }
         if (!pcie_auto.on) return;
         double tc_us = 0.0, rate = 0.0;
         const double nf = pcie_auto.window(pa_cpu_ms, hy_cpu_jobs, pcie_num / 256.0, &tc_us, &rate, wire.launch_ms, wire.wire_ms,
@@ -1744,14 +1757,53 @@ struct Engine {
         pc_want = pc_sent = 0;
         pcie_num = strata::core::pcie_num_of(nf);
     }
+    /// STRATA_Q36_PCIE_AUTO_STEP=1: one steady clock between consecutive decode steps (a step, a verify window or a batch
+    /// window that kept n rows), timed whether or not the stats are on; after every kPcieStepPositions tokens counted the
+    /// search (q36_pcie.hpp's PcieStepSearch) takes the window's wall time per token and sets the share, in 256ths.  A step
+    /// after a break (pcie_step_break) only opens an interval: its time and its tokens stay out of the window.
+    void pcie_step_window(int n) {
+        if (pcie_step.done) return;
+        const Clock::time_point now = Clock::now();
+        if (step_open) {
+            step_ms += std::chrono::duration<double, std::milli>(now - step_t).count();
+            step_tokens += n;
+        }
+        step_t = now;
+        step_open = true;
+        if (step_tokens < strata::q36::kPcieStepPositions) return;
+        const double w = step_ms / (double) step_tokens;   // ms per token
+        const int was = pcie_num;
+        const double before = pcie_step.t_prev;
+        pcie_num = pcie_step.next(pcie_num, w);
+        if (stats_on)
+            std::fprintf(stderr, "strata-q36: PCIe share step: %.2f ms per decode token over %d tokens (the window before: %.2f ms) "
+                         "-> share %.3f (was %.3f)%s\n", w, step_tokens, before, pcie_num / 256.0, was / 256.0,
+                         pcie_step.done ? ", the search has stopped on the best share seen" : "");
+        step_ms = 0.0;
+        step_tokens = 0;
+    }
+    /// STRATA_Q36_PCIE_AUTO_STEP: the next decode step opens a new interval instead of closing one, so the time since the
+    /// last decode step (a prompt chunk, another session's prefill, the rebalance after a prompt, a new request, the warm-up)
+    /// is no decode token's.  The window's tokens and time so far are dropped too, so a window never spans two prompts or two
+    /// requests (the content alone moves the time per token by more than the step's margin).
+    void pcie_step_break() {
+        step_open = false;
+        step_ms = 0.0;
+        step_tokens = 0;
+    }
     void after_rows(int n) {   // a decode step / verify window kept n rows: count them, rebalance at the boundary
         if (!m->hybrid) return;
         count_rows(n);
-        pcie_window();
-        if (pos % kRebalanceEvery == 0) {
-            CK(cudaStreamSynchronize(st));
-            rebalance(8);
-        }
+        pcie_window(n);
+        if (pos % rebalance_every == 0) rebalance_cadence(true);
+    }
+    /// A rebalance of the decode cadence (after_rows, run_rows): at most 8 replacements.  The stats count its swaps, bytes and
+    /// host time (rb_ms), the stream synchronisation before it (`sync`) and its own included; the default path reads no clock.
+    void rebalance_cadence(bool sync) {
+        const auto r0 = stats_on ? Clock::now() : Clock::time_point();
+        if (sync) CK(cudaStreamSynchronize(st));
+        rebalance(8, stats_on);
+        if (stats_on) stat_acc.rb_ms += ms_since(r0);
     }
 
     void alloc_session(Sess& ss) const {
@@ -1809,6 +1861,9 @@ struct Engine {
         n_sess = std::max(1, std::min(n_sessions, kVerify));
         vision = vision_;
         tmax = std::max(tmax_, kVerify);
+        std::string every_err;   // STRATA_Q36_REBALANCE_EVERY: read once, here (the rebalance cadence and the draft bound follow it)
+        rebalance_every = strata::q36::rebalance_every_from_env(std::getenv("STRATA_Q36_REBALANCE_EVERY"), &every_err);
+        if (!every_err.empty()) std::fprintf(stderr, "strata-q36: %s\n", every_err.c_str());
         const auto& g = m->g;
         const size_t T = (size_t) tmax, N = (size_t) g.n_embd, Kp = (size_t) m->top_k, FF = (size_t) g.n_ff;
         const size_t C = (size_t) g.ssm_conv_channels;
@@ -3053,8 +3108,9 @@ struct Engine {
 
     /// The slots to the experts the routing used most: the replacements with the best gain over all layers (q36_rebalance.hpp),
     /// at most max_swaps of them, between forwards (the copies are on the engine's stream).  Every layer's counts decay
-    /// afterwards, those of the layers it did not touch too.  Returns the replacements made.
-    int rebalance(int max_swaps) {
+    /// afterwards, those of the layers it did not touch too.  Returns the replacements made.  `count`: the stats count its swaps
+    /// and bytes (the decode cadence's rebalances, rebalance_cadence; not the one after a prompt).
+    int rebalance(int max_swaps, bool count = false) {
         static const bool off = std::getenv("STRATA_Q36_FIXED_SLOTS") != nullptr;   // the slots as placed (tests)
         if (!m->hybrid || off || warming) return 0;
         std::vector<strata::q36::LayerCounts> views(hy.size());
@@ -3067,20 +3123,23 @@ struct Engine {
         for (const strata::q36::SlotSwap& w : swaps) {
             Hy& H = hy[(size_t) w.layer];
             const Layer& L = layer_at(w.layer);
-            const int s = H.slot_of[(size_t) w.out];
-            H.slot_of[(size_t) w.out] = -1;
-            H.slot_of[(size_t) w.in] = s;
-            CK(cudaMemcpyAsync(L.blobs + (size_t) s * L.stride, L.hblobs + (size_t) w.in * L.stride, L.L.bytes,
-                               cudaMemcpyHostToDevice, st));
+            strata::q36::apply_slot_swap(H.slot_of, w, [&](int s, int in) {
+                CK(cudaMemcpyAsync(L.blobs + (size_t) s * L.stride, L.hblobs + (size_t) in * L.stride, L.L.bytes,
+                                   cudaMemcpyHostToDevice, st));
+            });
             changed[(size_t) w.layer] = 1;
             ++hy_swaps;
+            if (count) stat_acc.rb_bytes += (long long) L.L.bytes;
         }
         for (size_t li = 0; li < hy.size(); ++li) {
-            if (changed[li])
+            if (changed[li]) {
                 CK(cudaMemcpyAsync(hy[li].slot_of_d, hy[li].slot_of.data(), (size_t) m->g.n_expert * 4,
                                    cudaMemcpyHostToDevice, st));
+                if (count) stat_acc.rb_bytes += (long long) m->g.n_expert * 4;
+            }
             for (double& v : hy[li].score) v *= strata::q36::kRebalanceDecay;
         }
+        if (count) stat_acc.rb_swaps += (long long) swaps.size();
         CK(cudaStreamSynchronize(st));   // slot_of's host copy is pageable: the upload is done before it changes
         return (int) swaps.size();
     }
@@ -3271,6 +3330,7 @@ struct Engine {
             verify_flush();
             mtab_now = nullptr;
             map_on = false;
+            pcie_step_break();   // the chunk's time is no decode token's: the PCIe step's next decode step only opens an interval
             if (!on_chunk(i + T)) {
                 if (m->hybrid) rebalance_after_prompt();
                 return i + T;
@@ -3343,8 +3403,8 @@ struct Engine {
         rows_G_last = G;
         if (m->hybrid) {
             count_rows(T);
-            pcie_window();
-            if (++win_count % kRebalanceEvery == 0) rebalance(8);
+            pcie_window(T);
+            if (++win_count % rebalance_every == 0) rebalance_cadence(false);
         }
     }
     /// One window for the next token of each of the rows' sessions (no proposals): the greedy picks in rows_pick.
@@ -3474,8 +3534,10 @@ struct Engine {
     }
     int hybrid_swaps_after_prompt = 2048;
     /// The prompt's routing moves the slots at once; the decode windows' rebalances add up in hy_swaps (the request's log line).
+    /// Its swaps, bytes and time stay out of the stats' rebalance counters, which count the decode cadence's only (issue #96).
     void rebalance_after_prompt() {
-        const int n = rebalance(hybrid_swaps_after_prompt);
+        const int n = rebalance(hybrid_swaps_after_prompt, false);
+        pcie_step_break();   // its time is no decode token's (the PCIe step)
         if (!warming)
             std::fprintf(stderr, "strata-q36: rebalance after the prompt: %d slot replacements (%lld since the start)\n", n,
                          hy_swaps);
@@ -3496,7 +3558,7 @@ struct Engine {
                   const std::atomic<bool>* cancel = nullptr,
                   const std::function<int32_t(int, const int32_t*)>& sample_row = nullptr) {
         const int N = (int) m->g.n_embd;
-        if (main_hybrid) D = std::min<int>(D, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
+        if (main_hybrid) D = strata::q36::draft_depth_limit(pos, rebalance_every, D);
         const int T0 = (int) fix.size() + 1;   // the redo rows and the row of x
         CK(cudaStreamSynchronize(st));
         // rows of the first MTP call: (hmain row i, fix[i]) at positions pos - fix.size() + i, then (hlast, x) at pos
@@ -3579,6 +3641,7 @@ struct Engine {
         }
         CK(cudaStreamSynchronize(st));
         warming = false;
+        pcie_step_break();   // the warm-up's steps are not the decode's (the PCIe step; the break also empties the window)
         for (Hy& H : hy) {
             std::fill(H.score.begin(), H.score.end(), 0.0);
             std::fill(H.heat.begin(), H.heat.end(), 0.0);
@@ -3741,7 +3804,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     if (!E.use_mmq) E.hybrid_t = E.tmax;   // no streamed prompt path: every batch on slots + the pool
     // the graphs (a decode step, a verify window) run the hybrid layers through the doorbell; a window over hybrid_t
     // rows would stream the layer's experts with host syncs in the middle, which a capture cannot hold
-    if (E.main_hybrid && E.hybrid_t < Engine::kVerify) E.use_graph = false;
+    if (strata::q36::hybrid_graph_off(E.main_hybrid, E.hybrid_t, Engine::kVerify)) E.use_graph = false;
     // the two staging buffers: a streamed forward over the main layers alternates between them, and the MTP block (the
     // widest layer where its gate / up are Q4_K: 1.24 GiB against 0.97 GiB for a main layer on Ornith) is streamed alone,
     // so it only ever takes the first (stream_begin with one layer): the second holds a main layer
@@ -3916,7 +3979,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             frac = strata::core::pcie_frac_for_gbps(link_gbps, kBase);
             double sum = 0.0;
             for (const Layer& L : m.layers) sum += (double) L.L.bytes;
-            E.pcie_auto.on = true;
+            // STRATA_Q36_PCIE_AUTO_STEP=1: the step moves the share instead of PcieAuto (both would move the same share)
+            E.pcie_step_on = strata::q36::pcie_step_enabled(std::getenv("STRATA_Q36_PCIE_AUTO_STEP"));
+            E.pcie_auto.on = !E.pcie_step_on;
             E.pcie_auto.min_share = 0.0;   // (Flash-Next's 0.10 floor would keep sending a share a slow link cannot carry)
             E.pcie_auto.max_share = 0.95;  // (Flash-Next's 0.60 cap would leave a large part of Ornith's experts to the CPU pool)
             E.pcie_auto.pool_factor = 1.0; // (Flash-Next's 1.85 is fitted to a pool time that holds the launches and the job build; here they are counted apart)
@@ -3928,12 +3993,17 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             std::fprintf(stderr, "strata-q36: PCIe share %.2f of the missed experts (--pcie-frac)\n", frac);
         else if (link_gbps > 0.0)
             std::fprintf(stderr, "strata-q36: PCIe probe: %.1f GB/s host->device (best of %s) -> PCIe share %.2f of the missed "
-                         "experts, refined from the CPU pool's speed (--pcie-frac N fixes it, 0 turns it off)\n", link_gbps,
-                         bursts.c_str(), frac);
+                         "experts, %s (--pcie-frac N fixes it, 0 turns it off)\n", link_gbps, bursts.c_str(), frac,
+                         E.pcie_step_on ? "moved by the wall time per decode token (STRATA_Q36_PCIE_AUTO_STEP=1)"
+                                        : "refined from the CPU pool's speed");
         else
             std::fprintf(stderr, "strata-q36: PCIe probe failed -> PCIe share %.2f of the missed experts (--pcie-frac N fixes it, "
                          "0 turns it off)\n", frac);
     }
+    // one place for every branch above (--pcie-frac 0, pageable memory, no PCIe bytes, --pcie-frac N, failed probe, or a value
+    // that does not switch it on): the step search is off, and the log says the variable did nothing
+    if (std::getenv("STRATA_Q36_PCIE_AUTO_STEP") != nullptr && !E.pcie_step_on)
+        std::fprintf(stderr, "strata-q36: STRATA_Q36_PCIE_AUTO_STEP ignored (the PCIe share is not automatic here, or the value is not 1)\n");
     CK(cudaDeviceSynchronize());
     if (mtp_only)
         std::fprintf(stderr, "strata-q36: every main layer's routed experts in VRAM (%.2f GiB); the MTP block's: %d of "
@@ -4476,6 +4546,7 @@ struct Serve {
         const auto t0 = Clock::now();
         const int64_t fresh = (int64_t) (ids.size() - reuse);
         bool cancelled = false;
+        E.pcie_step_break();   // the time since the last decode step (idle, or the end of another request) is no decode token's
         const int64_t got = E.process(ids.data() + reuse, fresh, [&](int64_t done) -> bool {
             std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) fresh, ms_since(t0),
                         (double) done / std::max(1e-9, ms_since(t0) / 1000.0));

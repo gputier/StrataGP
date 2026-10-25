@@ -11,6 +11,10 @@
 #include <system_error>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #include <process.h>
 #else
 #include <unistd.h>
@@ -18,8 +22,39 @@
 
 namespace strata::core {
 
+namespace {
+// replaces the file at `to` by the one at `from`, in one step, as rename(2) does on POSIX.  On Windows that is MoveFileExW
+// with MOVEFILE_REPLACE_EXISTING.  Two saves of one path replace the target at once, and Windows then refuses one of the
+// replacements while the other holds the target (ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION): such a refusal is retried
+// for a short while before it is reported.
+void replace_file(const std::filesystem::path& from, const std::filesystem::path& to, std::error_code& ec) {
+#ifdef _WIN32
+    for (int attempt = 1;; ++attempt) {
+        if (MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            ec.clear();
+            return;
+        }
+        const DWORD e = GetLastError();
+        ec = std::error_code((int) e, std::system_category());
+        const bool busy = e == ERROR_ACCESS_DENIED || e == ERROR_SHARING_VIOLATION;
+        if (!busy || attempt == 50) return;
+        Sleep(2);
+    }
+#else
+    std::filesystem::rename(from, to, ec);
+#endif
+}
+}  // namespace
+
 bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
                          std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err) {
+    // a directory is refused by name before it is opened: Windows' fopen fails on one with another message, and POSIX
+    // opens it and fails the read with EISDIR (the same text as before)
+    std::error_code dir_ec;
+    if (std::filesystem::is_directory(path, dir_ec)) {
+        err = "read_expert_profile: cannot read " + path + ": " + std::strerror(EISDIR);
+        return false;
+    }
     std::FILE* f = std::fopen(path.c_str(), "rb");
     if (f == nullptr) {
         err = "read_expert_profile: cannot open " + path;
@@ -144,7 +179,7 @@ bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_e
     const uint32_t hdr[5] = {1u, (uint32_t) n_layers, (uint32_t) n_expert, (uint32_t) ranked.size(),
                              (uint32_t) ranked.size()};
     // a temporary of its own: the process id and a counter of this process's writes, so two saves of one path never
-    // share a file (the rename below still replaces the target in one step)
+    // share a file (the replace below still swaps the target in one step)
     static std::atomic<uint64_t> n_writes{0};
 #ifdef _WIN32
     const long pid = (long) _getpid();
@@ -165,7 +200,7 @@ bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_e
     ok = (std::fclose(f) == 0) && ok;
     const int io_errno = errno;   // the failing write or close, when there is one
     std::error_code ec;
-    if (ok) std::filesystem::rename(tmp, path, ec);   // replaces an existing file (MoveFileEx / rename(2))
+    if (ok) replace_file(tmp, path, ec);
     if (!ok || ec) {
         const std::string why = ok ? ec.message() : std::strerror(io_errno);
         std::filesystem::remove(tmp, ec);

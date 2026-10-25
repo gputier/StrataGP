@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -18,6 +20,29 @@ namespace strata::q36 {
 inline constexpr double kRebalanceMinCount = 2.0;   // a candidate is routed at least this often (decayed count)
 inline constexpr double kRebalanceMinGain = 1.5;    // and beats the expert it replaces by at least this much
 inline constexpr double kRebalanceDecay = 0.7;      // the counts' factor after each rebalance, in every layer
+inline constexpr int kRebalanceEveryDefault = 32;   // positions between two rebalances (STRATA_Q36_REBALANCE_EVERY unset)
+inline constexpr int kRebalanceEveryMax = 1024;     // the largest value the variable accepts
+
+/// STRATA_Q36_REBALANCE_EVERY: the positions between two rebalances, decimal digits only (no sign, no space, nothing after
+/// them) for a value from 1 to 1024; leading zeros are read as decimal ("08" is 8).  Unset gives 32.  Any other value gives 32
+/// as well, and `err` (when given) gets the line the engine prints for it; an accepted value leaves `err` alone.
+inline int rebalance_every_from_env(const char* v, std::string* err) {
+    if (v == nullptr) return kRebalanceEveryDefault;
+    char* end = nullptr;
+    const bool digit = v[0] >= '0' && v[0] <= '9';   // strtol alone would also take a leading space or sign
+    const long n = digit ? std::strtol(v, &end, 10) : 0;
+    if (digit && *end == '\0' && n >= 1 && n <= kRebalanceEveryMax) return (int) n;
+    if (err != nullptr)
+        *err = std::string("STRATA_Q36_REBALANCE_EVERY=") + v + " is not a whole number from 1 to " +
+               std::to_string(kRebalanceEveryMax) + " in decimal digits: using " + std::to_string(kRebalanceEveryDefault);
+    return kRebalanceEveryDefault;
+}
+
+/// The draft depth a window at position `pos` may use: its rows are the positions pos .. pos + D, so D stops short of the next
+/// rebalance position (a multiple of `every`), and the rebalance falls at the window's end, never inside it.
+inline int draft_depth_limit(int64_t pos, int every, int D) {
+    return std::min<int>(D, (int) (every - pos % every) - 1);
+}
 
 /// One hybrid layer as the rebalance sees it; null pointers: the layer has no slot table (all its experts in VRAM).
 struct LayerCounts {
@@ -78,6 +103,17 @@ inline std::vector<SlotSwap> choose_swaps(const std::vector<LayerCounts>& layers
     if (budget < 0) budget = 0;
     if (swaps.size() > (size_t) budget) swaps.resize((size_t) budget);
     return swaps;
+}
+
+/// The placement change of one replacement: `in` takes the slot `out` held, and that slot's blob is then filled from the
+/// host copy of expert `in`, which the caller does through copy(slot, in).  Returns the slot.
+template <class Copy>
+inline int apply_slot_swap(std::vector<int>& slot_of, const SlotSwap& w, Copy&& copy) {
+    const int s = slot_of[(size_t) w.out];
+    slot_of[(size_t) w.out] = -1;
+    slot_of[(size_t) w.in] = s;
+    copy(s, w.in);
+    return s;
 }
 
 }  // namespace strata::q36

@@ -18,12 +18,12 @@ Figures marked "calculated" are arithmetic on measured values, not measurements.
 | KL against llama.cpp b11756, 10 prompts of 32 steps | not measured | 0.0423 (bar 0.061) |
 | Top-1 agreement, same test | not measured | 299 of 320 |
 
-The branch is faster than its start, and only under the 24 GB working-set cap (see below). The N5 build (task 5) gave a KL of 0.0455 and 299 of 320; the start was not measured on this test. The target of 100 tokens/s is
+The branch is faster than its start under the 24 GB working-set cap (see below). No uncapped comparison with the start exists; the uncapped series of 24 October measured the branch alone (see its section). The N5 build (task 5) gave a KL of 0.0455 and 299 of 320; the start was not measured on this test. The target of 100 tokens/s is
 not reached. By owner decision of 23 October 2026, there is no fixed throughput threshold: each result is judged case by case.
 
 Without the cap, one series run outside the protocol gave 43.2 tokens/s for the branch against 43.8 for the start at
 1,024 tokens, and 18.8 against 17.2 at 128K. The memory guard was not armed in that run, free memory fell to 703 MB, and
-the series does not count as a result. No uncapped measurement under the protocol has completed.
+the series does not count as a result. The first uncapped measurement under the protocol completed on 24 October 2026: 41.40 tokens/s for the default (see the uncapped series section).
 
 ## Protocols
 
@@ -46,12 +46,12 @@ Working-set cap. `SetProcessWorkingSetSizeEx` sets a hard cap of 24 GB per `stra
 the working set, not the commit. Without it, the working set of the process reached about 105 GB at the time of the stop, and was still rising, probably because it counts the
 pages of the mapped GGUF file as well as the pinned experts (probable, not verified). Free memory then drops in under 30 seconds. A comparison
 without the cap therefore measures memory pressure as much as the code, and every throughput comparison in this record
-is made under the cap.
+is made under the cap until 23 October.
 
 Memory guard. A watcher samples free memory every few seconds. Below 8,192 MB it stops the process by its PID, never by
 its name. Before each GPU window, `nvidia-smi` must show no foreign compute process and less than 200 MiB in use. Two
 guard failures happened. In series 1 of the T8 run, 19 of the 21 watchers wrote nothing, because a leftover `watch.stop` file stopped them, and the two others had a filter that matched no `strata.exe`. Series 1 therefore ran without cap and without an effective guard. In a later attempt, memory fell faster than the
-sampling interval, so the process was stopped at 4,272 MB, below the 8 GB floor.
+sampling interval, so the process was stopped at 4,272 MB, below the 8 GB floor. From 24 October 2026 the owner runs Ornith with no cap and no guard; the pre-start checks of the tool replace them (see the uncapped series section).
 
 ## Experiments, in order
 
@@ -204,7 +204,7 @@ and the host cost to fall, not only the pool.
 ### Uncapped attempt (23 October)
 
 A later attempt ran without the cap, under the guard. The process was stopped at 4,272 MB available, after 28.1 seconds of
-falling memory, before it produced any token. No uncapped throughput exists. The coordinator chose to stop and report; lifting the cap is the owner's decision.
+falling memory, before it produced any token. No uncapped throughput existed at that date. The coordinator chose to stop and report; lifting the cap was the owner's decision. The series of 24 October are the first uncapped throughput measurements (41.40 tokens/s for the default, see the section below).
 
 ### Lower-bit expert quantization, IQ2_XXS (23 October)
 
@@ -225,6 +225,37 @@ Source of the gain. Missed expert bytes per token fall from 678 MB to 451 MB (mi
 
 Decision of the owner, 23 October 2026: IQ2_XXS is set aside and the current quant stays the default. The BF16 source is kept on the test box for a possible intermediate tier, for example gate and up in IQ2_S (2.5 bits per weight), which is not measured. The IQ2_XXS file stays on disk, unused.
 
+### Uncapped series (24 October)
+
+Measured on 24 October 2026 on the test PC (RTX 5090), with the binary of branch `fix-issues-simples`, build `E:\StrataGP-89\final`. It is the first throughput series run without the working-set cap. By owner decision, the series ran with no cap and no memory guard. The tool `tools/ornith/measure_partition.ps1` checks before each start: it refuses to start when a GitLab runner VM runs, when free RAM is under 100 GiB, or when the GPU holds more than 4096 MiB. During the run it only logs memory. Free memory fell to about 3.9 GiB in every launch (3.88 to 3.95 GiB), and no process was stopped.
+
+Each series follows the same protocol. The summary is produced by `tools/ornith/partition_summary.py`. Each launch is a cold server start with `STRATA_Q36_STATS=1`. Each launch runs one code request, "Write a Python function that parses an ISO 8601 date-time string without the standard library, then explain each step in a short paragraph and give three unit tests.", for 300 decoded tokens, after a 256-token warm-up request. The figures are medians over the measured launches.
+
+| Series | Launches | Tokens/s | ms per token | Pool / wait / host outside pool (ms) | PCIe copies per step (ms) | Inter-token p95 (ms) |
+|---|---|---|---|---|---|---|
+| Default (PCIe share 0.15) | 3 | 41.40 | 24.13 | 15.06 / 7.63 / 1.43 | 2.60 | 30.70 |
+| Rebalance every 8 steps (r08) | 2 | 42.85 | 23.35 | 14.26 / 7.62 / 1.47 | 1.54 | 29.40 |
+| Rebalance every 16 steps (r16) | 2 | 41.55 | 24.06 | 15.01 / 7.61 / 1.45 | 2.01 | 30.00 |
+| Fixed PCIe share 0.50 (pf050) | 2 | 35.80 | 27.93 | 9.86 / 9.59 / 8.49 | 19.54 | 36.45 |
+| Fixed PCIe share 0.55 (pf055) | 2 | 35.75 | 27.97 | 9.83 / 9.58 / 8.56 | 19.59 | 36.55 |
+| Automatic PCIe step (pauto) | 2 | 35.10 | 28.47 | 9.97 / 9.67 / 8.83 | 26.26 | 38.15 |
+
+The PCIe copies overlap the rest of each decode step. In the default series, the decode rebalances made 72 slot swaps, copied 293.8 MB and cost 9.3 ms of host time. Rebalancing every 8 steps was the only setting that beat the default: 304 swaps, 1240.5 MB copied and 36.8 ms of host time, for 42.85 tokens/s, or 3.5 % more over two launches. Rebalancing every 16 steps made 152 swaps, copied 620.2 MB and cost 18.8 ms of host time.
+
+The automatic step started at 0.55. It saw four noisy windows of 36 to 41 ms and stayed at 0.55. It cannot go below 0.30. It stays off by default.
+
+Parity: six greedy prompts in fixed slots, 128 tokens each, give identical content on this branch and on main. The single launches ran at 37.70 tokens/s on the branch and 36.10 on main, one launch each, which is within noise.
+
+Reading (an interpretation of the figures above, not a separate measurement): without the cap, a larger PCIe share is slower. The default 0.15 beats 0.50 and 0.55 by about 5.6 tokens/s, because the host time outside the pool rises from 1.4 to 8.5 ms per token. The fixed optimum of 0.50 to 0.55 found on 22 October was measured under the 24 GB cap and does not carry over. Rebalancing every 8 steps is the only setting that beats the default, and only by 3.5 % over two launches.
+
+### Attention kernel durations (25 October)
+
+Measured on 25 October 2026 with Nsight Systems, kernel durations only, in bench mode with `--max-context 409600` and KV q4. The median `k_attn_part` per call is 199 µs at 1,024 tokens of context, 562 µs at 37,159 and 1,565 µs at 127,685. There are 12 calls per token, so the attention kernels take about 2.4 ms per token at 1K and 18.8 ms at 128K (calculated). The 22 October measurement gave 2.42 ms and 18.93 ms, so the two agree. The slope is about 10 to 11 µs per thousand tokens of context per call.
+
+At 1,024 tokens with `--max-context 4096`, the median falls to 98 µs. That run also halves the chunk size (`chunk_tiles` 2 to 1), so it does not isolate the grid. The 22 October measurement already put a bounded grid at 6 µs per call, so most of the 100 µs gap comes from the chunk size (a deduction, not an isolated measurement). A smaller chunk changes how the sum is split, and so the output bits, which issue #81 rules out.
+
+The per-head re-read of the K/V cache is still a hypothesis. Testing it needs read counters. Nsight Compute cannot provide them on this box (see the operational pitfalls). No kernel change has been made.
+
 ## Operational pitfalls
 
 - A process started with `Start-Process` from an SSH session dies with the session. Start it detached instead.
@@ -237,6 +268,9 @@ Decision of the owner, 23 October 2026: IQ2_XXS is set aside and the current qua
 - Compare builds only under the same environment variables and the same `FIXED_SLOTS` setting: the variable itself changes the output.
 - The thread count reported by the engine is one more than `--cpu-threads`.
 - `--mtp` above 7 is refused at startup with exit code 2.
+- Nsight Compute on the hybrid engine deadlocks it. It serializes the kernels while the host spins on a GPU doorbell (probable cause), and it can leave the GPU at 100 % with no process until a reboot. `nvidia-smi -rgc` does not clear it.
+- Per-process GPU memory reads `[N/A]` under WDDM.
+
 ## Open leads, ranked
 
 Estimated gains come from calculations in the sources, not from measurements on the box.
@@ -247,13 +281,14 @@ Estimated gains come from calculations in the sources, not from measurements on 
 4. NVMe tier, issue #84. The issue estimates no gain, because about 48 GiB of experts stay pinned in RAM and a storage tier does not lift the rate while they do. First step: confirm the architecture and the ceiling with the NVMe share, then decide.
 5. MTP, issue #74. A speculative step costs 133 ms against 50 ms for a plain step, for about 1.5 tokens. The cause of the divergence is not proven. First measurement: profile the multi-row path of the hybrid MoE step and the draft block's expert requests.
 6. Speculative decoding without MTP, issue #78 (AcceptMoE, Specter). Deferred. The gain depends on the union of experts across a verification window, where a two-token window touched 0.85 to 0.89 of the slots that two separate tokens would use. The published gains do not transfer without that measurement.
-7. Attention per head, issue #81. No gain estimated. At 128K, attention takes 18.93 ms per token. The cache re-read per head is a hypothesis, not checked. First measurement: the slope of `k_attn_part` across 2K, 32K and 128K.
-8. PCIe share, issue #80. The automatic share settles at 0.45, while the fixed optimum is 0.50 to 0.55. The gap is within the noise on the capped median of the final series (30.0 against 30.0). On the first request, it is 2.5 tokens/s, outside the spreads. First measurement: three alternated automatic launches against three at 0.55.
+7. Attention per head, issue #81. No gain estimated. The durations of 25 October (see the section above) put the slope at 10 to 11 µs per thousand tokens of context per call, which gives about 18.8 ms of attention per token at 128K (calculated). The cache re-read per head remains a hypothesis: it needs read counters, which Nsight Compute cannot give on this box. No kernel change has been made.
+8. PCIe share, issue #80. Under the 24 GB cap, the automatic share settled at 0.45, and the fixed optimum was 0.50 to 0.55 (22 October). Without the cap, measured on 24 October, the default share of 0.15 gives 41.40 tokens/s. Fixed 0.50 and 0.55 give 35.80 and 35.75 tokens/s, about 5.6 tokens/s less, and the automatic step gives 35.10, about 6.3 tokens/s less. A larger share raises the host time outside the pool from 1.4 to 8.5 ms per token. The optimum found under the cap does not carry over. The automatic step stays off by default.
 9. CPU pool, issue #79. The recommended path works without large pages, which need a privilege the box does not grant. First measurement: busy time against wall time per thread.
 10. Expert pruning (REAP), issue #75. Not measured on Ornith. The published figure is 95.8 % kept on BoolQ alone at 20 % pruning, on another model. First measurement: KL on the ten prompts.
 11. KV precision, issue #72. Accepted by the owner on 23 October 2026: KL 0.079 on the short prompts against the 0.061 bar, with `--kv q4`. The measurements are in the Ornith section of QWEN36.md.
 12. YaRN gate, issue #73. A 99 % top-1 target cannot be reached even by llama.cpp (91.6 %). The owner must choose a criterion.
 13. Q2_0 on CPU, issue #70. Fixed on branch `fix-issues-simples`: `hy_cpu_compute` now fills the ActQ that the Q2_0 kernels read. A Q2_0 pack whose n_embd exceeds 2560 is refused at load, so Ornith (3072) stays off native Q2_0 while the ActQ keeps its size. On the Windows test PC (MSVC 2022, CUDA 13.4, sm_120), `q36_engine.cu` compiles once it includes `strata/kernels/cpu/expert_layout.hpp`, `native_q2_act_test` passes on its AVX2 path, and its `--hy-job` mode, which builds the job without an ActQ as the old code did, crashes with an access violation. No q36 model was run with a Q2_0 pack.
+14. Rebalance cadence, issue #96. Measured uncapped on 24 October 2026: rebalancing every 8 steps gives 42.85 tokens/s against 41.40 for the default, which is +3.5 % over two launches. Every 16 steps gives 41.55 tokens/s. The gain is small and rests on two launches per setting; more launches of the 8-step setting would show whether it holds.
 
 ## Resuming
 
