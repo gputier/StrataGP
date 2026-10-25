@@ -5050,10 +5050,10 @@ int strata::qwen35::run(int argc, char** argv) {
                     break;
                 }
         } else if (!fits) {
-            // the hybrid mode: 2048 (a chunk streams every layer's experts over PCIe once); a small card, where the chunk's buffers
-            // would take the slots' room, falls back to less
+            // the hybrid mode: hybrid_prompt_chunk (q36_rules.hpp), 2048 by default, 4096 on a big card with one session, less on a
+            // small card where the chunk's buffers would take the slots' room
             const double fr_gib = (double) fr / GiB;
-            chunk = fr_gib >= 7.5 ? 2048 : fr_gib >= 5.5 ? 1024 : 512;
+            chunk = strata::q36::hybrid_prompt_chunk(fr_gib, std::max(1, batch));
         }
         if (const char* cv = std::getenv("STRATA_Q36_CHUNK")) chunk = std::max(256, std::min(4096, std::atoi(cv)));   // force a chunk (512: the old default)
         if (std::getenv("STRATA_Q36_PLACE_DEBUG"))
