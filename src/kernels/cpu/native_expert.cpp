@@ -127,6 +127,8 @@ bool iq512_on() {
     static const bool on = cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr;
     return on;
 }
+// SwiGLU as ggml-cpu's path applies it: one expression in this translation unit for every path that must match it
+inline float swiglu(float g, float u) { return (g / (1.f + std::exp(-g))) * u; }
 }  // namespace
 
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
@@ -144,8 +146,9 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
 int native_gu_mt_min(int gu_type, bool one_token_512) {
     // #152: from how many tokens the multi-token kernels run (ggml's vec_dot below that).  The default 2 is the
     // measured-fastest rule, but a token's expert rows then round differently alone than in a group, so greedy output
-    // can depend on how many drafts a verify window held.  STRATA_IQ_MT_MIN=1 (opt-in, 0.1.30) uses the multi-token
-    // kernels for every group: output independent of the drafting, at a measured -1..-3% decode on IQ3_S (AVX-512).
+    // can depend on how many drafts a verify window held (not IQ3_XXS on AVX-512 since #74: see native_gu_rows).
+    // STRATA_IQ_MT_MIN=1 (opt-in, 0.1.30) uses the multi-token kernels for every group: output independent of the
+    // drafting, at a measured -1..-3% decode on IQ3_S (AVX-512).
     static const char* env = std::getenv("STRATA_IQ_MT_MIN");
     static const int mt_min = env ? std::atoi(env) : 2;
     // IQ3_S where the AVX-2 kernel gathers its grid (cpu_gather_fast, unless STRATA_IQ256_GATHER=0) on a CPU without
@@ -165,6 +168,14 @@ int native_gu_mt_min(int gu_type, bool one_token_512) {
     // rule stays 2 (a lone token goes to ggml-cpu, as without the flag).
     if (one_token_512 && env == nullptr && gu_type == 18 && iq512_on()) return 1;
     return iq3s_one && gu_type == 21 ? 1 : mt_min;
+}
+
+bool native_gu_ggml_order(int gu_type, bool one_token_512) {
+    // where a lone token takes ggml-cpu's dot (mt_min above 1, no one_token_512), and only where that dot is ggml's
+    // AVX2+FMA one, the order the kernel copies
+    static const bool on = iq512_on() && ggml_cpu_has_avx2() && ggml_cpu_has_fma() &&
+                           std::getenv("STRATA_NO_IQ512_GGML_ORDER") == nullptr;
+    return on && gu_type == 18 && !one_token_512 && native_gu_mt_min(gu_type, one_token_512) > 1;
 }
 
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
@@ -191,9 +202,10 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // as the AVX-2 kernels, and STRATA_IQ_MT_MIN=1 takes the kernel for one token too (its rows are then
     // independent of the drafting: iq_avx1_parity checks every width bit for bit).
     static const bool avx1 = !cpu_avx2_ok() && cpu_avx1_ok() && std::getenv("STRATA_NO_IQ128") == nullptr;
-    // The exact rows are ggml-cpu's AVX2 single-token dot bit for bit, so they need ggml-cpu itself built for AVX2 and
-    // not AVX-512 (ggml_cpu_has_*): a STRATA_ISA_FLOOR build runs ggml's AVX1/SSE dots, a native build on an AVX-512 CPU
-    // run with STRATA_FORCE_AVX2=1 runs its AVX-512 one, and both round differently (#2215's guard).
+    // The exact rows are ggml-cpu's AVX2 single-token dot bit for bit, so they need ggml-cpu itself built for AVX2
+    // (ggml_cpu_has_*): a STRATA_ISA_FLOOR build runs ggml's AVX1/SSE dots, which round differently (#2215's guard).
+    // ggml-cpu built for AVX-512 runs the same AVX2 dots for these five formats (arch/x86/quants.c at the pinned
+    // 3cf03257 has no AVX-512 branch for them), so the !ggml_cpu_has_avx512() check is a conservative guard only.
     static const bool exact_one = [] {
         const char* v = std::getenv("STRATA_CPU_IQ_ALL_EXACT1");
         return v && v[0] == '1' && v[1] == 0 && ggml_cpu_has_avx2() && !ggml_cpu_has_avx512();
@@ -220,6 +232,24 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // for it, as before (its rows would round differently).  Each kernel only for the formats it implements: falling
     // through an empty switch would leave ff unwritten instead of falling back to ggml-cpu.
     static const bool cpu512 = cpu_avx512_ok();
+    // #74: where a lone token takes ggml-cpu's dot below (mt_min above 1, no one_token_512), an IQ3_XXS group takes the
+    // AVX-512 kernel in ggml's float order, then SwiGLU here with the expression and order of ggml's path below (the
+    // gate/up scales are 1 for this format), so a token's rows are the same alone and in a verify window.  Only where the
+    // linked dot is ggml's AVX2+FMA one, the order the kernel copies.  STRATA_NO_IQ512_GGML_ORDER=1 keeps iq512_gu_rows.
+    if (nt >= mt_min && native_gu_ggml_order(f.gu_type, f.one_token_512)) {
+        thread_local float gbuf[MAXT][kNativeMaxFF], ubuf[MAXT][kNativeMaxFF];
+        float* gp[MAXT];
+        float* up[MAXT];
+        for (int t = 0; t < nt; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
+        iq512_iq3xxs_gu_rows_ggml(blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, gp, up, r0, r1);
+        for (int r = r0; r < r1; ++r) {
+#ifdef _MSC_VER
+#pragma loop(no_vector)   // a scalar exp, as in ggml's path below (MSVC may vectorize exp with other roundings)
+#endif
+            for (int t = 0; t < nt; ++t) ff[t][r] = swiglu(gbuf[t][r], ubuf[t][r]);
+        }
+        return;
+    }
     if (nt >= mt_min && (iq512_supported(f.gu_type) || (!cpu512 && iq256_supported(f.gu_type)))) {
         if (avx512 && iq512_supported(f.gu_type)) {
             iq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
@@ -268,7 +298,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
             dot(n, &u, 0, ur, 0, act[t], 0, 1);
             g *= sg;
             u *= su;
-            ff[t][r] = (g / (1.f + std::exp(-g))) * u;
+            ff[t][r] = swiglu(g, u);
         }
     }
 }

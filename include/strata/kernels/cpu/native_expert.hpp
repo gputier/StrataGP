@@ -65,6 +65,9 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst);
 /// From how many tokens native_gu_rows gives this gate/up type to a multi-token kernel (#152; ggml-cpu's per-token dot
 /// below that).  1: a token's rows are the same alone and in any group.  `one_token_512`: NativeFmt::one_token_512.
 int native_gu_mt_min(int gu_type, bool one_token_512 = false);
+/// Whether a group of native_gu_mt_min tokens or more of this gate/up type takes the AVX-512 kernel in ggml's float
+/// order (#74: IQ3_XXS where a lone token takes ggml-cpu's AVX2+FMA dot; STRATA_NO_IQ512_GGML_ORDER=1 turns it off).
+bool native_gu_ggml_order(int gu_type, bool one_token_512 = false);
 /// ff[t][r] = silu(gate_r . a[t]) * (up_r . a[t]) for rows r in [r0, r1), `nt` tokens.
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1);

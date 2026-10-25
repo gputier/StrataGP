@@ -262,7 +262,19 @@ Other levers measured: `STRATA_DMA_BATCH=1` against 0 has no measurable effect, 
 
 Not reached: 100 tokens/s. The rate is 30.0 tokens/s at 1,024 tokens. Its open issues are #77 (CPU kernels of ik_llama: the pool stays the first cost, 20.8 ms), #79 (CPU pool), #80 (PCIe share), #81 (attention at long context), #74 (MTP), #75 (REAP) and #78 (speculative decoding). #76 (experts in 2 bits) was measured and set aside: 40.65 against 28.45 tokens/s, KL 0.4697 against 0.0423 (docs/ORNITH_122B.md).
 
-MTP is off in the configuration. With `STRATA_Q36_ONE_TOKEN_CPU=1`, its output is identical, but 20 to 35 % slower, with no drop in missed bytes (issue #74).
+MTP is off in the configuration. Measured on 22/10/2026 (issue #74), before the change below: with `STRATA_Q36_ONE_TOKEN_CPU=1`, its output is identical to `--mtp 0` with the same variable on 6 of 6 prompts, but 20 to 35 % slower, with no drop in missed bytes. Without the variable, `--mtp 2` gave the text of `--mtp 0` on 1 prompt of 6.
+
+The cause, read in the code: in a verify window, an expert picked by two or more rows is one CPU job of several tokens. By default its IQ3_XXS gate/up rows took the AVX-512 multi-token kernel (`iq_avx512.cpp`), while a lone token, the only case at `--mtp 0`, takes ggml-cpu's dot. Both compute the same integer sums per block. The float part differed: 16 float lanes and `_mm512_reduce_add_ps` against ggml's 8 lanes and `hsum_float_8`. A near tie then flipped. The IQ4_XS down rows are ggml-cpu's dot for every token count by default, so they never differed.
+
+The change: for IQ3_XXS, a group of two or more tokens now takes `iq512_iq3xxs_gu_rows_ggml`. It decodes the weights once for all the tokens, as before. For each token it adds the two 256-bit halves of the integer sums (ggml's `sumi1 + sumi2`, lane for lane), accumulates one FMA per block into 8 float lanes with `d = fp16(d_x) * d_y`, and ends with `0.25f * hsum_float_8`: the order of ggml's AVX2 dot `ggml_vec_dot_iq3_xxs_q8_K`, which has no AVX-512 branch at the pinned commit 3cf03257. It returns the raw gate and up values, and `native_gu_rows` applies SwiGLU in `native_expert.cpp` with the expression of the lone-token path. The kernel is used only where ggml-cpu's dot is its AVX2+FMA one (`ggml_cpu_has_avx2()`, `ggml_cpu_has_fma()`), not with `STRATA_Q36_ONE_TOKEN_CPU` (its kernels already give one result for every token count) and not with `STRATA_IQ_MT_MIN=1`. `STRATA_NO_IQ512_GGML_ORDER=1` gives the previous multi-token kernel. A lone token's path is unchanged, so the `--mtp 0` text cannot change.
+
+Measured on 25 October 2026 on the Ornith box (RTX 5090, 128 GB RAM, Ryzen 9 9950X3D), with the new defaults and `--mtp 2`, decode, three alternated launches per setting: with the ggml-order kernel (the default) 49.0, 49.1 and 49.0 tokens/s; with `STRATA_NO_IQ512_GGML_ORDER=1` 47.6, 47.4 and 47.4 tokens/s. The kernel is about 3.4 % faster. The owner chose on 25 October to keep it on by default, an exception to the opt-in rule of AGENTS.md (line 30); `STRATA_NO_IQ512_GGML_ORDER=1` turns it off.
+
+Greedy identity with fixed slots (`STRATA_Q36_FIXED_SLOTS=1 --pcie-frac 0`, six parity prompts, 128 tokens): `--mtp 2` and `--mtp 3` give the same text as `--mtp 0` on six of six prompts with this branch, against one of six on main (ac27f23f). The build with the new defaults gives the same text as the build before them on six of six prompts under the same setting.
+
+On a real AVX-512 CPU, `iq512_ggml_order_test` and the default pass of `native_expert_row_invariance_test` pass, with 0 differing values.
+
+Checked without AVX-512 (an AVX2 transcription of the new per-token arithmetic, run under qemu against ggml-cpu's AVX2 dot): 0 of 32,768 dots differ, against 22,863 of 32,768 for the previous 16-lane order.
 
 ## Non-finite logits
 

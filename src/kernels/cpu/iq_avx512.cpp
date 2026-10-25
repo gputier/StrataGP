@@ -180,10 +180,25 @@ template <> struct Fmt<23> {   // IQ4_XS: d, scales_h, scales_l[4], qs[128] - 13
     }
 };
 
-template <int TY, int NT>
+// ggml's hsum_float_8 (arch/x86/quants.c): hi + lo, then movehl, then movehdup
+inline float ggml_hsum8(__m256 x) {
+    __m128 s = _mm_add_ps(_mm256_extractf128_ps(x, 1), _mm256_castps256_ps128(x));
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_movehdup_ps(s));
+    return _mm_cvtss_f32(s);
+}
+
+// GGML: the float part in the order of ggml's AVX2 dot (ggml_vec_dot_iq3_xxs_q8_K, which has no AVX-512 branch), so a
+// token's row is ggml's vec_dot bit for bit (#74).  ggml's int32 lane k holds bytes 4k..4k+3 of every 32-value sub-block;
+// here lane k holds them for sub-blocks 2j and lane k+8 for 2j+1, so adding the two 256-bit halves gives ggml's
+// sumi1 + sumi2 exactly.  Then one FMA per block into 8 float lanes with d = d_x * d_y, and K * hsum_float_8 at the end.
+// IQ3_XXS only: the one format checked against ggml's dot in this order (iq512_ggml_order_test).
+template <int TY, int NT, bool GGML = false>
 inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
+    static_assert(!GGML || TY == 18, "ggml's float order is implemented for IQ3_XXS only");
     __m512 accf[NT];
-    for (int t = 0; t < NT; ++t) accf[t] = _mm512_setzero_ps();
+    __m256 acc8[NT];
+    for (int t = 0; t < NT; ++t) { accf[t] = _mm512_setzero_ps(); acc8[t] = _mm256_setzero_ps(); }
     const __m512i zero = _mm512_setzero_si512();
     for (int i = 0; i < nblocks; ++i) {
         const uint8_t* blk = row + (size_t) i * Fmt<TY>::bytes;
@@ -206,11 +221,19 @@ inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y,
                 acci[t] = _mm512_add_epi32(acci[t], _mm512_madd_epi16(_mm512_maddubs_epi16(g, ys), sc));
             }
         }
-        const float dx = h2f(u16(blk)) * Fmt<TY>::K;
-        for (int t = 0; t < NT; ++t)
-            accf[t] = _mm512_fmadd_ps(_mm512_set1_ps(dx * y[t][i].d), _mm512_cvtepi32_ps(acci[t]), accf[t]);
+        if constexpr (GGML) {
+            const float dx = h2f(u16(blk));
+            for (int t = 0; t < NT; ++t) {
+                const __m256i s8 = _mm256_add_epi32(_mm512_castsi512_si256(acci[t]), _mm512_extracti64x4_epi64(acci[t], 1));
+                acc8[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * y[t][i].d), _mm256_cvtepi32_ps(s8), acc8[t]);
+            }
+        } else {
+            const float dx = h2f(u16(blk)) * Fmt<TY>::K;
+            for (int t = 0; t < NT; ++t)
+                accf[t] = _mm512_fmadd_ps(_mm512_set1_ps(dx * y[t][i].d), _mm512_cvtepi32_ps(acci[t]), accf[t]);
+        }
     }
-    for (int t = 0; t < NT; ++t) res[t] = _mm512_reduce_add_ps(accf[t]);
+    for (int t = 0; t < NT; ++t) res[t] = GGML ? Fmt<TY>::K * ggml_hsum8(acc8[t]) : _mm512_reduce_add_ps(accf[t]);
 }
 
 template <int TY, int NT>
@@ -224,6 +247,22 @@ void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const voi
         row_dot<TY, NT>(blob + (size_t) r * gu_row, nb, y, g);
         row_dot<TY, NT>(blob + up_off + (size_t) r * gu_row, nb, y, u);
         for (int t = 0; t < NT; ++t) ff[t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
+    }
+}
+
+// IQ3_XXS gate and up rows in ggml's float order, raw: SwiGLU is the caller's (native_gu_rows applies it in its own
+// translation unit with the expression of ggml-cpu's path, so exp is the same call under the same flags)
+template <int NT>
+void gu_rows_ggml18(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, float* const* g,
+                    float* const* u, int r0, int r1) {
+    const block_q8_K* y[NT];
+    for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
+    const int nb = n / QK_K;
+    float gr[NT], ur[NT];
+    for (int r = r0; r < r1; ++r) {
+        row_dot<18, NT, true>(blob + (size_t) r * gu_row, nb, y, gr);
+        row_dot<18, NT, true>(blob + up_off + (size_t) r * gu_row, nb, y, ur);
+        for (int t = 0; t < NT; ++t) { g[t][r] = gr[t]; u[t][r] = ur[t]; }
     }
 }
 
@@ -279,6 +318,20 @@ void iq512_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, 
         case 21: gu_rows_nt<21>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         case 22: gu_rows_nt<22>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         default: break;
+    }
+}
+
+void iq512_iq3xxs_gu_rows_ggml(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
+                               float* const* g, float* const* u, int r0, int r1) {
+    switch (nt) {
+        case 1: gu_rows_ggml18<1>(blob, gu_row, up_off, n, act, g, u, r0, r1); break;
+        case 2: gu_rows_ggml18<2>(blob, gu_row, up_off, n, act, g, u, r0, r1); break;
+        case 3: gu_rows_ggml18<3>(blob, gu_row, up_off, n, act, g, u, r0, r1); break;
+        case 4: gu_rows_ggml18<4>(blob, gu_row, up_off, n, act, g, u, r0, r1); break;
+        case 5: gu_rows_ggml18<5>(blob, gu_row, up_off, n, act, g, u, r0, r1); break;
+        case 6: gu_rows_ggml18<6>(blob, gu_row, up_off, n, act, g, u, r0, r1); break;
+        case 7: gu_rows_ggml18<7>(blob, gu_row, up_off, n, act, g, u, r0, r1); break;
+        default: gu_rows_ggml18<8>(blob, gu_row, up_off, n, act, g, u, r0, r1); break;
     }
 }
 

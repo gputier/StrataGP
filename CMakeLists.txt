@@ -1648,6 +1648,13 @@ if(STRATA_NATIVE_EXPERTS)
     add_test(NAME native_expert_row_invariance_test COMMAND native_expert_row_invariance_test)
     set_tests_properties(native_expert_row_invariance_test PROPERTIES SKIP_RETURN_CODE 77)   # no AVX-512 CPU: skipped
   endif()
+  # #74: the AVX-512 IQ3_XXS gate/up rows in ggml's float order against ggml-cpu's vec_dot, bit for bit, 1..8 tokens
+  add_executable(iq512_ggml_order_test src/kernels/cpu/iq512_ggml_order_test.cpp)
+  target_link_libraries(iq512_ggml_order_test PRIVATE strata_kernels_cpu)
+  if(STRATA_BUILD_TESTS)
+    add_test(NAME iq512_ggml_order_test COMMAND iq512_ggml_order_test)
+    set_tests_properties(iq512_ggml_order_test PROPERTIES SKIP_RETURN_CODE 77)   # no AVX-512 CPU: skipped
+  endif()
   set(_strata_mmq_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0)
   # #296: OrcaRouter Q4_K_S's Q5_0 experts (Q4_K and Q5_1 come with STRATA_MMQ_KQUANTS on CUDA, S5's branch)
   if(STRATA_ORCA_Q4KS_MMQ)
