@@ -31,6 +31,8 @@ Greedy identity. Two builds must produce the same tokens at `temperature 0`. The
 tokens each, with `STRATA_Q36_FIXED_SLOTS=1 --pcie-frac 0 --expert-slots 62 --cpu-threads 6`. Without `FIXED_SLOTS`, the
 placement of expert slots changes over the steps, and the output can change from one run to the next.
 
+Logit determinism (issue #71). On the test PC, 40 forced greedy runs of p00 were made from the CLI (62 slots, chunk 2048, `--pcie-frac 0`, yarn scale 1), with the full logits dumped and each row compared bit for bit with the first run. This branch gave 40 of 40 identical runs with the CUDA graph, 40 of 40 with `--no-graph` and 40 of 40 with `--cpu-threads 16`. Main (ac27f23f) gave 40 of 40 with the graph. The divergence reported in #71 (one of eleven resumed runs, on branch feat/ornith-122b at e82d1fc3) did not reproduce in 160 runs, so its first differing step and its cause are not identified.
+
 Forced logits and KL. The engine receives the token sequence of llama.cpp b11756 and returns its logits at each step.
 The comparison uses ten prompts of 32 steps and reports the mean KL divergence and the share of steps where the top-1
 token agrees. The proposed bar, still to be validated, is a mean KL of 0.061, about 1.5 times the 0.041 of the T7 gate. Two passes on the same
