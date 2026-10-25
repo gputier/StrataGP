@@ -3978,7 +3978,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     }
     E.pool = std::make_unique<C::ExpertPool>(strata::q36::pool_workers(threads, (int) C::detect_cpu_topology(true).worker_cores.size()));
     if (!pcie.on()) {
-        if (E.main_hybrid) {   // no hybrid main layer: every expert is in VRAM, there is no share to report
+        if (E.main_hybrid) {   // no hybrid main layer (all in VRAM, or only the MTP block on the CPU pool): no share to report
             std::fprintf(stderr, "strata-q36: PCIe share off (%s)\n",
                          pcie.mode == strata::q36::PcieMode::Off ? "--pcie-frac 0"
                                                                  : "the default: --pcie-frac F or --pcie-frac auto turns it on");

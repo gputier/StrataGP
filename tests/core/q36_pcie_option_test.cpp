@@ -19,6 +19,8 @@ int main() {
         check(parse_pcie_option("1", &o) && o.mode == PcieMode::Fixed && o.frac == 1.0, "1: a fixed share");
         check(parse_pcie_option("0", &o) && o.mode == PcieMode::Off && !o.on(), "0: off, asked for");
         check(parse_pcie_option("0.0", &o) && o.mode == PcieMode::Off, "0.0 is off as well");
+        check(parse_pcie_option(".5", &o) && o.mode == PcieMode::Fixed && o.frac == 0.5, ".5 is a fixed share of 0.5");
+        check(parse_pcie_option("5.", &o) && o.mode == PcieMode::Fixed && o.frac == 5.0, "5. is a fixed value of 5");
         PcieOption keep{PcieMode::Fixed, 0.3};
         bool refused = true;
         for (const char* bad : {"", "abc", "Auto", "0.3x", " 0.3", "-0.1", "-1", "nan", "inf", "auto ", "0x8", "1e0", ".", "1.2.3"})
