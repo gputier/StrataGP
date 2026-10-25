@@ -72,9 +72,11 @@ int main() {
         b.pf_hits = 120;
         b.wait_layer_ms = {4, 5};
         a.rb_swaps = 7;
-        a.rb_bytes = 3'500'000LL;
+        a.rb_blob_bytes = 3'500'000LL;
+        a.rb_slot_bytes = 9'000LL;
         b.rb_swaps = 4;
-        b.rb_bytes = 1'000'000LL;
+        b.rb_blob_bytes = 1'000'000LL;
+        b.rb_slot_bytes = 4'000LL;
         a.rb_ms = 20.0;
         b.rb_ms = 7.5;
         const DecodeStats d = a - b;
@@ -89,9 +91,10 @@ int main() {
         check(has(line, "PCIe blobs per token: on demand 2.00, prefetched 2.00, prefetch hits 1.80 (90.0% of the prefetched)"),
               "the PCIe blobs by token: on demand, prefetched, hits and the hit rate");
         check(has(line, "host wait on the doorbell 20 ms over 100 layer steps (200.0 us each)"), "the doorbell wait");
-        check(d.rb_swaps == 3 && d.rb_bytes == 2'500'000LL && near(d.rb_ms, 12.5), "the difference of the rebalance counters");
-        check(has(line, "decode rebalances: 3 slot swaps, 2.5 MB copied, 12.5 ms of host time"),
-              "the decode cadence's rebalances: swaps, bytes copied and host time");
+        check(d.rb_swaps == 3 && d.rb_blob_bytes == 2'500'000LL && d.rb_slot_bytes == 5'000LL && near(d.rb_ms, 12.5),
+              "the difference of the rebalance counters");
+        check(has(line, "decode rebalances: 3 slot swaps, 2.5 MB of expert blobs, 5.0 KB of slot tables, 12.5 ms of host time"),
+              "the decode cadence's rebalances: swaps, blob bytes, slot table bytes and host time");
         check(has(format_decode_stats(0, DecodeStats(), 0), "(0 tokens)"), "no token, no division by zero");
         check(has(format_wait_layers(3, d), "by layer (ms): 6.0 15.0"), "the wait by layer line");
     }

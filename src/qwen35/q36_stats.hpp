@@ -107,7 +107,8 @@ struct DecodeStats {
     long long pf_hits = 0;       // picks of a layer step served from the prefetch (no copy)
     // the rebalances of the decode cadence (every rebalance_every positions or batch windows), not the one after a prompt
     long long rb_swaps = 0;      // slot replacements they applied
-    long long rb_bytes = 0;      // bytes they copied: the expert blobs, and the slot tables uploaded after them
+    long long rb_blob_bytes = 0; // bytes they copied as expert blobs (host to VRAM slots)
+    long long rb_slot_bytes = 0; // bytes they uploaded as slot tables (slot_of), one per changed layer
     double rb_ms = 0;            // their host time: the decode step's stream sync before them (after_rows) and their own included
 };
 
@@ -128,7 +129,8 @@ inline DecodeStats operator-(const DecodeStats& a, const DecodeStats& b) {
     d.pf_issued = a.pf_issued - b.pf_issued;
     d.pf_hits = a.pf_hits - b.pf_hits;
     d.rb_swaps = a.rb_swaps - b.rb_swaps;
-    d.rb_bytes = a.rb_bytes - b.rb_bytes;
+    d.rb_blob_bytes = a.rb_blob_bytes - b.rb_blob_bytes;
+    d.rb_slot_bytes = a.rb_slot_bytes - b.rb_slot_bytes;
     d.rb_ms = a.rb_ms - b.rb_ms;
     return d;
 }
@@ -218,7 +220,8 @@ inline std::string format_steps(int session, const StepLog& log) {
 inline double gbps(long long bytes, double ms) { return ms > 0 ? (double) bytes / 1e9 / (ms / 1e3) : 0.0; }
 
 /// The pool, bytes and doorbell line of a request that produced `tokens` tokens, then the PCIe blobs by token: copied on
-/// demand, prefetched ahead, and the picks the prefetch served (the hit rate is over the prefetched blobs).
+/// demand, prefetched ahead, and the picks the prefetch served (the hit rate is over the prefetched blobs), and the decode
+/// rebalances' bytes as expert blobs and as slot tables (the share of picks each path served is the request's own line).
 inline std::string format_decode_stats(int session, const DecodeStats& d, long long tokens) {
     const double t = tokens > 0 ? (double) tokens : 1.0;
     char b[1280];
@@ -227,7 +230,7 @@ inline std::string format_decode_stats(int session, const DecodeStats& d, long l
                   "%.2f GB/s over the row phases (%.2f over all three); bytes per token: GPU %.1f MB, PCIe %.1f MB, CPU %.1f MB "
                   "(%lld tokens); host wait on the doorbell %.0f ms over %lld layer steps (%.1f us each), host serving %.0f ms "
                   "(%.1f us each); PCIe blobs per token: on demand %.2f, prefetched %.2f, prefetch hits %.2f (%.1f%% of the prefetched); "
-                  "decode rebalances: %lld slot swaps, %.1f MB copied, %.1f ms of host time",
+                  "decode rebalances: %lld slot swaps, %.1f MB of expert blobs, %.1f KB of slot tables, %.1f ms of host time",
                   session, d.pool_gu_ms + d.pool_q_ms + d.pool_down_ms, d.pool_gu_ms, d.pool_q_ms, d.pool_down_ms,
                   (double) d.cpu_bytes / 1e9, gbps(d.cpu_bytes, d.pool_gu_ms + d.pool_down_ms),
                   gbps(d.cpu_bytes, d.pool_gu_ms + d.pool_q_ms + d.pool_down_ms), (double) d.gpu_bytes / 1e6 / t,
@@ -235,7 +238,7 @@ inline std::string format_decode_stats(int session, const DecodeStats& d, long l
                   d.steps ? 1e3 * d.wait_ms / (double) d.steps : 0.0, d.serve_ms,
                   d.steps ? 1e3 * d.serve_ms / (double) d.steps : 0.0, (double) d.pcie_demand / t, (double) d.pf_issued / t,
                   (double) d.pf_hits / t, d.pf_issued ? 100.0 * (double) d.pf_hits / (double) d.pf_issued : 0.0, d.rb_swaps,
-                  (double) d.rb_bytes / 1e6, d.rb_ms);
+                  (double) d.rb_blob_bytes / 1e6, (double) d.rb_slot_bytes / 1e3, d.rb_ms);
     return b;
 }
 

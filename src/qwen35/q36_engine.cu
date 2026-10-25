@@ -3163,13 +3163,13 @@ struct Engine {
             });
             changed[(size_t) w.layer] = 1;
             ++hy_swaps;
-            if (count) stat_acc.rb_bytes += (long long) L.L.bytes;
+            if (count) stat_acc.rb_blob_bytes += (long long) L.L.bytes;
         }
         for (size_t li = 0; li < hy.size(); ++li) {
             if (changed[li]) {
                 CK(cudaMemcpyAsync(hy[li].slot_of_d, hy[li].slot_of.data(), (size_t) m->g.n_expert * 4,
                                    cudaMemcpyHostToDevice, st));
-                if (count) stat_acc.rb_bytes += (long long) m->g.n_expert * 4;
+                if (count) stat_acc.rb_slot_bytes += (long long) m->g.n_expert * 4;
             }
             for (double& v : hy[li].score) v *= strata::q36::kRebalanceDecay;
         }
