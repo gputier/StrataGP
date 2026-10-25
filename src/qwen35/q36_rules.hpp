@@ -32,9 +32,10 @@ Q36_HD inline bool hybrid_graph_off(bool main_hybrid, int hybrid_t, int verify_r
 /// bigger chunk pays that copy for more tokens.  4096 is taken only where it was measured: an RTX 5090 with 23.2 GiB free on
 /// Ornith-1.5-122B, a 34,257-token prompt read 62 % faster than at 2048 for 4 % less decode at short context (issue #104,
 /// 25 October 2026).  It is for one session only: with several sessions a chunk holds the other sessions' decode windows for
-/// its whole length.  The 7.5 / 5.5 GiB steps are unchanged.
-inline int hybrid_prompt_chunk(double free_gib, int sessions) {
-    if (free_gib >= 20.0 && sessions <= 1) return 4096;
+/// its whole length.  With slots or an expert VRAM budget given by hand (auto_slots false) the 4096 step is not taken, since
+/// its buffers would take the room of those slots.  The 7.5 / 5.5 GiB steps are unchanged.
+inline int hybrid_prompt_chunk(double free_gib, int sessions, bool auto_slots) {
+    if (free_gib >= 20.0 && sessions <= 1 && auto_slots) return 4096;
     return free_gib >= 7.5 ? 2048 : free_gib >= 5.5 ? 1024 : 512;
 }
 

@@ -91,15 +91,18 @@ int main() {
         check(self_copies == std::vector<Pair>({{1, 1}}), "and copies it into that slot again");
     }
     std::printf("hybrid_prompt_chunk:\n");
-    check(hybrid_prompt_chunk(23.2, 1) == 4096, "23.2 GiB free, one session: 4096");
-    check(hybrid_prompt_chunk(20.0, 1) == 4096, "20.0 GiB free, one session: 4096");
-    check(hybrid_prompt_chunk(19.99, 1) == 2048, "19.99 GiB free, one session: 2048");
-    check(hybrid_prompt_chunk(23.2, 2) == 2048, "23.2 GiB free, two sessions: 2048");
-    check(hybrid_prompt_chunk(23.2, 0) == 4096, "23.2 GiB free, 0 sessions (one at a time): 4096");
-    check(hybrid_prompt_chunk(7.5, 1) == 2048, "7.5 GiB free: 2048");
-    check(hybrid_prompt_chunk(7.49, 1) == 1024, "7.49 GiB free: 1024");
-    check(hybrid_prompt_chunk(5.5, 1) == 1024, "5.5 GiB free: 1024");
-    check(hybrid_prompt_chunk(5.49, 1) == 512, "5.49 GiB free: 512");
+    check(hybrid_prompt_chunk(23.2, 1, true) == 4096, "23.2 GiB free, one session: 4096");
+    check(hybrid_prompt_chunk(20.0, 1, true) == 4096, "20.0 GiB free, one session: 4096");
+    check(hybrid_prompt_chunk(19.99, 1, true) == 2048, "19.99 GiB free, one session: 2048");
+    check(hybrid_prompt_chunk(23.2, 2, true) == 2048, "23.2 GiB free, two sessions: 2048");
+    check(hybrid_prompt_chunk(23.2, 0, true) == 4096, "23.2 GiB free, 0 sessions (one at a time): 4096");
+    check(hybrid_prompt_chunk(7.5, 1, true) == 2048, "7.5 GiB free: 2048");
+    check(hybrid_prompt_chunk(7.49, 1, true) == 1024, "7.49 GiB free: 1024");
+    check(hybrid_prompt_chunk(5.5, 1, true) == 1024, "5.5 GiB free: 1024");
+    check(hybrid_prompt_chunk(5.49, 1, true) == 512, "5.49 GiB free: 512");
+    check(hybrid_prompt_chunk(23.2, 1, false) == 2048, "23.2 GiB free, one session, slots by hand: 2048");
+    check(hybrid_prompt_chunk(20.0, 1, false) == 2048, "20.0 GiB free, one session, slots by hand: 2048");
+    check(hybrid_prompt_chunk(5.49, 1, false) == 512, "5.49 GiB free, slots by hand: 512");
     std::printf("%s\n", g_fail ? "FAILED" : "all passed");
     return g_fail ? 1 : 0;
 }

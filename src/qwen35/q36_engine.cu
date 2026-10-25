@@ -5050,10 +5050,10 @@ int strata::qwen35::run(int argc, char** argv) {
                     break;
                 }
         } else if (!fits) {
-            // the hybrid mode: hybrid_prompt_chunk (q36_rules.hpp), 2048 by default, 4096 on a big card with one session, less on a
-            // small card where the chunk's buffers would take the slots' room
+            // the hybrid mode: hybrid_prompt_chunk (q36_rules.hpp), 2048 by default, 4096 on a big card with one session and automatic
+            // slots, less on a small card where the chunk's buffers would take the slots' room
             const double fr_gib = (double) fr / GiB;
-            chunk = strata::q36::hybrid_prompt_chunk(fr_gib, std::max(1, batch));
+            chunk = strata::q36::hybrid_prompt_chunk(fr_gib, std::max(1, batch), expert_slots <= 0 && expert_vram < 0);
         }
         if (const char* cv = std::getenv("STRATA_Q36_CHUNK")) chunk = std::max(256, std::min(4096, std::atoi(cv)));   // force a chunk (512: the old default)
         if (std::getenv("STRATA_Q36_PLACE_DEBUG"))
