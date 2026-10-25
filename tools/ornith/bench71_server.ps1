@@ -5,8 +5,9 @@ two other sessions decode a long greedy answer on the same server; every resumed
 
 .DESCRIPTION
 Starts one serve\server.py with the strata engine (a config of its own: the CLI bench's engine arguments and "parallel": 3 batch
-slots; -ExtraArgs and -ExtraEnv add more), stopped the way measure_partition.ps1 does it (process tree by parent PID, in a
-finally block). Then, -Runs times (default 40, -Trial: 2): two greedy load requests of -LoadTokens tokens are kept in flight
+slots; -ExtraArgs and -ExtraEnv add more), stopped by Stop-ServerTree as measure_partition.ps1 stops it (process tree by
+parent PID, in a finally block; unlike measure_partition.ps1 it does not wait for the GPU memory to come back, the next
+start's pre-flight refuses a busy GPU). Then, -Runs times (default 40, -Trial: 2): two greedy load requests of -LoadTokens tokens are kept in flight
 (a finished one is replaced, then -LoadSettleS seconds of settling), one greedy chat request for p00 asks -Tokens tokens (default:
 ids in p00.force + 1), and its output is compared with run 0. A run is "under load" when loads=2/2 at its start and its end.
 The server takes chat messages only and returns text, usage and finish_reason: no token ids, no logprobs (see

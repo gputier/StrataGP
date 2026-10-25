@@ -43,6 +43,9 @@ ENGINE_LOG = (
 # the stats line's tail as the engine prints it since issue #96 (q36_stats.hpp): the decode rebalances' cost
 REB_OLD = "(12.3% of the prefetched)\n"
 REB_NEW = "(12.3% of the prefetched); decode rebalances: 42 slot swaps, 12.5 MB copied, 3.2 ms of host time\n"
+# and as it prints it since the cost was split into expert blobs and slot tables (q36_stats.hpp format_decode_stats)
+REB_SPLIT = ("(12.3% of the prefetched); decode rebalances: 304 slot swaps, 1240.2 MB of expert blobs, "
+             "287.7 KB of slot tables, 37.1 ms of host time\n")
 
 MEM_LOG = (
     "0.0 30000000 -1 -1\n"
@@ -174,6 +177,16 @@ class ParseEngineLog(unittest.TestCase):
         self.assertAlmostEqual(launch.rb_ms, 3.2)
         self.assertEqual(launch.tokens, 300)
         self.assertEqual(ps.RE_STATS.search(ENGINE_LOG.replace(REB_OLD, REB_NEW)).group(21), "12.3")
+        self.assertIsNone(launch.rb_slot_kb)
+
+    def test_split_rebalance_cost_is_read(self):
+        launch = ps.Launch("x")
+        ps.parse_engine_log(ENGINE_LOG.replace(REB_OLD, REB_SPLIT), launch)
+        self.assertEqual(launch.problems, [])
+        self.assertEqual(launch.rb_swaps, 304)
+        self.assertAlmostEqual(launch.rb_mb, 1240.2)
+        self.assertAlmostEqual(launch.rb_slot_kb, 287.7)
+        self.assertAlmostEqual(launch.rb_ms, 37.1)
 
     def test_old_stats_line_without_rebalances_still_parses(self):
         launch = ps.Launch("x")
@@ -486,7 +499,7 @@ class Summary(unittest.TestCase):
             root = Path(tmp)
             gib13 = 13 * 1024 * 1024
             self.make_launch(root, "launch_01", 30.0, gib13, rebalances="10 slot swaps, 2.0 MB copied, 1.0 ms of host time")
-            self.make_launch(root, "launch_02", 32.0, gib13, rebalances="20 slot swaps, 4.0 MB copied, 2.0 ms of host time")
+            self.make_launch(root, "launch_02", 32.0, gib13, rebalances="20 slot swaps, 4.0 MB of expert blobs, 6.0 KB of slot tables, 2.0 ms of host time")
             self.make_launch(root, "launch_03", 50.0, gib13, own_stats=False)   # only the warm-up's stats line
             text = ps.summary(sorted(root.glob("launch_*")))
         self.assertIn("median over the measured launches (2 of 3)", text)
@@ -498,6 +511,8 @@ class Summary(unittest.TestCase):
         self.assertEqual(swaps.split()[-1], "15")
         mb = [l for l in text.splitlines() if l.strip().startswith("decode rebalances: MB copied")][0]
         self.assertEqual(mb.split()[-1], "3.0")
+        kb = [l for l in text.splitlines() if l.strip().startswith("decode rebalances: KB of slot tables")][0]
+        self.assertEqual(kb.split()[-1], "6.0")   # the one launch that has them
         host = [l for l in text.splitlines() if l.strip().startswith("decode rebalances: host ms")][0]
         self.assertEqual(host.split()[-1], "1.5")
 

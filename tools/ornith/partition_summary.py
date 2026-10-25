@@ -16,7 +16,8 @@ Engine lines read (src/qwen35/q36_engine.cu and src/qwen35/q36_stats.hpp):
   strata serve: session S: experts on the GPU ..., N slot replacements, PCIe share H
   strata serve: session S: stats: pool ... ms (gate/up ..., quantize ..., down ...), ... bytes per token: GPU ... MB,
       PCIe ... MB, CPU ... MB (T tokens); host wait on the doorbell W ms over L layer steps (...), host serving ...
-      ...; decode rebalances: N slot swaps, B MB copied, H ms of host time   (this last part is optional: older lines lack it)
+      ...; decode rebalances: N slot swaps, B MB of expert blobs, K KB of slot tables, H ms of host time   (this last part
+      is optional: older lines lack it; lines of before issue #96's split say "B MB copied" for blobs and tables together)
   strata-q36: stats: wire window K: share ..., B blobs chosen for PCIe (...), busy U us on the copy streams: ...
   strata serve: session S: stats: decode steps (pool/wait/host/PCIe copies ms[/rows]), N steps, M listed: p/w/h/c ...
       (optional: older engines lack it; one p/w/h/c group per decode step, /r after it for a step of r > 1 rows)
@@ -64,7 +65,8 @@ RE_STATS = re.compile(
     r" ms over (\d+) layer steps \(" + NUM + r" us each\), host serving " + NUM + r" ms \(" + NUM + r" us each\); "
     r"PCIe blobs per token: on demand " + NUM + r", prefetched " + NUM + r", prefetch hits " + NUM + r" \(" + NUM +
     r"% of the prefetched\)"
-    r"(?:; decode rebalances: (\d+) slot swaps, " + NUM + r" MB copied, " + NUM + r" ms of host time)?")
+    r"(?:; decode rebalances: (\d+) slot swaps, (?:" + NUM + r" MB copied|" + NUM + r" MB of expert blobs, " + NUM +
+    r" KB of slot tables), " + NUM + r" ms of host time)?")
 RE_WIRE = re.compile(
     r"strata-q36: stats: wire window (\d+): share " + NUM + r", (\d+) blobs chosen for PCIe \((\d+) on demand, (\d+) "
     r"prefetched\), busy " + NUM + r" us on the copy streams: " + NUM + r" us per chosen blob, " + NUM +
@@ -142,7 +144,8 @@ class Launch:
     cpu_mb: Optional[float] = None
     pcie_busy_ms: Optional[float] = None   # copy streams' busy time per decode step (overlaps the rest; not additive)
     rb_swaps: Optional[int] = None         # the decode rebalances of the request: slot swaps (None: an older stats line)
-    rb_mb: Optional[float] = None          # their copies and slot table uploads, MB
+    rb_mb: Optional[float] = None          # their expert blob copies, MB (with the slot table uploads on an older line)
+    rb_slot_kb: Optional[float] = None     # their slot table uploads, KB (None: a line of before the split)
     rb_ms: Optional[float] = None          # their host time, ms
     stats_tied: bool = False               # the stats line is the measured request's (after its generated line, same session
                                            # and same token count)
@@ -290,8 +293,10 @@ def parse_engine_log(text: str, launch: Launch) -> None:
     launch.wait_ms = float(g[12])
     if g[21] is not None:
         launch.rb_swaps = int(g[21])
-        launch.rb_mb = float(g[22])
-        launch.rb_ms = float(g[23])
+        launch.rb_mb = float(g[22] if g[22] is not None else g[23])
+        if g[24] is not None:
+            launch.rb_slot_kb = float(g[24])
+        launch.rb_ms = float(g[25])
     if int(gen.group(7)) != launch.tokens:
         launch.problems.append(f"token counts differ: {gen.group(7)} generated, {launch.tokens} in the stats line: not measured")
     else:
@@ -432,6 +437,7 @@ METRICS = [
     ("CPU pool MB per token", lambda l: l.cpu_mb, "{:.1f}"),
     ("decode rebalances: slot swaps", lambda l: l.rb_swaps, "{:.0f}"),
     ("decode rebalances: MB copied", lambda l: l.rb_mb, "{:.1f}"),
+    ("decode rebalances: KB of slot tables", lambda l: l.rb_slot_kb, "{:.1f}"),
     ("decode rebalances: host ms", lambda l: l.rb_ms, "{:.1f}"),
     ("TTFT ms (streamed)", lambda l: l.ttft_ms, "{:.0f}"),
     ("inter-token p50 ms", lambda l: l.itl_p50, "{:.2f}"),
