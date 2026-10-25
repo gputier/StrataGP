@@ -97,6 +97,23 @@ about 57 GB/s from four threads. A three-token window touches 79 % of the expert
 took 37.7 ms: 16.6 ms in the pool, 8.9 ms waiting for the GPU. Large pages were not available: the process lacks
 `SeLockMemoryPrivilege`.
 
+### Expert arena in large pages (25 October)
+
+The expert arena, about 34 GB of expert blobs in host memory, is built by `PinnedArena` (`include/strata/core/pinned.hpp`,
+`src/qwen35/q36_engine.cu`, `place_experts`). It asks for large pages first: on Windows, `VirtualAlloc(MEM_LARGE_PAGES)`,
+which needs `SeLockMemoryPrivilege`; otherwise 4 KB pages (`src/core/pinned.cu:396-476`). The arena is registered with CUDA
+before any page is touched. If the registration does not cover the whole arena, the engine releases it and falls back to
+`cudaHostAlloc`, then to malloc, as before, and prints a warning that names the refusal.
+
+- `STRATA_NO_LARGEPAGES=1` forces 4 KB pages. No new variable was added.
+- `STRATA_Q36_STATS=1` prints the backing actually used: large pages, 4 KB pages pinned by registration, or the
+  `cudaHostAlloc` fallback.
+- Prerequisite on Windows: the account that runs the engine needs `SeLockMemoryPrivilege`. The Ornith box's account did not
+  have it on 25 October 2026 (`whoami /priv`).
+- Not measured. Whether CUDA registers a large-page region under WDDM is open, and so is the throughput and KL against the
+  previous build. Both are to be measured on the Ornith box with `tools/ornith/measure_partition.ps1`, three alternated
+  rounds, with and without `STRATA_NO_LARGEPAGES=1`.
+
 ### Identity bisection (21 October)
 
 Four commits were built and compared to find where greedy output changed. `dfcfa856` and `0f4a3e90` match the reference.

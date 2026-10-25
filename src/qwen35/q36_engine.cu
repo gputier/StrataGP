@@ -23,6 +23,7 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/family_layout.hpp"
 #include "strata/core/pcie_share.hpp"
+#include "strata/core/pinned.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/fused_gdn.hpp"
@@ -1549,6 +1550,9 @@ struct Engine {
         const Layer& L = li < m->layers.size() ? m->layers[li] : m->mtp;
         return L.n_slots < (int) m->g.n_expert;
     }
+    // place_experts: the host copy of every expert, which L.hblobs points into. Declared before `pool`, so it is released
+    // after the pool's threads have stopped.
+    std::unique_ptr<strata::core::PinnedArena> expert_arena;
 #if defined(STRATA_Q36_CPU_POOL)
     std::unique_ptr<strata::kernels::cpu::ExpertPool> pool;
     std::vector<strata::kernels::cpu::ExpertJobMulti> jobs;
@@ -3875,24 +3879,43 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             return false;
         }
     }
-    // host memory: every expert, pinned where the driver allows it (the prompt's stream and the slot copies)
+    // host memory: every expert, pinned where the driver allows it (the prompt's stream and the slot copies). First a
+    // PinnedArena, in large pages where the OS grants them and in 4 KB pages otherwise, registered with CUDA before any
+    // page is touched. An arena that CUDA does not register in full is released, and the experts take cudaHostAlloc,
+    // then malloc, as before.
     size_t host = 0;
     for (Layer* L : all)
         if (!mtp_only || L == &m.mtp) host += L->stride * (size_t) ne + kMmqTail;
     uint8_t* arena = nullptr;
-    bool pinned = cudaHostAlloc((void**) &arena, host, cudaHostAllocDefault) == cudaSuccess;
-    if (!pinned) {
-        (void) cudaGetLastError();
-        arena = (uint8_t*) std::malloc(host);
-        if (!arena) {
-            err = "no host memory for the experts (" + std::to_string(host >> 20) + " MiB)";
-            return false;
+    bool pinned = false;
+    std::string how;
+    E.expert_arena = std::make_unique<strata::core::PinnedArena>(host);
+    const strata::core::PinnedArena& pa = *E.expert_arena;
+    if (pa.valid() && pa.registered_bytes == pa.capacity) {
+        arena = pa.data();
+        pinned = true;
+        how = std::string(pa.backing == strata::core::PageBacking::LargePages ? "large pages" : "4 KB pages") +
+              " pinned by CUDA registration (" + pa.note + ")";
+    } else {
+        if (pa.valid())
+            std::fprintf(stderr, "strata-q36: the expert arena is not pinned (%s); falling back to cudaHostAlloc\n",
+                         pa.note.c_str());
+        E.expert_arena.reset();   // `pa` is not read past this line
+        (void) cudaGetLastError();   // releasing an arena that CUDA never registered can leave its error set
+        pinned = cudaHostAlloc((void**) &arena, host, cudaHostAllocDefault) == cudaSuccess;
+        if (!pinned) {
+            (void) cudaGetLastError();
+            arena = (uint8_t*) std::malloc(host);
+            if (!arena) {
+                err = "no host memory for the experts (" + std::to_string(host >> 20) + " MiB)";
+                return false;
+            }
         }
+        how = pinned ? "cudaHostAlloc memory (pinned, default flags)" : "malloc memory (cudaHostAlloc failed, not pinned)";
     }
     if (E.stats_on)
         std::fprintf(stderr, "strata-q36: stats: the expert arena (%.2f GiB) is %s\n", (double) host / (1024.0 * 1024.0 * 1024.0),
-                     pinned ? "cudaHostAlloc memory (pinned, default flags, no large pages)"
-                            : "malloc memory (cudaHostAlloc failed, not pinned)");
+                     how.c_str());
     size_t off = 0;
     E.hy.resize(all.size());
     for (size_t li = 0; li < all.size(); ++li) {
