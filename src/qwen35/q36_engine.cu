@@ -1621,6 +1621,7 @@ struct Engine {
         int chosen = 0, demand = 0, prefetch = 0;
         size_t bytes = 0;
         double launch_ms = 0.0;   // the host time spent picking, launching and planning the step's PCIe copies
+        long long step = 0;       // STRATA_Q36_STATS=1: the decode step that issued the copies (StepLog::id)
     };
     struct WireCount {
         double wire_ms = 0, bytes = 0, cpu_ms = 0, launch_ms = 0;
@@ -1632,12 +1633,27 @@ struct Engine {
     WireCount wire, wire_mark;
     int wire_steps = 0, wire_logs = 0;
     // STRATA_Q36_STATS=1 (q36_stats.hpp): the bytes each path reads, the host's wait on the doorbell, the experts' union over
-    // consecutive tokens; every use below is behind stats_on, so a run without the switch reads no clock and adds no sync
+    // consecutive tokens, the partition of each decode step; every use below is behind stats_on, so a run without the switch
+    // reads no clock and adds no sync
     const bool stats_on = strata::q36::stats_enabled();
     strata::q36::DecodeStats stat_acc;
     strata::q36::ExpertUnion stat_union;
     long long stat_mixed = 0;          // decode windows of two or more sessions, and requests started beside a decoding one
     std::vector<char> stat_hit_mark;   // per expert: counted as a resident expert read by this layer step
+    strata::q36::StepLog stat_steps;   // the request's decode steps (after_rows), for its decode steps line
+    Clock::time_point stat_step_t;     // the last step's close (the decode's start for the first)
+    /// The pool's row phases so far, ms (0 without the pool).
+    double stat_pool_ms() const {
+#if defined(STRATA_Q36_CPU_POOL)
+        if (pool) return pool->ms_multi_gu + pool->ms_multi_q + pool->ms_multi_down;
+#endif
+        return 0.0;
+    }
+    /// The request's decode starts: its steps are logged from here.
+    void stat_steps_begin() {
+        stat_steps.begin(stat_pool_ms(), stat_acc.wait_ms);
+        stat_step_t = Clock::now();
+    }
     /// The accumulated counters now, the pool's included (the request's figures are the difference of two snapshots).
     strata::q36::DecodeStats stat_snapshot() const {
         strata::q36::DecodeStats d = stat_acc;
@@ -1679,7 +1695,8 @@ struct Engine {
     }
     /// Reads the layer steps whose copies have completed, in order (the first one still copying ends the pass).
     void wire_resolve() {
-        std::vector<std::pair<double, double>> iv;
+        std::vector<std::pair<double, double>> iv, step_iv;   // step_iv (stats): the intervals of one decode step's copies
+        long long step = -1;
         while (!wire_pending.empty()) {
             WireStep& r = wire_pending.front();
             bool done = true;
@@ -1696,6 +1713,14 @@ struct Engine {
             }
             if (ok) {
                 iv.insert(iv.end(), mine.begin(), mine.end());
+                if (stats_on) {   // the layer steps are in order: one decode step's copies are read together
+                    if (r.step != step) {
+                        stat_steps.add_pcie(step, strata::q36::interval_union_ms(step_iv));
+                        step_iv.clear();
+                        step = r.step;
+                    }
+                    step_iv.insert(step_iv.end(), mine.begin(), mine.end());
+                }
                 wire.launch_ms += r.launch_ms;
                 wire.chosen += r.chosen;
                 wire.demand += r.demand;
@@ -1707,6 +1732,7 @@ struct Engine {
             wire_pending.pop_front();
         }
         wire.wire_ms += strata::q36::interval_union_ms(iv);
+        if (stats_on) stat_steps.add_pcie(step, strata::q36::interval_union_ms(step_iv));
     }
     /// STRATA_Q36_STATS=1: one line per window (48 steps, then 96 each, as PcieAuto's updates): the wire time measured against
     /// the blobs chosen for PCIe and the blobs that crossed the link, and the share c / (c + w - l) gives with it.
@@ -1793,9 +1819,16 @@ struct Engine {
     }
     void after_rows(int n) {   // a decode step / verify window kept n rows: count them, rebalance at the boundary
         if (!m->hybrid) return;
+        if (stats_on) stat_steps.open(n);   // the step's entry, before pcie_window resolves its copies into it
         count_rows(n);
         pcie_window(n);
         if (pos % rebalance_every == 0) rebalance_cadence(true);
+        if (stats_on) {   // the step ends after its rebalance: that host time is the step's
+            const Clock::time_point now = Clock::now();
+            stat_steps.close(stat_pool_ms(), stat_acc.wait_ms,
+                             std::chrono::duration<double, std::milli>(now - stat_step_t).count());
+            stat_step_t = now;
+        }
     }
     /// A rebalance of the decode cadence (after_rows, run_rows): at most 8 replacements.  The stats count its swaps, bytes and
     /// host time (rb_ms), the stream synchronisation before it (`sync`) and its own included; the default path reads no clock.
@@ -2963,6 +2996,7 @@ struct Engine {
             launch_ms = ms_since(l0);
             ws.chosen = n_pcie;
             ws.launch_ms = launch_ms;
+            if (stats_on) ws.step = stat_steps.id();
             wire_pending.push_back(ws);
         }
         int n_pcie_ent = 0;
@@ -4646,6 +4680,7 @@ struct Serve {
             std::mt19937_64 r = draw_rng(smp.seed, (uint64_t) (E.pos + t));
             return (int32_t) sample(lg, smp, hist, r, dr, (size_t) t);
         };
+        if (E.stats_on) E.stat_steps_begin();
         bool known = false;   // nx came out of a verify window already
         bool no_logit = false;   // a pick had no finite logit (-1): the request ends in ERR, that pick is not emitted
         for (;;) {
@@ -4698,6 +4733,7 @@ struct Serve {
             fix.clear();
             if (!smp.needs_logits()) nx = E.greedy();
         }
+        if (E.stats_on) E.stat_steps.stop();
         E.sess[(size_t) E.cur].pos = E.pos;
         if (no_logit) {
             std::printf("ERR %s\n", kNoLogitMsg);
@@ -4720,8 +4756,9 @@ struct Serve {
                          pct(hp), hp, pct(hcpu), hcpu, E.hy_swaps - hs0, E.pcie_num / 256.0);
             if (E.stats_on && strata::q36::single_decoder(alone, mixed0, E.stat_mixed)) {
                 const strata::q36::DecodeStats d = E.stat_snapshot() - stat0;
-                std::fprintf(stderr, "%s\n%s\n%s\n", strata::q36::format_decode_stats(s, d, produced).c_str(),
-                             strata::q36::format_wait_layers(s, d).c_str(), strata::q36::format_union(s, E.stat_union).c_str());
+                std::fprintf(stderr, "%s\n%s\n%s\n%s\n", strata::q36::format_decode_stats(s, d, produced).c_str(),
+                             strata::q36::format_wait_layers(s, d).c_str(), strata::q36::format_union(s, E.stat_union).c_str(),
+                             strata::q36::format_steps(s, E.stat_steps).c_str());
             }
         }
     }

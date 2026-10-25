@@ -18,9 +18,12 @@ Engine lines read (src/qwen35/q36_engine.cu and src/qwen35/q36_stats.hpp):
       PCIe ... MB, CPU ... MB (T tokens); host wait on the doorbell W ms over L layer steps (...), host serving ...
       ...; decode rebalances: N slot swaps, B MB copied, H ms of host time   (this last part is optional: older lines lack it)
   strata-q36: stats: wire window K: share ..., B blobs chosen for PCIe (...), busy U us on the copy streams: ...
+  strata serve: session S: stats: decode steps (pool/wait/host/PCIe copies ms[/rows]), N steps, M listed: p/w/h/c ...
+      (optional: older engines lack it; one p/w/h/c group per decode step, /r after it for a step of r > 1 rows)
 The stats line is printed only for a single decoding session, right after its request's generated line: the one read is the
-first of the same session after the last generated line. The wire window K covers 48 steps for K = 1 and 96 after; only
-the windows printed during the measured request are read (a window that straddles the warm-up's end is counted whole).
+first of the same session after the last generated line, and so is the decode steps line. The wire window K covers 48 steps
+for K = 1 and 96 after; only the windows printed during the measured request are read (a window that straddles the warm-up's
+end is counted whole).
 The "PCIe copies ms per decode step" figure is the busy time of those windows over the decode steps of the measured request,
 taken from its stats line (the "(T tokens)" count: one step per token with --mtp 0), not over the printed windows' steps: the
 engine counts every window and prints only those with copies. It is n/a without the stats line or without a wire window.
@@ -29,9 +32,14 @@ chunks.tsv: one line per streamed chunk that carried text, "index<TAB>t_ms<TAB>c
 request was sent. The inter-token time is the time between two consecutive such chunks (one chunk per token when the chunk
 count equals usage.completion_tokens; otherwise the launch says so and the times are per chunk).
 
-The per-token partition by path is the request's counters divided by its tokens: the engine counts per request and per copy
-window, not per token, so the slow tokens (above the p95) are measured as times and as a share of the decode time, and their
-excess over the median is reported, but which path made a given token slow is not in the logs.
+The per-token partition by path is the request's counters divided by its tokens; the slow tokens (above the p95) are
+measured as times and as a share of the decode time, and their excess over the median is reported. With the decode steps
+line, each slow token is matched to the decode step that produced it: the first token comes from the prompt, then decode
+step k gives the next r_k tokens (r_k = 1 with --mtp 0), and the inter-token time before the first of them is the step's.
+The match needs one text chunk per token and step rows that add up to the token count; otherwise the launch says why and
+has no attribution. For each matched slow token the stage that made it slow is the one with the largest excess over the
+launch's median step (pool, GPU wait, host, PCIe copies; the copies overlap the other three, so their excess can be the
+pool's or the host's too). Without the decode steps line, which path made a given token slow is not in the logs.
 """
 from __future__ import annotations
 
@@ -62,6 +70,9 @@ RE_WIRE = re.compile(
     r"prefetched\), busy " + NUM + r" us on the copy streams: " + NUM + r" us per chosen blob, " + NUM +
     r" us per blob on the wire, " + NUM + r" GB/s; CPU path " + NUM + r" us per job, launch " + NUM +
     r" us per chosen blob -> c / \(c \+ w - l\) = " + NUM)
+RE_STEPS = re.compile(
+    r"strata serve: session (\d+): stats: decode steps \(pool/wait/host/PCIe copies ms\[/rows\]\), (\d+) steps, (\d+) "
+    r"listed:([^\n]*)")
 RE_MEM = re.compile(r"^" + NUM + r" (\d+) (-?\d+) (-?\d+)$")
 
 
@@ -71,6 +82,42 @@ class Mem:
     max_vram_used_mib: Optional[int] = None
     vram_total_mib: Optional[int] = None
     samples: int = 0
+
+
+STAGES = ("pool", "wait", "host", "PCIe")
+
+
+@dataclass
+class Step:
+    """One decode step of the decode steps line: the pool, the host's wait on the GPU, the host outside both, the copy streams'
+    busy time on its PCIe copies (ms), and the rows (tokens) it kept."""
+    pool: float
+    wait: float
+    host: float
+    pcie: float
+    rows: int = 1
+
+    def stage(self, name: str) -> float:
+        return {"pool": self.pool, "wait": self.wait, "host": self.host, "PCIe": self.pcie}[name]
+
+    @property
+    def wall(self) -> float:
+        """The step's wall time: pool + wait + host (the copies overlap them)."""
+        return self.pool + self.wait + self.host
+
+
+def parse_steps(listed: str) -> Optional[list]:
+    """The steps of a decode steps line's list (" p/w/h/c[/r] ..."); None when a group is malformed."""
+    steps = []
+    for group in listed.split():
+        parts = group.split("/")
+        if len(parts) not in (4, 5):
+            return None
+        try:
+            steps.append(Step(*(float(x) for x in parts[:4]), rows=int(parts[4]) if len(parts) == 5 else 1))
+        except ValueError:
+            return None
+    return steps
 
 
 def percentile(values: list, q: float) -> Optional[float]:
@@ -99,6 +146,8 @@ class Launch:
     rb_ms: Optional[float] = None          # their host time, ms
     stats_tied: bool = False               # the stats line is the measured request's (after its generated line, same session
                                            # and same token count)
+    steps: Optional[list] = None           # the measured request's decode steps (None: no decode steps line)
+    steps_total: int = 0                   # the steps it ran, the ones the line does not list included
     share: Optional[float] = None          # the PCIe share at the end of the measured request
     share_before: Optional[float] = None   # the PCIe share at the end of the request before it (the warm-up)
     asked: Optional[int] = None            # max_tokens of the measured request
@@ -152,6 +201,44 @@ class Launch:
         slow = self.slow_gaps
         p50 = self.itl_p50
         return statistics.mean(slow) - p50 if slow and p50 is not None else None
+
+    def step_of_gaps(self) -> tuple:
+        """The decode step behind each inter-token time: (a list with, per gap, the index of the step whose first token ends
+        it, or None for a step's later tokens; None and the reason when the steps and the streamed tokens do not match)."""
+        if self.steps is None:
+            return None, "no decode steps line"
+        if self.completion_tokens is not None and self.completion_tokens != self.tokens:
+            return None, f"usage.completion_tokens {self.completion_tokens} for {self.tokens} engine tokens"
+        if len(self.chunk_ms) != self.tokens:
+            return None, f"{len(self.chunk_ms)} text chunks for {self.tokens} tokens"
+        rows = [s.rows for s in self.steps]
+        if len(self.steps) == self.steps_total:
+            # the last step's rows may run past the end of the answer (an end of answer or max_tokens inside a verify window)
+            if not (1 + sum(rows[:-1]) < self.tokens <= 1 + sum(rows) if rows else self.tokens <= 1):
+                return None, f"{self.steps_total} decode steps of {sum(rows)} rows for {self.tokens} tokens"
+        elif 1 + sum(rows) > self.tokens:
+            return None, f"{len(self.steps)} listed decode steps of {sum(rows)} rows for {self.tokens} tokens"
+        of = [None] * len(self.gaps_ms)
+        token = 1
+        for k, r in enumerate(rows):
+            if token - 1 < len(of):
+                of[token - 1] = k
+            token += r
+        return of, None
+
+    def slow_steps(self) -> list:
+        """The tokens above the p95 that start a decode step: (token index, inter-token ms, step), in token order."""
+        of, _ = self.step_of_gaps()
+        p95 = self.itl_p95
+        if of is None or p95 is None:
+            return []
+        return [(i + 1, g, self.steps[of[i]]) for i, g in enumerate(self.gaps_ms) if g > p95 and of[i] is not None]
+
+    def median_step(self) -> Optional[Step]:
+        """Each stage's median over the listed steps."""
+        if not self.steps:
+            return None
+        return Step(*(statistics.median(s.stage(n) for s in self.steps) for n in STAGES))
 
     @property
     def short(self) -> bool:
@@ -224,6 +311,15 @@ def parse_engine_log(text: str, launch: Launch) -> None:
         launch.pcie_busy_ms = busy_us / 1000.0 / launch.tokens
     else:
         launch.problems.append("no wire window line or no step count in the stats line: the PCIe copy time is not measured")
+    for m in RE_STEPS.finditer(text, gen.end()):
+        if m.group(1) == gen.group(1):
+            steps = parse_steps(m.group(4))
+            if steps is None or len(steps) != int(m.group(3)):
+                launch.problems.append("the decode steps line is malformed: no attribution of the slow tokens")
+            else:
+                launch.steps = steps
+                launch.steps_total = int(m.group(2))
+            break
 
 
 def parse_mem_log(text: str, mem: Mem) -> None:
@@ -349,6 +445,71 @@ def fmt(v: Optional[float], spec: str) -> str:
     return "n/a" if v is None else spec.format(v)
 
 
+def dominant(step: Step, median: Step) -> str:
+    """The stage with the largest excess over the median step."""
+    return max(STAGES, key=lambda n: step.stage(n) - median.stage(n))
+
+
+def stage_totals(slow: list, median: Step) -> tuple:
+    """Over the slow tokens' steps: each stage's ms, its excess over the median step (ms), and how many it dominates."""
+    ms = {n: sum(s.stage(n) for _, _, s in slow) for n in STAGES}
+    excess = {n: sum(s.stage(n) - median.stage(n) for _, _, s in slow) for n in STAGES}
+    count = {n: sum(1 for _, _, s in slow if dominant(s, median) == n) for n in STAGES}
+    return ms, excess, count
+
+
+def excess_text(excess: dict) -> str:
+    """Each stage's excess and its share of the stages' positive excess."""
+    pos = sum(v for v in excess.values() if v > 0)
+    if pos <= 0:
+        return ", ".join(f"{n} {excess[n]:.1f} ms" for n in STAGES)
+    return ", ".join(f"{n} {excess[n]:.1f} ms ({100.0 * max(excess[n], 0.0) / pos:.0f}%)" for n in STAGES)
+
+
+def slow_by_stage(launches: list) -> list:
+    """The section on which stage made each slow token slow (the measured launches with a decode steps line)."""
+    out = ["slow tokens by stage: the decode step behind each inter-token time above the p95 (ms; host = the step's wall time",
+           "less the pool and the GPU wait; the PCIe copies overlap the other three). dominant: the stage with the largest excess",
+           "over the launch's median step."]
+    all_excess = {n: 0.0 for n in STAGES}
+    all_count = {n: 0 for n in STAGES}
+    matched = 0
+    for l in launches:
+        if not l.measured:
+            out.append(f"{l.name}: not measured, left out")
+            continue
+        of, why = l.step_of_gaps()
+        if of is None:
+            out.append(f"{l.name}: no attribution: {why}")
+            continue
+        slow = l.slow_steps()
+        med = l.median_step()
+        out.append(f"{l.name}: p95 {fmt(l.itl_p95, '{:.2f}')} ms, {len(l.slow_gaps)} tokens above it, {len(slow)} matched to the "
+                   f"first token of a decode step; median step: " + ", ".join(f"{n} {med.stage(n):.1f}" for n in STAGES))
+        if l.steps_total != len(l.steps):
+            out.append(f"  {l.steps_total - len(l.steps)} decode steps past the listed {len(l.steps)}: their tokens are not "
+                       "attributed")
+        if not slow:
+            continue
+        out.append(f"  {'token':>6}{'gap ms':>9}{'pool':>8}{'wait':>8}{'host':>8}{'PCIe':>8}  dominant")
+        for token, gap, s in slow:
+            out.append(f"  {token:>6}{gap:>9.2f}{s.pool:>8.1f}{s.wait:>8.1f}{s.host:>8.1f}{s.pcie:>8.1f}  {dominant(s, med)}")
+        ms, excess, count = stage_totals(slow, med)
+        wall = sum(s.wall for _, _, s in slow)
+        share = (lambda n: f"{100.0 * ms[n] / wall:.0f}%") if wall > 0 else (lambda n: "n/a")
+        out.append(f"  share of the slow steps' time: pool {share('pool')}, wait {share('wait')}, host {share('host')}; "
+                   f"PCIe copies {share('PCIe')} (overlap)")
+        out.append(f"  excess over the median step: {excess_text(excess)}")
+        out.append("  dominant: " + ", ".join(f"{n} {count[n]}" for n in STAGES))
+        matched += len(slow)
+        for n in STAGES:
+            all_excess[n] += excess[n]
+            all_count[n] += count[n]
+    out.append(f"all measured launches: {matched} slow tokens matched; dominant: " +
+               ", ".join(f"{n} {all_count[n]}" for n in STAGES) + f"; excess over the median step: {excess_text(all_excess)}")
+    return out
+
+
 def summary(folders: list) -> str:
     launches = [read_launch(f) for f in folders]
     out = []
@@ -382,11 +543,19 @@ def summary(folders: list) -> str:
     for label, get, spec in METRICS:
         med = median_of([get(l) for l in kept])
         out.append(f"  {label:<38}{fmt(med, spec):>10}")
+    with_steps = any(l.steps is not None for l in launches)
+    if with_steps:
+        out.append("")
+        out.extend(slow_by_stage(launches))
     out.append("")
     out.append("per-token partition: the request's counters over its tokens (pool, GPU wait, host outside the pool; the PCIe")
     out.append("copies overlap them). Slow tokens: the inter-token times above the p95 of the streamed completion, their share")
-    out.append("of the decode time and their excess over the median. Which path made a given token slow is not in the logs:")
-    out.append("the engine counts per request and per copy window, not per token.")
+    if with_steps:
+        out.append("of the decode time and their excess over the median. Which stage made each slow token slow: the section")
+        out.append("above, from the engine's decode steps line.")
+    else:
+        out.append("of the decode time and their excess over the median. Which path made a given token slow is not in the logs:")
+        out.append("the engine counts per request and per copy window, not per token.")
     return "\n".join(out)
 
 

@@ -1,9 +1,9 @@
 // src/qwen35/q36_stats.hpp - STRATA_Q36_STATS=1: the per-request measurements of the hybrid decode (host side, header only).
 //
 // What one request costs in bytes and in waiting, from counters the engine already keeps (the pool's phase timers and byte
-// count, the hybrid entry totals) plus three small additions: the doorbell wait of the host, the bytes each path reads, and
-// the expert union over 2, 3 and 4 consecutive tokens.  Nothing here runs unless the switch is set; the engine then reads
-// the clock around the waits it already has and adds no synchronisation.
+// count, the hybrid entry totals) plus four small additions: the doorbell wait of the host, the bytes each path reads, the
+// expert union over 2, 3 and 4 consecutive tokens, and the pool, wait, host and PCIe time of each decode step.  Nothing here
+// runs unless the switch is set; the engine then reads the clock around the waits it already has and adds no synchronisation.
 #pragma once
 
 #include <algorithm>
@@ -131,6 +131,87 @@ inline DecodeStats operator-(const DecodeStats& a, const DecodeStats& b) {
     d.rb_bytes = a.rb_bytes - b.rb_bytes;
     d.rb_ms = a.rb_ms - b.rb_ms;
     return d;
+}
+
+/// One decode step of a request (one forward of the decode loop: a token, or a verify window of `rows` tokens): the pool's
+/// row phases, the host's wait on the doorbell, the host's own time (the step's wall time less those two: serving the
+/// layers outside the pool, the PCIe copies' sync, the launches, the sampling, a rebalance) and the copy streams' busy time
+/// on the step's PCIe copies (it overlaps the other three).
+struct StepStats {
+    double pool_ms = 0, wait_ms = 0, host_ms = 0, pcie_ms = 0;
+    int rows = 1;
+};
+
+inline constexpr size_t kStepLogMax = 4096;   // the steps a request's line lists; the ones after are only counted
+
+/// The decode steps of one request, for the line that tells which stage made a slow token slow.  The engine opens a step
+/// when the decode loop's forward has ended (after_rows), adds the busy time of the step's PCIe copies as their events
+/// complete (in that step or a later one: each copy carries the id of the step that issued it), and closes the step with
+/// the pool and doorbell counters and the wall time since the last close (since the decode's start for the first step).
+class StepLog {
+public:
+    /// The request's decode starts, at these counters: the log empties, and the copies tagged before (the prompt's) are
+    /// not its own.
+    void begin(double pool_ms, double wait_ms) {
+        base_ = ++id_;
+        steps_.clear();
+        steps_.reserve(kStepLogMax);
+        pool0_ = pool_ms;
+        wait0_ = wait_ms;
+        on_ = true;
+    }
+    /// The request's decode has ended: no step opens or closes until the next begin.
+    void stop() { on_ = false; }
+    /// The id of the step running now, for the copies it issues.
+    long long id() const { return id_; }
+    /// A forward of `rows` rows has ended: its entry, while the log has room.
+    void open(int rows) {
+        if (!on_ || steps_.size() >= kStepLogMax) return;
+        steps_.emplace_back();
+        steps_.back().rows = rows;
+    }
+    /// `ms` of copy-stream busy time on the copies of step `id` (ignored when that step is not listed).
+    void add_pcie(long long id, double ms) {
+        if (id >= base_ && (size_t) (id - base_) < steps_.size()) steps_[(size_t) (id - base_)].pcie_ms += ms;
+    }
+    /// The step ends at these counters, `wall_ms` after the last close.
+    void close(double pool_ms, double wait_ms, double wall_ms) {
+        if (!on_) return;
+        const size_t at = (size_t) (id_ - base_);
+        if (at < steps_.size()) {
+            StepStats& s = steps_[at];
+            s.pool_ms = pool_ms - pool0_;
+            s.wait_ms = wait_ms - wait0_;
+            s.host_ms = wall_ms - s.pool_ms - s.wait_ms;
+        }
+        pool0_ = pool_ms;
+        wait0_ = wait_ms;
+        ++id_;
+    }
+    const std::vector<StepStats>& steps() const { return steps_; }
+    /// The steps closed since begin, the ones past kStepLogMax included.
+    long long total() const { return id_ - base_; }
+
+private:
+    std::vector<StepStats> steps_;
+    long long id_ = 0, base_ = 0;
+    double pool0_ = 0, wait0_ = 0;
+    bool on_ = false;
+};
+
+/// The decode steps line: per listed step, in order, pool / wait / host / PCIe copies in ms, then / rows when the step kept
+/// more than one row (a verify window).  One line per request, whatever its length (kStepLogMax steps at most).
+inline std::string format_steps(int session, const StepLog& log) {
+    char b[160];
+    std::snprintf(b, sizeof b, "strata serve: session %d: stats: decode steps (pool/wait/host/PCIe copies ms[/rows]), "
+                  "%lld steps, %zu listed:", session, log.total(), log.steps().size());
+    std::string s = b;
+    for (const StepStats& t : log.steps()) {
+        std::snprintf(b, sizeof b, " %.1f/%.1f/%.1f/%.1f", t.pool_ms, t.wait_ms, t.host_ms, t.pcie_ms);
+        s += b;
+        if (t.rows != 1) s += "/" + std::to_string(t.rows);
+    }
+    return s;
 }
 
 /// GB/s of `bytes` over `ms` (0 with no time).
