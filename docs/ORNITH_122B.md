@@ -313,7 +313,12 @@ STRATA_Q36_REBALANCE_EVERY=4
 - Combination at `--max-context 131072`: +26.3 % at short context. After the 34K prompt: +17.7 % at 65536, +25.0 % at 131072 (38.0 against 30.4 tokens/s).
 - The gains add up to more than their sum: 7.4 + 8.0 + 3.5 + 2.3 = 21.2 %, against 31 % measured.
 
-`--max-context` is the longest context the engine serves, so at 65536 a 128K request does not fit. Choosing between 65536 and 131072 is the owner's decision. The engine defaults and the installed service do not change in this batch.
+`--max-context` is the longest context the engine serves, so at 65536 a 128K request does not fit. The service needs 200K to 400K tokens (owner's decision, 25 October 2026), which rules out 65536 and 131072. The engine defaults and the installed service do not change in this batch.
+
+Combination at the service's contexts, round v17 (base 44.4 to 45.2 tokens/s at short context, 30.2 to 30.4 after the 34K prompt), set by `--cpu-threads 0 --mtp 1` and `STRATA_Q36_REBALANCE_EVERY=4`:
+
+- At the default `--max-context 409600`: 53.5 to 53.6 tokens/s at short context (+19.8 %), 34.8 to 35.0 after the 34K prompt (+15.1 %). This is the setting the service can run. Its KL on p00 to p09 is 0.0513 with 300 of 320 top-1, under the bar of 0.061 (the base gives 0.0485 and 301 of 320).
+- At `--max-context 262144`: 36.0 tokens/s at short context (-19.5 % against the base) and 27.9 after the 34K prompt, the same on all three rounds. It holds 73 expert slots per layer against 67 at 409600, yet the CPU pool takes 18.4 ms per step against 12.5. The cause is tracked in issue #112.
 
 Output identity and KL:
 
