@@ -291,7 +291,7 @@ The base gives 44.6 to 45.3 tokens/s at short context, with 67 of 256 experts pe
 Single settings, round v13 (base 45.2 to 45.3 tokens/s):
 
 - `--max-context 65536`: +8.0 % (81 slots per layer). `--max-context 131072`: +4.0 % (78 slots). `--max-context 40960`: +7.8 %.
-- `--max-context 262144` is unstable: between -30 % and +1 % depending on the round. A repeat gave -31 % to +1 %. The cause is not explained.
+- `--max-context 262144` is unstable: between -30 % and +1 % depending on the round. A repeat in round v14 gave -31 % to +1 %. The cause is not explained.
 - `--cpu-threads 0` (auto): +7.4 %. Fixed counts from 7 to 16 gave +3.8 % to +7.4 %, 5 gave -5.9 % and 4 gave -13.7 %.
 - `STRATA_Q36_REBALANCE_EVERY=4`: +3.5 % (16 gave -1.5 %; the default is 8).
 - `--mtp 1`: +2.3 % with 65 % of drafts accepted. `--mtp 2`: +1.4 % (54 %). `--mtp 3`: -8.6 % (45 %).
