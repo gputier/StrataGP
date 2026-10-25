@@ -204,7 +204,7 @@ and the host cost to fall, not only the pool.
 ### Uncapped attempt (23 October)
 
 A later attempt ran without the cap, under the guard. The process was stopped at 4,272 MB available, after 28.1 seconds of
-falling memory, before it produced any token. No uncapped throughput existed at that date. The coordinator chose to stop and report; lifting the cap was the owner's decision. The series of 24 October are the first uncapped throughput measurements (41.40 tokens/s for the default, see the section below).
+falling memory, before it produced any token. No uncapped throughput existed at that date. The coordinator chose to stop and report; lifting the cap was the owner's decision. The series of 24 October are the first uncapped throughput measurements (41.40 tokens/s for the default, see the section below). The current uncapped throughput is the one of 25 October: 46.7 tokens/s with the new defaults, against 43.7 with the old ones on the same box (see the section New defaults below).
 
 ### Lower-bit expert quantization, IQ2_XXS (23 October)
 
@@ -248,6 +248,24 @@ Parity: six greedy prompts in fixed slots, 128 tokens each, give identical conte
 
 Reading (an interpretation of the figures above, not a separate measurement): without the cap, a larger PCIe share is slower. The default 0.15 beats 0.50 and 0.55 by about 5.6 tokens/s, because the host time outside the pool rises from 1.4 to 8.5 ms per token. The fixed optimum of 0.50 to 0.55 found on 22 October was measured under the 24 GB cap and does not carry over. Rebalancing every 8 steps is the only setting that beats the default, and only by 3.5 % over two launches.
 
+### New defaults (owner decision, 25 October 2026)
+
+Two defaults changed from these measurements, taken on the same test PC (RTX 5090, 128 GB RAM, Ryzen 9 9950X3D), decode, one 300-token prompt, three launches per setting, alternated:
+
+| Setting | Tokens/s |
+|---|---|
+| Old defaults (rebalance every 32, probed PCIe share) | 42.2 |
+| Rebalance every 8 | 45.4 |
+| `--pcie-frac 0` | 44.9 |
+| Both | 46.5 |
+| Any `--pcie-frac` from 0.05 to 0.30 | about 42.5 |
+
+The PCIe path costs as soon as it is active, whatever the share. So the rebalance cadence default is now 8 (`STRATA_Q36_REBALANCE_EVERY`, bounds unchanged), and without `--pcie-frac` the PCIe share is 0: no probe at load, the path off. `--pcie-frac F` (F > 0) works as before. The former automatic share (probe, PcieAuto, and `STRATA_Q36_PCIE_AUTO_STEP=1` on top) now needs `--pcie-frac auto`; `STRATA_Q36_PCIE_AUTO_STEP=1` without it prints that it was ignored. The engine's load line says which share is used and why. The earlier sections of this record describe the old defaults. Measured on the test PC on 25 October 2026 with the binary of this branch, three launches alternated per setting: the new defaults gave 46.7, 46.7 and 46.6 tokens/s, against 43.7, 43.7 and 43.6 for the old defaults (`--pcie-frac auto` and `STRATA_Q36_REBALANCE_EVERY=32`), which is 6.9 % more. The load line of the new defaults reads: "PCIe share off (the default: --pcie-frac F or --pcie-frac auto turns it on)". With `--pcie-frac auto`, the probe measured 57.7 GB/s and set the share to 0.55.
+
+Greedy text is not identical with the new defaults. With slots moving, `--mtp 2` and `--mtp 0` do not give the same text on the six parity prompts: the first difference comes after 15 to 622 characters. The new defaults and the fixed-slot setting at `--mtp 0` differ on five of six prompts. All the texts read as coherent answers, and the differences are word choices. The likely cause, an interpretation not measured here: with moving slots, the slot assignment depends on the routing counts, which include the drafts of a verify window, so which experts run on the GPU and which on the CPU changes, and the two round differently. Identity holds only with fixed slots.
+
+The full ctest of this build passed 148 of 151 on the test PC (MSVC, CUDA). The three failures (ple_parity, expert_parity and pool_test) fail on main too, and isa_guard_check was skipped.
+
 ### Attention kernel durations (25 October)
 
 Measured on 25 October 2026 with Nsight Systems, kernel durations only, in bench mode with `--max-context 409600` and KV q4. The median `k_attn_part` per call is 199 µs at 1,024 tokens of context, 562 µs at 37,159 and 1,565 µs at 127,685. There are 12 calls per token, so the attention kernels take about 2.4 ms per token at 1K and 18.8 ms at 128K (calculated). The 22 October measurement gave 2.42 ms and 18.93 ms, so the two agree. The slope is about 10 to 11 µs per thousand tokens of context per call.
@@ -282,7 +300,7 @@ Estimated gains come from calculations in the sources, not from measurements on 
 5. MTP, issue #74. A speculative step costs 133 ms against 50 ms for a plain step, for about 1.5 tokens. The divergence came from the float order of the AVX-512 multi-token kernel for IQ3_XXS gate and up rows, which differed from ggml-cpu's dot; the ggml-order kernel removes it. It has been on by default since 25 October: with `--mtp 2` and fixed slots it gives the text of `--mtp 0` on six of six parity prompts, against one of six on main, and it runs about 3.4 % faster (49.0, 49.1 and 49.0 tokens/s against 47.6, 47.4 and 47.4 with `STRATA_NO_IQ512_GGML_ORDER=1`). The owner chose to keep it on, an exception to the opt-in rule of AGENTS.md. The step cost above predates this kernel and has not been measured again.
 6. Speculative decoding without MTP, issue #78 (AcceptMoE, Specter). Deferred. The gain depends on the union of experts across a verification window, where a two-token window touched 0.85 to 0.89 of the slots that two separate tokens would use. The published gains do not transfer without that measurement.
 7. Attention per head, issue #81. No gain estimated. The durations of 25 October (see the section above) put the slope at 10 to 11 µs per thousand tokens of context per call, which gives about 18.8 ms of attention per token at 128K (calculated). The cache re-read per head remains a hypothesis: it needs read counters, which Nsight Compute cannot give on this box. No kernel change has been made.
-8. PCIe share, issue #80. Under the 24 GB cap, the automatic share settled at 0.45, and the fixed optimum was 0.50 to 0.55 (22 October). Without the cap, measured on 24 October, the default share of 0.15 gives 41.40 tokens/s. Fixed 0.50 and 0.55 give 35.80 and 35.75 tokens/s, about 5.6 tokens/s less, and the automatic step gives 35.10, about 6.3 tokens/s less. A larger share raises the host time outside the pool from 1.4 to 8.5 ms per token. The optimum found under the cap does not carry over. The automatic step stays off by default.
+8. PCIe share, issue #80. Under the 24 GB cap, the automatic share settled at 0.45, and the fixed optimum was 0.50 to 0.55 (22 October). Without the cap, measured on 24 October, the default share of 0.15 gives 41.40 tokens/s. Fixed 0.50 and 0.55 give 35.80 and 35.75 tokens/s, about 5.6 tokens/s less, and the automatic step gives 35.10, about 6.3 tokens/s less. A larger share raises the host time outside the pool from 1.4 to 8.5 ms per token. The optimum found under the cap does not carry over. The automatic step is off unless `--pcie-frac auto` is given; since 25 October the PCIe path itself is off by default (see "New defaults").
 9. CPU pool, issue #79. The recommended path works without large pages, which need a privilege the box does not grant. First measurement: busy time against wall time per thread.
 10. Expert pruning (REAP), issue #75. Not measured on Ornith. The published figure is 95.8 % kept on BoolQ alone at 20 % pruning, on another model. First measurement: KL on the ten prompts.
 11. KV precision, issue #72. Accepted by the owner on 23 October 2026: KL 0.079 on the short prompts against the 0.061 bar, with `--kv q4`. The measurements are in the Ornith section of QWEN36.md.

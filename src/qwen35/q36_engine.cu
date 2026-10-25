@@ -3706,7 +3706,7 @@ struct Engine {
 /// The routed experts after the engine's buffers: all in VRAM when they fit in `vram_gib` (< 0: the free VRAM less a
 /// reserve), else the hybrid mode - every expert in host memory, the same number of VRAM slots per layer, a decode
 /// batch's other experts on the CPU pool and a prompt chunk's streamed through two staging buffers.
-bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid_t, int slots, double pcie_frac, std::string& err) {
+bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid_t, int slots, const strata::q36::PcieOption& pcie, std::string& err) {
     const auto t0 = Clock::now();
     const auto& g = m.g;
     const int64_t ne = g.n_expert;
@@ -3748,7 +3748,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     // the PCIe share's staging area (q36_pcie.hpp): kPcieStageBlobs blobs of the widest layer's stride (the layer's own slots and the
     // prefetch's two regions); --pcie-frac 0 is off.  The
     // estimate counts it before main_hybrid is known; the real size (pcie_bytes) drops it when only the MTP block is hybrid
-    const size_t pcie_stage = pcie_frac != 0.0 ? (size_t) strata::q36::kPcieStageBlobs * pc_blob + kMmqTail : 0;
+    const size_t pcie_stage = pcie.on() ? (size_t) strata::q36::kPcieStageBlobs * pc_blob + kMmqTail : 0;
     const size_t fixed_est = (E.use_mmq ? max_layer + max_main + 2 * kMmqTail : 0) + pcie_stage;
     const auto slots_in = [&](size_t room) {
         return room > reserve + fixed_est ? std::min<size_t>((size_t) ne, (room - reserve - fixed_est) / per_slot) : (size_t) 0;
@@ -3845,11 +3845,11 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     const size_t staging = E.use_mmq && E.main_hybrid ? max_layer + max_main + 2 * kMmqTail : 0;
     // the main layers' hybrid path only (the MTP block alone runs few rows)
     const size_t pcie_bytes = E.main_hybrid ? pcie_stage : 0;
-    // no --pcie-frac: the share the link's probed bandwidth gives (as Flash-Next's native packs: 0.55 on a 20 GB/s link or
-    // faster), then refined from the pool's speed (PcieAuto); a probe that fails keeps the 0.55
+    // --pcie-frac auto: the share the link's probed bandwidth gives (as Flash-Next's native packs: 0.55 on a 20 GB/s link or
+    // faster), then refined from the pool's speed (PcieAuto); a probe that fails keeps the 0.55; no probe otherwise
     double link_gbps = -1.0;
     std::string bursts;
-    if (pcie_bytes > 0 && pcie_frac < 0.0) link_gbps = strata::core::probe_pcie_h2d_gbps(&bursts);
+    if (pcie_bytes > 0 && pcie.mode == strata::q36::PcieMode::Auto) link_gbps = strata::core::probe_pcie_h2d_gbps(&bursts);
     size_t slot_bytes = budget2 > staging + pcie_bytes ? budget2 - staging - pcie_bytes : 0;
     if (slot_bytes + staging + pcie_bytes + ((size_t) 256 << 20) > fr)
         slot_bytes = fr > staging + pcie_bytes + ((size_t) 512 << 20) ? fr - staging - pcie_bytes - ((size_t) 512 << 20) : 0;
@@ -3977,8 +3977,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         }
     }
     E.pool = std::make_unique<C::ExpertPool>(strata::q36::pool_workers(threads, (int) C::detect_cpu_topology(true).worker_cores.size()));
-    if (pcie_frac == 0.0) {
-        std::fprintf(stderr, "strata-q36: PCIe share off (--pcie-frac 0)\n");
+    if (!pcie.on()) {
+        std::fprintf(stderr, "strata-q36: PCIe share off (%s)\n",
+                     pcie.mode == strata::q36::PcieMode::Off ? "--pcie-frac 0"
+                                                             : "the default: --pcie-frac F or --pcie-frac auto turns it on");
     } else if (pcie_bytes > 0 && !pinned) {
         std::fprintf(stderr, "strata-q36: the PCIe share is off: the experts are in pageable host memory\n");
     } else if (pcie_bytes > 0) {
@@ -4007,8 +4009,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         E.pc_mark.assign((size_t) ne, 0);
         constexpr double kBase = 0.55;   // the share measured on x16 links (Flash-Next's native packs)
         double frac = kBase;
-        if (pcie_frac >= 0.0) {
-            frac = std::min(1.0, pcie_frac);
+        if (pcie.mode == strata::q36::PcieMode::Fixed) {
+            frac = std::min(1.0, pcie.frac);
         } else if (link_gbps > 0.0) {
             frac = strata::core::pcie_frac_for_gbps(link_gbps, kBase);
             double sum = 0.0;
@@ -4023,21 +4025,21 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             E.pcie_auto.blob_bytes = sum / (double) m.layers.size();
         }
         E.pcie_num = strata::core::pcie_num_of(frac);
-        if (pcie_frac >= 0.0)
+        const char* how = "--pcie-frac auto; --pcie-frac F fixes it, 0 turns it off";
+        if (pcie.mode == strata::q36::PcieMode::Fixed)
             std::fprintf(stderr, "strata-q36: PCIe share %.2f of the missed experts (--pcie-frac)\n", frac);
         else if (link_gbps > 0.0)
             std::fprintf(stderr, "strata-q36: PCIe probe: %.1f GB/s host->device (best of %s) -> PCIe share %.2f of the missed "
-                         "experts, %s (--pcie-frac N fixes it, 0 turns it off)\n", link_gbps, bursts.c_str(), frac,
+                         "experts, %s (%s)\n", link_gbps, bursts.c_str(), frac,
                          E.pcie_step_on ? "moved by the wall time per decode token (STRATA_Q36_PCIE_AUTO_STEP=1)"
-                                        : "refined from the CPU pool's speed");
+                                        : "refined from the CPU pool's speed", how);
         else
-            std::fprintf(stderr, "strata-q36: PCIe probe failed -> PCIe share %.2f of the missed experts (--pcie-frac N fixes it, "
-                         "0 turns it off)\n", frac);
+            std::fprintf(stderr, "strata-q36: PCIe probe failed -> PCIe share %.2f of the missed experts (%s)\n", frac, how);
     }
-    // one place for every branch above (--pcie-frac 0, pageable memory, no PCIe bytes, --pcie-frac N, failed probe, or a value
+    // one place for every branch above (default off, --pcie-frac 0, pageable memory, no PCIe bytes, --pcie-frac F, failed probe, or a value
     // that does not switch it on): the step search is off, and the log says the variable did nothing
     if (std::getenv("STRATA_Q36_PCIE_AUTO_STEP") != nullptr && !E.pcie_step_on)
-        std::fprintf(stderr, "strata-q36: STRATA_Q36_PCIE_AUTO_STEP ignored (the PCIe share is not automatic here, or the value is not 1)\n");
+        std::fprintf(stderr, "strata-q36: STRATA_Q36_PCIE_AUTO_STEP ignored (it needs --pcie-frac auto, a working probe and the value 1)\n");
     CK(cudaDeviceSynchronize());
     if (mtp_only)
         std::fprintf(stderr, "strata-q36: every main layer's routed experts in VRAM (%.2f GiB); the MTP block's: %d of "
@@ -4880,7 +4882,7 @@ int strata::qwen35::run(int argc, char** argv) {
     double expert_vram = -1.0;
     float cache_prior = 0.0f, ser_t = 0.0f;   // routing options, off
     int ser_kmin = 8;
-    double pcie_frac = -1.0;   // the PCIe share of the missed experts: < 0 the probed one, 0 off
+    strata::q36::PcieOption pcie;   // the PCIe share of the missed experts: off by default, --pcie-frac F or auto
     bool warm = true;
     int expert_slots = 0, batch = 0, draft_vocab = -1;
     std::string rope_scaling;
@@ -4930,7 +4932,13 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--expert-profile") expert_profile = next();
         else if (a == "--expert-profile-save") expert_profile_save = next();
         else if (a == "--hybrid-rows") hybrid_rows = std::atoi(next().c_str());
-        else if (a == "--pcie-frac") pcie_frac = std::atof(next().c_str());
+        else if (a == "--pcie-frac") {
+            const std::string v = next();
+            if (!strata::q36::parse_pcie_option(v.c_str(), &pcie)) {
+                std::fprintf(stderr, "strata-q36: --pcie-frac %s is not \"auto\" or a number from 0 up\n", v.c_str());
+                return 2;
+            }
+        }
         else if (a == "--cache-prior") cache_prior = (float) std::atof(next().c_str());   // 0 off, else in (0, 1]
         else if (a == "--ser") {                                                          // Kmin,t
             const std::string v = next();
@@ -4963,7 +4971,7 @@ int strata::qwen35::run(int argc, char** argv) {
             std::fprintf(stderr,
                          "usage: strata-q36 --model GGUF [--max-context 32768] [--chunk 512] [--no-graph] [--kv fp32|q4]\n"
                          "       [--rope-scaling none|linear|yarn [--rope-scale F] [--rope-orig-ctx N]]\n"
-                         "       [--expert-profile FILE] [--expert-profile-save FILE] [--pcie-frac F]\n"
+                         "       [--expert-profile FILE] [--expert-profile-save FILE] [--pcie-frac F|auto]\n"
                          "       [--cache-prior L] [--ser Kmin,t]\n"
                          "       (--serve | --tokens IDS [--n 64] [--force IDS] [--dump-full-logits F] | --bench-pp N "
                          "--bench-tg N)\n");
@@ -5063,7 +5071,7 @@ int strata::qwen35::run(int argc, char** argv) {
             std::fprintf(stderr, "strata-q36: %s - the slots start with experts 0 .. S - 1\n", perr.c_str());
         }
     }
-    if (!place_experts(m, E, expert_vram, cpu_threads, hybrid_rows, expert_slots, pcie_frac, err)) {
+    if (!place_experts(m, E, expert_vram, cpu_threads, hybrid_rows, expert_slots, pcie, err)) {
         std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
         return 1;
     }

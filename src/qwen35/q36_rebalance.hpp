@@ -20,11 +20,11 @@ namespace strata::q36 {
 inline constexpr double kRebalanceMinCount = 2.0;   // a candidate is routed at least this often (decayed count)
 inline constexpr double kRebalanceMinGain = 1.5;    // and beats the expert it replaces by at least this much
 inline constexpr double kRebalanceDecay = 0.7;      // the counts' factor after each rebalance, in every layer
-inline constexpr int kRebalanceEveryDefault = 32;   // positions between two rebalances (STRATA_Q36_REBALANCE_EVERY unset)
+inline constexpr int kRebalanceEveryDefault = 8;    // positions between two rebalances (STRATA_Q36_REBALANCE_EVERY unset)
 inline constexpr int kRebalanceEveryMax = 1024;     // the largest value the variable accepts
 
 /// STRATA_Q36_REBALANCE_EVERY: the positions between two rebalances, decimal digits only (no sign, no space, nothing after
-/// them) for a value from 1 to 1024; leading zeros are read as decimal ("08" is 8).  Unset gives 32.  Any other value gives 32
+/// them) for a value from 1 to 1024; leading zeros are read as decimal ("08" is 8).  Unset gives 8.  Any other value gives 8
 /// as well, and `err` (when given) gets the line the engine prints for it; an accepted value leaves `err` alone.
 inline int rebalance_every_from_env(const char* v, std::string* err) {
     if (v == nullptr) return kRebalanceEveryDefault;

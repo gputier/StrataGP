@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 #include <vector>
@@ -111,7 +112,32 @@ inline void pcie_plan(const int32_t* ids, int n_ent, int top_k, const int32_t* p
     plan[kPlanStart + m] = entries;
 }
 
-// STRATA_Q36_PCIE_AUTO_STEP=1 (automatic share only): the share moves by one step every kPcieStepPositions decode tokens,
+/// What --pcie-frac asks for.  Without the option the PCIe path is off (Default): any share from 0.05 to 0.30 measured about
+/// 42.5 tokens/s against 44.9 with it off on Ornith-1.5-122B, so the path costs as soon as it is active.  "auto" opts in to the
+/// probed share refined from the pool's speed (PcieAuto, and STRATA_Q36_PCIE_AUTO_STEP on top); a number F > 0 fixes the share.
+enum class PcieMode { Default, Off, Fixed, Auto };
+struct PcieOption {
+    PcieMode mode = PcieMode::Default;
+    double frac = 0.0;   // the fixed share (Fixed only)
+    bool on() const { return mode == PcieMode::Fixed || mode == PcieMode::Auto; }
+};
+
+/// --pcie-frac's value: "auto", or a decimal number from 0 with nothing after it (no sign, no space) (0 is Off).  False for anything else (`out` is
+/// left alone): a typo is refused instead of read as 0.
+inline bool parse_pcie_option(const char* v, PcieOption* out) {
+    if (std::strcmp(v, "auto") == 0) {
+        *out = PcieOption{PcieMode::Auto, 0.0};
+        return true;
+    }
+    char* end = nullptr;
+    const bool digit = (v[0] >= '0' && v[0] <= '9') || v[0] == '.';   // strtod alone would also take a space, a sign, nan, inf
+    const double f = digit ? std::strtod(v, &end) : 0.0;
+    if (!digit || end == v || *end != '\0' || f > 1e9) return false;   // no number, text after it, out of range
+    *out = f == 0.0 ? PcieOption{PcieMode::Off, 0.0} : PcieOption{PcieMode::Fixed, f};
+    return true;
+}
+
+// STRATA_Q36_PCIE_AUTO_STEP=1 (--pcie-frac auto only): the share moves by one step every kPcieStepPositions decode tokens,
 // against the wall time per decode token, instead of PcieAuto's refinement.  The rule works in 256ths, the unit the engine
 // stores the share in (pcie_num), so a step and a bound compare what the engine really runs.  The bounds, the margin and the
 // number of reversals are choices of the search; none is fitted to a machine's measure.
