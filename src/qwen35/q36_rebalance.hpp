@@ -33,7 +33,8 @@ inline int rebalance_every_from_env(const char* v, std::string* err) {
     const long n = digit ? std::strtol(v, &end, 10) : 0;
     if (digit && *end == '\0' && n >= 1 && n <= kRebalanceEveryMax) return (int) n;
     if (err != nullptr)
-        *err = std::string("STRATA_Q36_REBALANCE_EVERY=") + v + " is not a whole number from 1 to 1024 in decimal digits: using 32";
+        *err = std::string("STRATA_Q36_REBALANCE_EVERY=") + v + " is not a whole number from 1 to " +
+               std::to_string(kRebalanceEveryMax) + " in decimal digits: using " + std::to_string(kRebalanceEveryDefault);
     return kRebalanceEveryDefault;
 }
 

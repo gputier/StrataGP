@@ -134,7 +134,6 @@ inline bool pcie_step_enabled(const char* v) { return v != nullptr && v[0] == '1
 struct PcieStep {
     int num = 0;          // the new share in 256ths (what the engine stores in pcie_num)
     int dir = -1;         // the direction now: -1 lowers the share, +1 raises it
-    double share() const { return num / 256.0; }
 };
 
 /// The next share under the step rule.  `cur`: the share now, in 256ths.  `t_prev`, `t_cur`: the wall time per decode token
@@ -191,7 +190,7 @@ struct PcieStepSearch {
         }
         const PcieStep s = pcie_auto_step(cur, t_prev, t_ms, dir);
         if (s.num == cur) return cur;   // a tie: the share and the window before stay
-        if (s.dir != (dir < 0 ? -1 : 1) && ++turns >= kPcieStepTurns) {
+        if (s.dir != dir && ++turns >= kPcieStepTurns) {
             done = true;
             return best_num >= 0 ? best_num : cur;
         }
