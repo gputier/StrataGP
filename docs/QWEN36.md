@@ -213,7 +213,7 @@ Refusals at start (exit code 2, messages prefixed by `strata-q36:`):
 Environment variables. The q36 engine reads 19 of its own: 18 `STRATA_Q36_*` and `STRATA_DMA_BATCH`. It also reads `STRATA_BATCH_MTP`, `STRATA_MMQ_KQ` and `STRATA_Q8_PACKED`, which other engines share (on Windows it sets the last two to 1 when unset). Unset means the default shown.
 
 - `STRATA_Q36_BLAS_F32`: off. Set, the router product uses the hipBLAS / cuBLAS SGEMM instead of the native kernel (`q36_engine.cu:2116`, A/B check).
-- `STRATA_Q36_CHUNK=N`: forces the prompt chunk, from 256 to 4096 (`:5058`). Unset, `--chunk auto` picks it from the free VRAM (`:5011`).
+- `STRATA_Q36_CHUNK=N`: forces the prompt chunk, from 256 to 4096 (`:5058`). Unset, `--chunk auto` picks it from the free VRAM (`:5011`). On Ornith-1.5-122B in hybrid mode, 4096 read a 34,257-token prompt 62 % faster than the default 2048 and cost 4 % of decode at short context (docs/ORNITH_122B.md, "Prompt chunk size"; next steps in docs/Q36_LAYER_MAJOR_PROMPT.md).
 - `STRATA_Q36_DRAFT_VOCAB=N`: the MTP drafts pick among the first N token ids, used when `--draft-vocab` is absent (`:5167`). Unset, 0: the whole vocabulary (`:2751`).
 - `STRATA_Q36_FIXED_SLOTS=1`: freezes the expert slots as placed. The identity gate uses it (`:3148`).
 - `STRATA_Q36_KEEP_PACKED`: unset, the packed Q8_0 copies are freed when that gives more expert slots (`:3760`). Set, they are kept.
