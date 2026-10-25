@@ -122,15 +122,19 @@ struct PcieOption {
     bool on() const { return mode == PcieMode::Fixed || mode == PcieMode::Auto; }
 };
 
-/// --pcie-frac's value: "auto", or a decimal number from 0 with nothing after it (no sign, no space) (0 is Off).  False for anything else (`out` is
-/// left alone): a typo is refused instead of read as 0.
+/// --pcie-frac's value: "auto", or a plain decimal from 0 made of digits and dots only, with at least one digit (0 is Off): no sign,
+/// no space, no exponent, no hex.  False for anything else (`out` is left alone): a typo is refused instead of read as 0.
 inline bool parse_pcie_option(const char* v, PcieOption* out) {
     if (std::strcmp(v, "auto") == 0) {
         *out = PcieOption{PcieMode::Auto, 0.0};
         return true;
     }
+    bool digit = false;   // "." alone is no number
+    for (const char* p = v; *p != '\0'; ++p) {
+        if (*p >= '0' && *p <= '9') digit = true;
+        else if (*p != '.') return false;   // hex, exponent, sign, space, nan, inf: strtod alone would take them
+    }
     char* end = nullptr;
-    const bool digit = (v[0] >= '0' && v[0] <= '9') || v[0] == '.';   // strtod alone would also take a space, a sign, nan, inf
     const double f = digit ? std::strtod(v, &end) : 0.0;
     if (!digit || end == v || *end != '\0' || f > 1e9) return false;   // no number, text after it, out of range
     *out = f == 0.0 ? PcieOption{PcieMode::Off, 0.0} : PcieOption{PcieMode::Fixed, f};

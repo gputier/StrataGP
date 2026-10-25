@@ -21,9 +21,9 @@ int main() {
         check(parse_pcie_option("0.0", &o) && o.mode == PcieMode::Off, "0.0 is off as well");
         PcieOption keep{PcieMode::Fixed, 0.3};
         bool refused = true;
-        for (const char* bad : {"", "abc", "Auto", "0.3x", " 0.3", "-0.1", "-1", "nan", "inf", "auto "})
+        for (const char* bad : {"", "abc", "Auto", "0.3x", " 0.3", "-0.1", "-1", "nan", "inf", "auto ", "0x8", "1e0", ".", "1.2.3"})
             refused = refused && !parse_pcie_option(bad, &keep);
-        check(refused, "empty, a typo, a negative value, nan, inf and text after the value are refused");
+        check(refused, "empty, a typo, a negative value, nan, inf, hex, an exponent, a lone dot, two dots and text after the value are refused");
         check(keep.mode == PcieMode::Fixed && keep.frac == 0.3, "a refused value leaves the option as it was");
     }
     std::printf("%s\n", g_fail ? "FAILED" : "all passed");
