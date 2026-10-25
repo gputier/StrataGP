@@ -282,6 +282,52 @@ At 1,024 tokens with `--max-context 4096`, the median falls to 98 µs. That run 
 
 The per-head re-read of the K/V cache is still a hypothesis. Testing it needs read counters. Nsight Compute cannot provide them on this box (see the operational pitfalls). No kernel change has been made.
 
+## Measured launch settings (25 October 2026)
+
+Measured on the test PC (RTX 5090, 128 GB RAM, Ryzen 9 9950X3D) with build rev12 (commit `2e29c428`), on Ornith-1.5-122B with IQ3_XXS gate and up and IQ4_XS down. Each launch is one 300-token request after 256 warm-up tokens, with `--kv q4`, run by `tools/ornith/measure_partition.ps1`. Settings go in through `-ExtraArgs` or `-ExtraEnv`. Each setting is compared with the base of its own round, over three alternated rounds.
+
+The base gives 44.6 to 45.3 tokens/s at short context, with 67 of 256 experts per layer in VRAM at `--max-context 409600`. After a 34,257-token prompt it gives 30.3 to 30.5 tokens/s.
+
+Single settings, round v13 (base 45.2 to 45.3 tokens/s):
+
+- `--max-context 65536`: +8.0 % (81 slots per layer). `--max-context 131072`: +4.0 % (78 slots). `--max-context 40960`: +7.8 %.
+- `--max-context 262144` is unstable: between -30 % and +1 % depending on the round. A repeat gave -31 % to +1 %. The cause is not explained.
+- `--cpu-threads 0` (auto): +7.4 %. Fixed counts from 7 to 16 gave +3.8 % to +7.4 %, 5 gave -5.9 % and 4 gave -13.7 %.
+- `STRATA_Q36_REBALANCE_EVERY=4`: +3.5 % (16 gave -1.5 %; the default is 8).
+- `--mtp 1`: +2.3 % with 65 % of drafts accepted. `--mtp 2`: +1.4 % (54 %). `--mtp 3`: -8.6 % (45 %).
+- `--ser 7,0.6`: +9.8 %, but its KL fails (below). `--ser 7,0.4` is within noise.
+- No effect: `STRATA_IQ_PREFETCH` from 0 to 8192 (-0.4 % to -0.1 %), and `STRATA_POOL_SPIN_US=5000` (-0.3 %).
+- Losses: `STRATA_POOL_SPIN_US=0` (-4.1 %) and `--pcie-frac auto` (-3.8 %).
+- `STRATA_POOL_UMWAIT` does not apply: the 9950X3D has no WAITPKG.
+
+Combination, rounds v14 and v16 (base 44.5 to 44.7 tokens/s), set by these flags and variables:
+
+```
+--cpu-threads 0 --max-context 65536 --mtp 1
+STRATA_Q36_REBALANCE_EVERY=4
+```
+
+- `--cpu-threads 0 --max-context 65536`: +15.2 %.
+- Adding the rebalance cadence of 4: +18.2 % (v14), +20.6 % (v16).
+- Adding `--mtp 1`: +30.7 % (v14, 58.3 tokens/s), +31.2 % (v16, 58.5 tokens/s). This is the best combination measured.
+- Combination at `--max-context 131072`: +26.3 % at short context. After the 34K prompt: +17.7 % at 65536, +25.0 % at 131072 (38.0 against 30.4 tokens/s).
+- The gains add up to more than their sum: 7.4 + 8.0 + 3.5 + 2.3 = 21.2 %, against 31 % measured.
+
+The 65536 cap limits what the service accepts, so 128K requests would not fit. Choosing between 65536 and 131072 is the owner's decision. The engine defaults and the installed service do not change in this batch.
+
+Output identity and KL:
+
+- Identity, `STRATA_Q36_FIXED_SLOTS=1 --expert-slots 52 --pcie-frac 0`, one setting at a time: with `--cpu-threads 0`, with `--max-context 65536` and with `--mtp 1`, the full logits are byte-identical to the base on six of six prompts (p00 to p05). The rebalance cadence moves experts between slots and is covered by the KL below, not by this check.
+- KL on p00 to p09 (32 forced steps, bar 0.061): the base gives 0.0485 and 301 of 320 top-1, identical over three launches. The combination with rebalance every 4 gives 0.0362 and 303 of 320. It passes. This base differs from the 0.0423 in the Result table; the cause is not established.
+
+Settings that fail the bar:
+
+- `--ser 7,0.6`: KL 0.0979. `--ser 7,0.8`: KL 0.1120.
+- `--cache-prior 0.005` alone: KL 0.0540, passes. `0.01`: KL 0.0609, just under the bar.
+- `--cache-prior` combined with the rest, without MTP (the option refuses to run with `--mtp` above 0): KL 0.0625 at 0.005, which fails.
+
+Names checked in `src/`: `--cpu-threads` (`src/qwen35/q36_engine.cu:4932`), `--max-context` (`:4909`), `--mtp` (`:4920`), `--ser` (`:4945`), `--cache-prior` (`:4944`), `--expert-slots` (`:4933`), `--pcie-frac` (`:4937`), `--kv` (`:4957`), `STRATA_Q36_FIXED_SLOTS` (`:3148`), `STRATA_Q36_REBALANCE_EVERY` (`:1898`, default 8 in `src/qwen35/q36_rebalance.hpp:23`), `STRATA_Q36_STATS` (`src/qwen35/q36_stats.hpp:1`), `STRATA_IQ_PREFETCH` (`src/kernels/cpu/iq_avx512.cpp:39`, the kernel this CPU runs), `STRATA_POOL_SPIN_US` (`src/kernels/cpu/pool.cpp:520`), `STRATA_POOL_UMWAIT` (`src/kernels/cpu/pool.cpp:43`).
+
 ## Operational pitfalls
 
 - A process started with `Start-Process` from an SSH session dies with the session. Start it detached instead.
