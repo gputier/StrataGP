@@ -248,11 +248,10 @@ to measure.
    `STRATA_Q36_FIXED_SLOTS=1 --expert-slots 62 --pcie-frac 0` (the same slot count on both builds), byte-identical
    `--dump-full-logits` on the six parity prompts and on a long prompt at `--chunk 256`, `--chunk 2048` and `--chunk 4096`;
    then the decode at short context and after the 34K prompt with automatic slots, 3 alternated launches.
-3. With step 2 in, re-measure chunk 4096 against 2048 on this card and, if it holds (+62 % prompt read, a smaller decode
-   loss than 4 %), make 4096 the hybrid default where the room allows it (5053 to 5056 picks 2048 today). Risk: a default
-   change, so the AGENTS.md rule applies: the numbers on the record, and the smaller cards (7.5 GiB and 5.5 GiB steps at
-   5056) left as they are unless measured. Test: the same dumps; a chunk change alters bits only against another chunk size,
-   so the check is that the new default build matches the old build run with `--chunk 4096`.
+3. Done, 25 October 2026 (issue #104): 4096 is the hybrid default with one session, from 20 GiB free
+   (`hybrid_prompt_chunk`, `src/qwen35/q36_rules.hpp:36`). The measurements and the identity dumps are in
+   docs/ORNITH_122B.md, "Prompt chunk size, issue #104". Step 2 is NOT done: the default shipped without it, so the
+   sized buffers still take the slots' room (62 slots do not fit beside the 4096 chunk when the slots are given by hand).
 4. Opt-in equal chunks (+5.8 % under model A) and an opt-in run-by-run copy for cards that stay copy-bound (chunk 2048 or
    smaller: +43 % if the runs reach the probe rate). Risk: low, both opt-in; equal chunks change bits by design and need
    the KL check of docs/ORNITH_122B.md (ten prompts of 32 steps against llama.cpp b11756, bar 0.061). The run copy must give

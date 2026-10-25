@@ -166,8 +166,10 @@ kernels' share is gained: decode tg128 58.5 -> 59.7 tok/s (+2%), pp2048 1,958 ->
 expert: R9700 pp4096 at chunk 512 / 1024 / 2048 / 4096 = 3,453 / 4,786 / 5,766 / 6,223 tok/s. With every expert in VRAM the engine now takes the
 largest of 4096 / 2048 / 1024 that fits beside the experts, the 0.77 GiB reserve and the sessions' caches without giving the packed decode
 copies back (8K-64K context: 4096, 100K: 2048, 131K: 512; `--batch 2..4`: 1024 at most so the other slots are not held for a whole chunk,
-`--batch 8`: 512). The hybrid mode keeps 2048 (a bigger chunk takes expert slots: RTX 3060 chunk 4096 reads prompts 5% faster and decodes 13%
-slower) and goes down to 1024 / 512 on a card with 7.5 / 5.5 GiB free. **`--prefill 512` (or `STRATA_Q36_CHUNK=512`) gives the old size, and
+`--batch 8`: 512). The hybrid mode takes 4096 from 20 GiB free with one session, 2048 from 7.5 GiB, 1024 from 5.5 GiB and 512 below
+(`hybrid_prompt_chunk`, `src/qwen35/q36_rules.hpp:36`; with several sessions the chunk stays 2048). The 4096 step was measured on an
+RTX 5090 with 23.2 GiB free (docs/ORNITH_122B.md, "Prompt chunk size, issue #104"). A bigger chunk takes expert slots: on an RTX 3060,
+chunk 4096 read prompts 5% faster and decoded 13% slower, the reason the hybrid mode kept 2048 before that step. **`--prefill 512` (or `STRATA_Q36_CHUNK=512`) gives the old size, and
 then the text is the base engine's, bit for bit.** The chunk size changes the GEMM tiles the BLAS picks and with them the last bits of the
 prompt state: KL against the 512 chunk on six real 1.5-3.2K-token documents (48 teacher-forced rows each): chunk 1024 4.0e-3, 2048 4.2e-3,
 4096 3.6e-3 (per prompt 2.3e-3 .. 5.9e-3), top-1 agreement 44-48 of 48 rows - the size of the llama.cpp CPU-vs-HIP difference on the same
@@ -213,7 +215,7 @@ Refusals at start (exit code 2, messages prefixed by `strata-q36:`):
 Environment variables. The q36 engine reads 19 of its own: 18 `STRATA_Q36_*` and `STRATA_DMA_BATCH`. It also reads `STRATA_BATCH_MTP`, `STRATA_MMQ_KQ` and `STRATA_Q8_PACKED`, which other engines share (on Windows it sets the last two to 1 when unset). Unset means the default shown.
 
 - `STRATA_Q36_BLAS_F32`: off. Set, the router product uses the hipBLAS / cuBLAS SGEMM instead of the native kernel (`q36_engine.cu:2116`, A/B check).
-- `STRATA_Q36_CHUNK=N`: forces the prompt chunk, from 256 to 4096 (`:5058`). Unset, `--chunk auto` picks it from the free VRAM (`:5011`). On Ornith-1.5-122B in hybrid mode, 4096 read a 34,257-token prompt 62 % faster than the default 2048 and cost 4 % of decode at short context (docs/ORNITH_122B.md, "Prompt chunk size"; next steps in docs/Q36_LAYER_MAJOR_PROMPT.md).
+- `STRATA_Q36_CHUNK=N`: forces the prompt chunk, from 256 to 4096 (`:5058`). Unset, `--chunk auto` picks it from the free VRAM (`:5011`). On Ornith-1.5-122B in hybrid mode, 4096 read a 34,257-token prompt 62 % faster than 2048, the hybrid default before 25 October 2026, and cost 4 % of decode at short context (docs/ORNITH_122B.md, "Prompt chunk size, issue #104"; next steps in docs/Q36_LAYER_MAJOR_PROMPT.md). In hybrid mode the unset default is now 4096 with one session, from `hybrid_prompt_chunk`.
 - `STRATA_Q36_DRAFT_VOCAB=N`: the MTP drafts pick among the first N token ids, used when `--draft-vocab` is absent (`:5167`). Unset, 0: the whole vocabulary (`:2751`).
 - `STRATA_Q36_FIXED_SLOTS=1`: freezes the expert slots as placed. The identity gate uses it (`:3148`).
 - `STRATA_Q36_KEEP_PACKED`: unset, the packed Q8_0 copies are freed when that gives more expert slots (`:3760`). Set, they are kept.
