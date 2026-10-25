@@ -15,6 +15,10 @@ bool iq512_down_supported(int ggml_type) noexcept;
 /// ff[t][r] = silu(gate_r . a[t]) * (up_r . a[t]), rows [r0, r1); gate rows at blob, up rows at blob + up_off.
 void iq512_gu_rows(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
                    int nt, float* const* ff, int r0, int r1);
+/// IQ3_XXS (type 18) only: g[t][r] = gate_r . a[t] and u[t][r] = up_r . a[t], rows [r0, r1), no SwiGLU, each dot in the
+/// float order of ggml-cpu's AVX2 dot, so a row is ggml's vec_dot for that token bit for bit whatever nt (#74).
+void iq512_iq3xxs_gu_rows_ggml(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
+                               float* const* g, float* const* u, int r0, int r1);
 /// out[t][r] = w_r . a[t], rows [r0, r1).
 void iq512_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
                 float* const* out, int r0, int r1);

@@ -255,6 +255,142 @@ class InterToken(unittest.TestCase):
         self.assertIsNone(launch.ttft_ms)
 
 
+def steps_line(steps: list, total: int = None, session: int = 1) -> str:
+    """The decode steps line as q36_stats.hpp's format_steps prints it, for (pool, wait, host, pcie[, rows]) tuples."""
+    groups = "".join(" " + "/".join(f"{v:.1f}" for v in t[:4]) + (f"/{t[4]}" if len(t) > 4 and t[4] != 1 else "")
+                     for t in steps)
+    return (f"strata serve: session {session}: stats: decode steps (pool/wait/host/PCIe copies ms[/rows]), "
+            f"{len(steps) if total is None else total} steps, {len(steps)} listed:{groups}\n")
+
+
+NORMAL = (15.0, 7.0, 1.5, 2.6)   # a decode step at the median: 26.1 ms of wall time, the copies overlapping it
+
+
+class DecodeSteps(unittest.TestCase):
+    def test_parse_steps(self):
+        steps = ps.parse_steps(" 15.1/7.6/1.4/2.6 14.9/2.4/-0.3/0.0/3")
+        self.assertEqual(len(steps), 2)
+        self.assertEqual((steps[0].pool, steps[0].wait, steps[0].host, steps[0].pcie, steps[0].rows), (15.1, 7.6, 1.4, 2.6, 1))
+        self.assertEqual((steps[1].host, steps[1].rows), (-0.3, 3))
+        self.assertAlmostEqual(steps[1].wall, 14.9 + 2.4 - 0.3)
+        self.assertEqual(ps.parse_steps(""), [])
+        self.assertIsNone(ps.parse_steps(" 15.1/7.6/1.4"))
+        self.assertIsNone(ps.parse_steps(" 15.1/x/1.4/2.6"))
+
+    def test_line_after_the_measured_request_is_read(self):
+        warm = ENGINE_LOG + steps_line([(99.0, 0.0, 0.0, 0.0)])   # the warm-up's line: not the measured request's
+        log = warm + ENGINE_LOG + steps_line([NORMAL, (30.0, 7.0, 1.5, 2.6, 2)], total=5)
+        launch = ps.Launch("x")
+        ps.parse_engine_log(log, launch)
+        self.assertEqual(launch.problems, [])
+        self.assertEqual(len(launch.steps), 2)
+        self.assertEqual(launch.steps_total, 5)
+        self.assertEqual(launch.steps[1].rows, 2)
+        self.assertAlmostEqual(launch.steps[1].pool, 30.0)
+
+    def test_absent_line_leaves_no_steps(self):
+        launch = ps.Launch("x")
+        ps.parse_engine_log(ENGINE_LOG, launch)
+        self.assertIsNone(launch.steps)
+        self.assertTrue(launch.measured)
+        self.assertEqual(launch.step_of_gaps(), (None, "no decode steps line"))
+        self.assertEqual(launch.slow_steps(), [])
+
+    def test_line_of_another_session_is_not_read(self):
+        launch = ps.Launch("x")
+        ps.parse_engine_log(ENGINE_LOG + steps_line([NORMAL], session=2), launch)
+        self.assertIsNone(launch.steps)
+
+    def test_malformed_line_is_a_problem(self):
+        launch = ps.Launch("x")
+        bad = steps_line([NORMAL, NORMAL]).replace(" 2 listed:", " 3 listed:")   # the list is shorter than its count
+        ps.parse_engine_log(ENGINE_LOG + bad, launch)
+        self.assertIsNone(launch.steps)
+        self.assertTrue(any("decode steps line is malformed" in p for p in launch.problems))
+
+    def plain(self, steps: list, times: list = CHUNK_MS) -> ps.Launch:
+        launch = ps.Launch("x")
+        launch.tokens = len(times)
+        launch.chunk_ms = list(times)
+        launch.steps = ps.parse_steps(steps_line(steps).split("listed:")[1])
+        launch.steps_total = len(steps)
+        return launch
+
+    def test_plain_decode_one_step_per_gap(self):
+        # CHUNK_MS: 21 tokens, 20 gaps; the 20th gap (130 ms, the only one above the p95) ends token 20, decode step 19's
+        steps = [NORMAL] * 19 + [(15.0, 7.0, 105.0, 2.6)]
+        launch = self.plain(steps)
+        of, why = launch.step_of_gaps()
+        self.assertIsNone(why)
+        self.assertEqual(of, list(range(20)))
+        slow = launch.slow_steps()
+        self.assertEqual([(t, round(g, 6)) for t, g, _ in slow], [(20, 130.0)])
+        med = launch.median_step()
+        self.assertEqual([med.stage(n) for n in ps.STAGES], list(NORMAL))
+        self.assertEqual(ps.dominant(slow[0][2], med), "host")
+
+    def test_each_slow_token_gets_its_dominant_stage_and_the_totals(self):
+        # 3 slow gaps of 130 ms among 60 gaps (p95 = the 57th smallest, 30 ms): one made by the pool, one by the wait, one by
+        # the PCIe copies (the host waiting on them too, but the copies grew more)
+        times = [0.0]
+        for i in range(60):
+            times.append(times[-1] + (130.0 if i in (9, 19, 29) else 30.0))
+        steps = [NORMAL] * 60
+        steps[9] = (115.0, 7.0, 1.5, 2.6)
+        steps[19] = (15.0, 107.0, 1.5, 2.6)
+        steps[29] = (15.0, 7.0, 31.5, 72.6)
+        launch = self.plain(steps, times)
+        self.assertAlmostEqual(launch.itl_p95, 30.0)
+        slow = launch.slow_steps()
+        self.assertEqual([t for t, _, _ in slow], [10, 20, 30])
+        med = launch.median_step()
+        self.assertEqual([ps.dominant(s, med) for _, _, s in slow], ["pool", "wait", "PCIe"])
+        ms, excess, count = ps.stage_totals(slow, med)
+        self.assertAlmostEqual(ms["pool"], 145.0)
+        self.assertAlmostEqual(excess["pool"], 100.0)
+        self.assertAlmostEqual(excess["wait"], 100.0)
+        self.assertAlmostEqual(excess["host"], 30.0)
+        self.assertAlmostEqual(excess["PCIe"], 70.0)
+        self.assertEqual(count, {"pool": 1, "wait": 1, "host": 0, "PCIe": 1})
+        self.assertEqual(ps.excess_text(excess),
+                         "pool 100.0 ms (33%), wait 100.0 ms (33%), host 30.0 ms (10%), PCIe 70.0 ms (23%)")
+        self.assertEqual(ps.excess_text({n: 0.0 for n in ps.STAGES}), "pool 0.0 ms, wait 0.0 ms, host 0.0 ms, PCIe 0.0 ms")
+
+    def test_verify_windows_give_their_time_to_their_first_token(self):
+        # 7 tokens: the prompt's, then steps of 2, 1 and 3 rows; the later tokens of a window arrive with its first
+        launch = self.plain([NORMAL + (2,), NORMAL, NORMAL + (3,)], [0.0, 30.0, 30.5, 60.0, 90.0, 90.5, 91.0])
+        of, why = launch.step_of_gaps()
+        self.assertIsNone(why)
+        self.assertEqual(of, [0, None, 1, 2, None, None])
+        # an answer that ends inside the last window (max_tokens): 6 tokens of the 7 the rows allow still match
+        short = self.plain([NORMAL + (2,), NORMAL, NORMAL + (3,)], [0.0, 30.0, 30.5, 60.0, 90.0, 90.5])
+        self.assertEqual(short.step_of_gaps()[0], [0, None, 1, 2, None])
+
+    def test_steps_that_do_not_add_up_are_not_matched(self):
+        launch = self.plain([NORMAL] * 18)   # 18 steps for 21 tokens
+        of, why = launch.step_of_gaps()
+        self.assertIsNone(of)
+        self.assertEqual(why, "18 decode steps of 18 rows for 21 tokens")
+        self.assertEqual(launch.slow_steps(), [])
+        chunks = self.plain([NORMAL] * 20)
+        chunks.tokens = 30   # the stream merged tokens: one chunk is not one token
+        self.assertEqual(chunks.step_of_gaps(), (None, "21 text chunks for 30 tokens"))
+        usage = self.plain([NORMAL] * 20)
+        usage.completion_tokens = 22
+        self.assertEqual(usage.step_of_gaps(), (None, "usage.completion_tokens 22 for 21 engine tokens"))
+
+    def test_steps_past_the_listed_ones_leave_their_tokens_out(self):
+        launch = self.plain([NORMAL] * 10)
+        launch.steps_total = 20   # the engine listed 10 of its 20 steps
+        of, why = launch.step_of_gaps()
+        self.assertIsNone(why)
+        self.assertEqual(of, list(range(10)) + [None] * 10)
+        self.assertEqual(launch.slow_steps(), [])   # the slow gap (the 20th) is a step the line does not list
+        too_many = self.plain([NORMAL] * 21)
+        too_many.steps_total = 30
+        self.assertEqual(too_many.step_of_gaps()[1], "21 listed decode steps of 21 rows for 21 tokens")
+
+
 class Short(unittest.TestCase):
     def test_fewer_completion_tokens_than_asked(self):
         launch = ps.Launch("x")
@@ -282,7 +418,7 @@ class Short(unittest.TestCase):
 class Summary(unittest.TestCase):
     def make_launch(self, root: Path, name: str, tok_s: float, free_kib: int, completion: int = 300,
                     finish: str = "length", times: list = CHUNK_MS, warmup_share: str = "0.45",
-                    own_stats: bool = True, rebalances: str = "") -> Path:
+                    own_stats: bool = True, rebalances: str = "", steps: str = "") -> Path:
         d = root / name
         d.mkdir()
         # a warm-up request, then the measured one of 300 tokens at the given rate: decode time = 300 / rate seconds
@@ -292,6 +428,7 @@ class Summary(unittest.TestCase):
             text = text.replace(REB_OLD, "(12.3% of the prefetched); decode rebalances: " + rebalances + "\n")
         if not own_stats:   # the measured request printed no stats line: only the warm-up's is in the log
             text = "\n".join(line for line in text.splitlines() if ": stats: pool " not in line) + "\n"
+        text += steps   # the measured request's decode steps line (empty: an engine without it)
         warm = ENGINE_LOG.replace("PCIe share 0.45", "PCIe share " + warmup_share)
         (d / "engine.log").write_text(warm + text, encoding="utf-8")
         (d / "mem.log").write_text(f"0.0 {free_kib} 16000 32607\n", encoding="utf-8")
@@ -318,6 +455,8 @@ class Summary(unittest.TestCase):
         share_line = [l for l in text.splitlines() if l.strip().startswith("tokens above the p95: share of decode")][0]
         self.assertIn("0.186", share_line)
         self.assertIn("per-token partition", text)
+        self.assertNotIn("slow tokens by stage", text)   # no decode steps line: the summary as before it
+        self.assertIn("Which path made a given token slow is not in the logs", text)
 
     def test_short_launch_is_flagged_and_left_out(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -361,6 +500,47 @@ class Summary(unittest.TestCase):
         self.assertEqual(mb.split()[-1], "3.0")
         host = [l for l in text.splitlines() if l.strip().startswith("decode rebalances: host ms")][0]
         self.assertEqual(host.split()[-1], "1.5")
+
+    def test_slow_tokens_by_stage(self):
+        # 300 tokens: 299 gaps of 24 ms but 14 of 40 ms (p95 = the 285th smallest, 24 ms); 299 decode steps at the median
+        # but the slow tokens' steps: 10 with 16 ms more pool, 4 with 16 ms more GPU wait; of their 553 ms, the pool's
+        # 370 ms is 67%, the wait's 162 ms 29%, the host's 21 ms 4%, and the copies' 36.4 ms 7%
+        slow_at = set(range(10, 290, 20))
+        times = [440.0]
+        for i in range(299):
+            times.append(times[-1] + (40.0 if i in slow_at else 24.0))
+        steps = [NORMAL] * 299
+        for n, i in enumerate(sorted(slow_at)):
+            steps[i] = (31.0, 7.0, 1.5, 2.6) if n < 10 else (15.0, 23.0, 1.5, 2.6)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            gib13 = 13 * 1024 * 1024
+            self.make_launch(root, "launch_01", 30.0, gib13, times=times, steps=steps_line(steps))
+            self.make_launch(root, "launch_02", 32.0, gib13, times=times, steps=steps_line(steps[:-1]))   # 298 for 300 tokens
+            self.make_launch(root, "launch_03", 33.0, gib13, times=times)   # an engine without the line
+            text = ps.summary(sorted(root.glob("launch_*")))
+        lines = text.splitlines()
+        self.assertIn("slow tokens by stage: the decode step behind each inter-token time above the p95 (ms; host = the "
+                      "step's wall time", text)
+        head = [l for l in lines if l.startswith("launch_01: p95")][0]
+        self.assertEqual(head, "launch_01: p95 24.00 ms, 14 tokens above it, 14 matched to the first token of a decode step; "
+                               "median step: pool 15.0, wait 7.0, host 1.5, PCIe 2.6")
+        rows = [l for l in lines if l.startswith("  ") and l.split()[0].isdigit() and len(l.split()) == 7]
+        self.assertEqual(len(rows), 14)
+        self.assertEqual(rows[0].split(), ["11", "40.00", "31.0", "7.0", "1.5", "2.6", "pool"])
+        self.assertEqual(rows[-1].split(), ["271", "40.00", "15.0", "23.0", "1.5", "2.6", "wait"])
+        self.assertIn("  share of the slow steps' time: pool 67%, wait 29%, host 4%; PCIe copies 7% (overlap)", lines)
+        self.assertIn("  excess over the median step: pool 160.0 ms (71%), wait 64.0 ms (29%), host 0.0 ms (0%), "
+                      "PCIe 0.0 ms (0%)", lines)
+        self.assertIn("  dominant: pool 10, wait 4, host 0, PCIe 0", lines)
+        self.assertIn("launch_02: no attribution: 298 decode steps of 298 rows for 300 tokens", lines)
+        self.assertIn("launch_03: no attribution: no decode steps line", lines)
+        self.assertIn("all measured launches: 14 slow tokens matched; dominant: pool 10, wait 4, host 0, PCIe 0; excess over the "
+                      "median step: pool 160.0 ms (71%), wait 64.0 ms (29%), host 0.0 ms (0%), PCIe 0.0 ms (0%)", lines)
+        self.assertIn("Which stage made each slow token slow: the section", text)
+        self.assertNotIn("is not in the logs", text)
+        # the medians and the per-launch table are the same as without the line
+        self.assertIn("median over the measured launches (3 of 3)", text)
 
     def test_rebalances_of_older_lines_read_na(self):
         with tempfile.TemporaryDirectory() as tmp:

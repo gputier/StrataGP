@@ -1621,6 +1621,7 @@ struct Engine {
         int chosen = 0, demand = 0, prefetch = 0;
         size_t bytes = 0;
         double launch_ms = 0.0;   // the host time spent picking, launching and planning the step's PCIe copies
+        long long step = 0;       // STRATA_Q36_STATS=1: the decode step that issued the copies (StepLog::id)
     };
     struct WireCount {
         double wire_ms = 0, bytes = 0, cpu_ms = 0, launch_ms = 0;
@@ -1632,12 +1633,27 @@ struct Engine {
     WireCount wire, wire_mark;
     int wire_steps = 0, wire_logs = 0;
     // STRATA_Q36_STATS=1 (q36_stats.hpp): the bytes each path reads, the host's wait on the doorbell, the experts' union over
-    // consecutive tokens; every use below is behind stats_on, so a run without the switch reads no clock and adds no sync
+    // consecutive tokens, the partition of each decode step; every use below is behind stats_on, so a run without the switch
+    // reads no clock and adds no sync
     const bool stats_on = strata::q36::stats_enabled();
     strata::q36::DecodeStats stat_acc;
     strata::q36::ExpertUnion stat_union;
     long long stat_mixed = 0;          // decode windows of two or more sessions, and requests started beside a decoding one
     std::vector<char> stat_hit_mark;   // per expert: counted as a resident expert read by this layer step
+    strata::q36::StepLog stat_steps;   // the request's decode steps (after_rows), for its decode steps line
+    Clock::time_point stat_step_t;     // the last step's close (the decode's start for the first)
+    /// The pool's row phases so far, ms (0 without the pool).
+    double stat_pool_ms() const {
+#if defined(STRATA_Q36_CPU_POOL)
+        if (pool) return pool->ms_multi_gu + pool->ms_multi_q + pool->ms_multi_down;
+#endif
+        return 0.0;
+    }
+    /// The request's decode starts: its steps are logged from here.
+    void stat_steps_begin() {
+        stat_steps.begin(stat_pool_ms(), stat_acc.wait_ms);
+        stat_step_t = Clock::now();
+    }
     /// The accumulated counters now, the pool's included (the request's figures are the difference of two snapshots).
     strata::q36::DecodeStats stat_snapshot() const {
         strata::q36::DecodeStats d = stat_acc;
@@ -1679,7 +1695,8 @@ struct Engine {
     }
     /// Reads the layer steps whose copies have completed, in order (the first one still copying ends the pass).
     void wire_resolve() {
-        std::vector<std::pair<double, double>> iv;
+        std::vector<std::pair<double, double>> iv, step_iv;   // step_iv (stats): the intervals of one decode step's copies
+        long long step = -1;
         while (!wire_pending.empty()) {
             WireStep& r = wire_pending.front();
             bool done = true;
@@ -1696,6 +1713,14 @@ struct Engine {
             }
             if (ok) {
                 iv.insert(iv.end(), mine.begin(), mine.end());
+                if (stats_on) {   // the layer steps are in order: one decode step's copies are read together
+                    if (r.step != step) {
+                        stat_steps.add_pcie(step, strata::q36::interval_union_ms(step_iv));
+                        step_iv.clear();
+                        step = r.step;
+                    }
+                    step_iv.insert(step_iv.end(), mine.begin(), mine.end());
+                }
                 wire.launch_ms += r.launch_ms;
                 wire.chosen += r.chosen;
                 wire.demand += r.demand;
@@ -1707,6 +1732,7 @@ struct Engine {
             wire_pending.pop_front();
         }
         wire.wire_ms += strata::q36::interval_union_ms(iv);
+        if (stats_on) stat_steps.add_pcie(step, strata::q36::interval_union_ms(step_iv));
     }
     /// STRATA_Q36_STATS=1: one line per window (48 steps, then 96 each, as PcieAuto's updates): the wire time measured against
     /// the blobs chosen for PCIe and the blobs that crossed the link, and the share c / (c + w - l) gives with it.
@@ -1793,9 +1819,16 @@ struct Engine {
     }
     void after_rows(int n) {   // a decode step / verify window kept n rows: count them, rebalance at the boundary
         if (!m->hybrid) return;
+        if (stats_on) stat_steps.open(n);   // the step's entry, before pcie_window resolves its copies into it
         count_rows(n);
         pcie_window(n);
         if (pos % rebalance_every == 0) rebalance_cadence(true);
+        if (stats_on) {   // the step ends after its rebalance: that host time is the step's
+            const Clock::time_point now = Clock::now();
+            stat_steps.close(stat_pool_ms(), stat_acc.wait_ms,
+                             std::chrono::duration<double, std::milli>(now - stat_step_t).count());
+            stat_step_t = now;
+        }
     }
     /// A rebalance of the decode cadence (after_rows, run_rows): at most 8 replacements.  The stats count its swaps, bytes and
     /// host time (rb_ms), the stream synchronisation before it (`sync`) and its own included; the default path reads no clock.
@@ -2963,6 +2996,7 @@ struct Engine {
             launch_ms = ms_since(l0);
             ws.chosen = n_pcie;
             ws.launch_ms = launch_ms;
+            if (stats_on) ws.step = stat_steps.id();
             wire_pending.push_back(ws);
         }
         int n_pcie_ent = 0;
@@ -3672,7 +3706,7 @@ struct Engine {
 /// The routed experts after the engine's buffers: all in VRAM when they fit in `vram_gib` (< 0: the free VRAM less a
 /// reserve), else the hybrid mode - every expert in host memory, the same number of VRAM slots per layer, a decode
 /// batch's other experts on the CPU pool and a prompt chunk's streamed through two staging buffers.
-bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid_t, int slots, double pcie_frac, std::string& err) {
+bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid_t, int slots, const strata::q36::PcieOption& pcie, std::string& err) {
     const auto t0 = Clock::now();
     const auto& g = m.g;
     const int64_t ne = g.n_expert;
@@ -3714,7 +3748,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     // the PCIe share's staging area (q36_pcie.hpp): kPcieStageBlobs blobs of the widest layer's stride (the layer's own slots and the
     // prefetch's two regions); --pcie-frac 0 is off.  The
     // estimate counts it before main_hybrid is known; the real size (pcie_bytes) drops it when only the MTP block is hybrid
-    const size_t pcie_stage = pcie_frac != 0.0 ? (size_t) strata::q36::kPcieStageBlobs * pc_blob + kMmqTail : 0;
+    const size_t pcie_stage = pcie.on() ? (size_t) strata::q36::kPcieStageBlobs * pc_blob + kMmqTail : 0;
     const size_t fixed_est = (E.use_mmq ? max_layer + max_main + 2 * kMmqTail : 0) + pcie_stage;
     const auto slots_in = [&](size_t room) {
         return room > reserve + fixed_est ? std::min<size_t>((size_t) ne, (room - reserve - fixed_est) / per_slot) : (size_t) 0;
@@ -3811,11 +3845,11 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     const size_t staging = E.use_mmq && E.main_hybrid ? max_layer + max_main + 2 * kMmqTail : 0;
     // the main layers' hybrid path only (the MTP block alone runs few rows)
     const size_t pcie_bytes = E.main_hybrid ? pcie_stage : 0;
-    // no --pcie-frac: the share the link's probed bandwidth gives (as Flash-Next's native packs: 0.55 on a 20 GB/s link or
-    // faster), then refined from the pool's speed (PcieAuto); a probe that fails keeps the 0.55
+    // --pcie-frac auto: the share the link's probed bandwidth gives (as Flash-Next's native packs: 0.55 on a 20 GB/s link or
+    // faster), then refined from the pool's speed (PcieAuto); a probe that fails keeps the 0.55; no probe otherwise
     double link_gbps = -1.0;
     std::string bursts;
-    if (pcie_bytes > 0 && pcie_frac < 0.0) link_gbps = strata::core::probe_pcie_h2d_gbps(&bursts);
+    if (pcie_bytes > 0 && pcie.mode == strata::q36::PcieMode::Auto) link_gbps = strata::core::probe_pcie_h2d_gbps(&bursts);
     size_t slot_bytes = budget2 > staging + pcie_bytes ? budget2 - staging - pcie_bytes : 0;
     if (slot_bytes + staging + pcie_bytes + ((size_t) 256 << 20) > fr)
         slot_bytes = fr > staging + pcie_bytes + ((size_t) 512 << 20) ? fr - staging - pcie_bytes - ((size_t) 512 << 20) : 0;
@@ -3943,8 +3977,12 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         }
     }
     E.pool = std::make_unique<C::ExpertPool>(strata::q36::pool_workers(threads, (int) C::detect_cpu_topology(true).worker_cores.size()));
-    if (pcie_frac == 0.0) {
-        std::fprintf(stderr, "strata-q36: PCIe share off (--pcie-frac 0)\n");
+    if (!pcie.on()) {
+        if (E.main_hybrid) {   // no hybrid main layer (all in VRAM, or only the MTP block on the CPU pool): no share to report
+            std::fprintf(stderr, "strata-q36: PCIe share off (%s)\n",
+                         pcie.mode == strata::q36::PcieMode::Off ? "--pcie-frac 0"
+                                                                 : "the default: --pcie-frac F or --pcie-frac auto turns it on");
+        }
     } else if (pcie_bytes > 0 && !pinned) {
         std::fprintf(stderr, "strata-q36: the PCIe share is off: the experts are in pageable host memory\n");
     } else if (pcie_bytes > 0) {
@@ -3973,8 +4011,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         E.pc_mark.assign((size_t) ne, 0);
         constexpr double kBase = 0.55;   // the share measured on x16 links (Flash-Next's native packs)
         double frac = kBase;
-        if (pcie_frac >= 0.0) {
-            frac = std::min(1.0, pcie_frac);
+        if (pcie.mode == strata::q36::PcieMode::Fixed) {
+            frac = std::min(1.0, pcie.frac);
         } else if (link_gbps > 0.0) {
             frac = strata::core::pcie_frac_for_gbps(link_gbps, kBase);
             double sum = 0.0;
@@ -3989,21 +4027,21 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             E.pcie_auto.blob_bytes = sum / (double) m.layers.size();
         }
         E.pcie_num = strata::core::pcie_num_of(frac);
-        if (pcie_frac >= 0.0)
+        const char* how = "--pcie-frac auto; --pcie-frac F fixes it, 0 turns it off";
+        if (pcie.mode == strata::q36::PcieMode::Fixed)
             std::fprintf(stderr, "strata-q36: PCIe share %.2f of the missed experts (--pcie-frac)\n", frac);
         else if (link_gbps > 0.0)
             std::fprintf(stderr, "strata-q36: PCIe probe: %.1f GB/s host->device (best of %s) -> PCIe share %.2f of the missed "
-                         "experts, %s (--pcie-frac N fixes it, 0 turns it off)\n", link_gbps, bursts.c_str(), frac,
+                         "experts, %s (%s)\n", link_gbps, bursts.c_str(), frac,
                          E.pcie_step_on ? "moved by the wall time per decode token (STRATA_Q36_PCIE_AUTO_STEP=1)"
-                                        : "refined from the CPU pool's speed");
+                                        : "refined from the CPU pool's speed", how);
         else
-            std::fprintf(stderr, "strata-q36: PCIe probe failed -> PCIe share %.2f of the missed experts (--pcie-frac N fixes it, "
-                         "0 turns it off)\n", frac);
+            std::fprintf(stderr, "strata-q36: PCIe probe failed -> PCIe share %.2f of the missed experts (%s)\n", frac, how);
     }
-    // one place for every branch above (--pcie-frac 0, pageable memory, no PCIe bytes, --pcie-frac N, failed probe, or a value
+    // one place for every branch above (default off, --pcie-frac 0, pageable memory, no PCIe bytes, --pcie-frac F, failed probe, or a value
     // that does not switch it on): the step search is off, and the log says the variable did nothing
     if (std::getenv("STRATA_Q36_PCIE_AUTO_STEP") != nullptr && !E.pcie_step_on)
-        std::fprintf(stderr, "strata-q36: STRATA_Q36_PCIE_AUTO_STEP ignored (the PCIe share is not automatic here, or the value is not 1)\n");
+        std::fprintf(stderr, "strata-q36: STRATA_Q36_PCIE_AUTO_STEP ignored (it needs --pcie-frac auto, a working probe and the value 1)\n");
     CK(cudaDeviceSynchronize());
     if (mtp_only)
         std::fprintf(stderr, "strata-q36: every main layer's routed experts in VRAM (%.2f GiB); the MTP block's: %d of "
@@ -4646,6 +4684,7 @@ struct Serve {
             std::mt19937_64 r = draw_rng(smp.seed, (uint64_t) (E.pos + t));
             return (int32_t) sample(lg, smp, hist, r, dr, (size_t) t);
         };
+        if (E.stats_on) E.stat_steps_begin();
         bool known = false;   // nx came out of a verify window already
         bool no_logit = false;   // a pick had no finite logit (-1): the request ends in ERR, that pick is not emitted
         for (;;) {
@@ -4698,6 +4737,7 @@ struct Serve {
             fix.clear();
             if (!smp.needs_logits()) nx = E.greedy();
         }
+        if (E.stats_on) E.stat_steps.stop();
         E.sess[(size_t) E.cur].pos = E.pos;
         if (no_logit) {
             std::printf("ERR %s\n", kNoLogitMsg);
@@ -4720,8 +4760,9 @@ struct Serve {
                          pct(hp), hp, pct(hcpu), hcpu, E.hy_swaps - hs0, E.pcie_num / 256.0);
             if (E.stats_on && strata::q36::single_decoder(alone, mixed0, E.stat_mixed)) {
                 const strata::q36::DecodeStats d = E.stat_snapshot() - stat0;
-                std::fprintf(stderr, "%s\n%s\n%s\n", strata::q36::format_decode_stats(s, d, produced).c_str(),
-                             strata::q36::format_wait_layers(s, d).c_str(), strata::q36::format_union(s, E.stat_union).c_str());
+                std::fprintf(stderr, "%s\n%s\n%s\n%s\n", strata::q36::format_decode_stats(s, d, produced).c_str(),
+                             strata::q36::format_wait_layers(s, d).c_str(), strata::q36::format_union(s, E.stat_union).c_str(),
+                             strata::q36::format_steps(s, E.stat_steps).c_str());
             }
         }
     }
@@ -4843,7 +4884,7 @@ int strata::qwen35::run(int argc, char** argv) {
     double expert_vram = -1.0;
     float cache_prior = 0.0f, ser_t = 0.0f;   // routing options, off
     int ser_kmin = 8;
-    double pcie_frac = -1.0;   // the PCIe share of the missed experts: < 0 the probed one, 0 off
+    strata::q36::PcieOption pcie;   // the PCIe share of the missed experts: off by default, --pcie-frac F or auto
     bool warm = true;
     int expert_slots = 0, batch = 0, draft_vocab = -1;
     std::string rope_scaling;
@@ -4893,7 +4934,13 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--expert-profile") expert_profile = next();
         else if (a == "--expert-profile-save") expert_profile_save = next();
         else if (a == "--hybrid-rows") hybrid_rows = std::atoi(next().c_str());
-        else if (a == "--pcie-frac") pcie_frac = std::atof(next().c_str());
+        else if (a == "--pcie-frac") {
+            const std::string v = next();
+            if (!strata::q36::parse_pcie_option(v.c_str(), &pcie)) {
+                std::fprintf(stderr, "strata-q36: --pcie-frac %s is not \"auto\" or a number from 0 up\n", v.c_str());
+                return 2;
+            }
+        }
         else if (a == "--cache-prior") cache_prior = (float) std::atof(next().c_str());   // 0 off, else in (0, 1]
         else if (a == "--ser") {                                                          // Kmin,t
             const std::string v = next();
@@ -4926,7 +4973,7 @@ int strata::qwen35::run(int argc, char** argv) {
             std::fprintf(stderr,
                          "usage: strata-q36 --model GGUF [--max-context 32768] [--chunk 512] [--no-graph] [--kv fp32|q4]\n"
                          "       [--rope-scaling none|linear|yarn [--rope-scale F] [--rope-orig-ctx N]]\n"
-                         "       [--expert-profile FILE] [--expert-profile-save FILE] [--pcie-frac F]\n"
+                         "       [--expert-profile FILE] [--expert-profile-save FILE] [--pcie-frac F|auto]\n"
                          "       [--cache-prior L] [--ser Kmin,t]\n"
                          "       (--serve | --tokens IDS [--n 64] [--force IDS] [--dump-full-logits F] | --bench-pp N "
                          "--bench-tg N)\n");
@@ -5026,7 +5073,7 @@ int strata::qwen35::run(int argc, char** argv) {
             std::fprintf(stderr, "strata-q36: %s - the slots start with experts 0 .. S - 1\n", perr.c_str());
         }
     }
-    if (!place_experts(m, E, expert_vram, cpu_threads, hybrid_rows, expert_slots, pcie_frac, err)) {
+    if (!place_experts(m, E, expert_vram, cpu_threads, hybrid_rows, expert_slots, pcie, err)) {
         std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
         return 1;
     }

@@ -10,7 +10,7 @@ already running from the engine binary's path, or a server already answering on 
 VRAM every 2.5 s into mem.log; it never stops anything: the engine runs with no memory guard), serve/server.py with the strata
 engine, STRATA_Q36_STATS=1 and no working-set cap, a wait for /health, one throw-away warm-up request of -WarmupTokens tokens
 (241 or more: the first token comes from the prompt, so 241 tokens run 240 decode windows and the automatic PCIe share
-(PcieAuto) has made its last update, after 48, 144 and 240 windows; this guarantee covers PcieAuto only: under
+(PcieAuto, with -ExtraArgs "--pcie-frac auto"; off by default) has made its last update, after 48, 144 and 240 windows; this guarantee covers PcieAuto only: under
 -ExtraEnv STRATA_Q36_PCIE_AUTO_STEP=1 the step search may still move the share during the measured requests, and the script
 warns), then one greedy streamed chat request of -Tokens tokens per prompt, each text chunk timestamped on arrival (chunks.tsv). A completion with
 fewer tokens than asked is flagged (usage.completion_tokens, finish_reason) in response.json and by the summary. The PCIe
@@ -48,7 +48,7 @@ param(
     [string]$ServerScript = '',                                   # empty = serve\server.py of this tree
     [string]$Tokenizer = '',                                      # tokenizer folder with vocab.json; empty = pack\full\tokenizer
     [string]$ExtraEnv = '',                                       # more engine settings, 'NAME=value;NAME=value' (issues #96, #80)
-    [string]$ExtraArgs = '',                                      # more engine arguments, space separated (a fixed --pcie-frac, issue #80)
+    [string]$ExtraArgs = '',                                      # more engine arguments, space separated (--pcie-frac F or auto, issue #80)
     [string]$PromptsFile = ''                                     # one prompt per line, sent in order (greedy parity); empty = the fixed prompt
 )
 
@@ -496,7 +496,9 @@ for ($n = 1; $n -le $Launches; $n++) {
     Write-HyperV $hyper "launch $n"
 
     # The server's config: the engine's arguments (Ornith's launcher options, docs/ORNITH_122B.md) and the expert profile
-    # read at start. No --expert-slots, and no --pcie-frac unless -ExtraArgs gives one: the automatic settings are measured.
+    # read at start. No --expert-slots, and no --pcie-frac unless -ExtraArgs gives one: the engine defaults are measured (rebalance
+    # every 8, PCIe path off); -ExtraArgs "--pcie-frac auto" measures the automatic PCIe share (PcieAuto, and the step search with
+    # -ExtraEnv STRATA_Q36_PCIE_AUTO_STEP=1).
     $engineArgs = @('--native', $Gguf, '--max-context', '409600', '--prefill', 'auto', '--mtp', '0',
               '--rope-scaling', 'yarn', '--rope-scale', '2', '--rope-orig-ctx', '262144', '--kv', 'q4',
               '--expert-profile', $RankFile) + @($ExtraArgs -split '\s+' | Where-Object { $_ -ne '' })
