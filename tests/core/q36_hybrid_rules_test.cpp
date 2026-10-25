@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -103,6 +104,44 @@ int main() {
     check(hybrid_prompt_chunk(23.2, 1, false) == 2048, "23.2 GiB free, one session, slots by hand: 2048");
     check(hybrid_prompt_chunk(20.0, 1, false) == 2048, "20.0 GiB free, one session, slots by hand: 2048");
     check(hybrid_prompt_chunk(5.49, 1, false) == 512, "5.49 GiB free, slots by hand: 512");
+    std::printf("parse_ser_table:\n");
+    {
+        // 48 main layers, --ser's Kmin 7: a table line names a layer's own Kmin, the others keep 7
+        std::vector<int> kmin;
+        std::string err;
+        const bool ok = parse_ser_table("# SER table\n\n5 6\n  12\t8   # all picks\r\n47 1\n", 48, 7, &kmin, &err);
+        check(ok && err.empty(), "a table with comments, blank lines, tabs and CRs is read");
+        check(ok && kmin.size() == 48 && kmin[5] == 6 && kmin[12] == 8 && kmin[47] == 1 && kmin[0] == 7 && kmin[46] == 7,
+              "the named layers take their Kmin, the others --ser's Kmin 7");
+        std::vector<int> none;
+        check(parse_ser_table("", 4, 6, &none, &err) && none == std::vector<int>({6, 6, 6, 6}),
+              "an empty table gives every layer --ser's Kmin");
+        std::vector<int> two;
+        check(parse_ser_table("0 5\n3 4\n", 4, 8, &two, &err) && two == std::vector<int>({5, 8, 8, 4}),
+              "layers 0 and 3 are named, layers 1 and 2 take the default Kmin 8");
+    }
+    {
+        // each refusal names its line: a bad line is never skipped
+        std::vector<int> kmin;
+        std::string err;
+        const auto refused = [&](const char* text, int n_layers, const char* line) {
+            err.clear();
+            const bool ok = parse_ser_table(text, n_layers, 8, &kmin, &err);
+            return !ok && err.find(line) != std::string::npos;
+        };
+        check(refused("5\n", 48, "line 1"), "a line with one number is refused");
+        check(refused("5 6 7\n", 48, "line 1"), "a line with three numbers is refused");
+        check(refused("5 6x\n", 48, "line 1"), "a Kmin with text after it is refused");
+        check(refused("5 x\n", 48, "line 1"), "a non-number is refused");
+        check(refused("1.5 6\n", 48, "line 1"), "a layer that is not an integer is refused");
+        check(refused("3 6\n\n# c\n47 9\n", 48, "line 4"), "Kmin 9 is refused, the error names line 4");
+        check(refused("0 0\n", 48, "line 1"), "Kmin 0 is refused");
+        check(parse_ser_table("0 1\n", 48, 8, &kmin, &err), "Kmin 1 is accepted");
+        check(refused("48 6\n", 48, "line 1"), "layer 48 is out of 0 .. 47 and refused");
+        check(refused("-1 6\n", 48, "line 1"), "layer -1 is refused");
+        check(parse_ser_table("47 8\n", 48, 8, &kmin, &err), "layer 47 of 48 is accepted");
+        check(refused("2 6\n2 7\n", 48, "line 2"), "a layer named twice is refused, the error names line 2");
+    }
     std::printf("%s\n", g_fail ? "FAILED" : "all passed");
     return g_fail ? 1 : 0;
 }

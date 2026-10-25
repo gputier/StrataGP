@@ -4,6 +4,11 @@
 
 #include "q36_delta.hpp"
 
+#include <cstddef>
+#include <sstream>
+#include <string>
+#include <vector>
+
 namespace strata::q36 {
 
 /// SER (ik_llama.cpp PR 239), k_route_group: the pick of rank `rank` is kept when it is one of the first ser_kmin picks or
@@ -37,6 +42,44 @@ Q36_HD inline bool hybrid_graph_off(bool main_hybrid, int hybrid_t, int verify_r
 inline int hybrid_prompt_chunk(double free_gib, int sessions, bool auto_slots) {
     if (free_gib >= 20.0 && sessions <= 1 && auto_slots) return 4096;
     return free_gib >= 7.5 ? 2048 : free_gib >= 5.5 ? 1024 : 512;
+}
+
+/// SER's Kmin per main layer, from STRATA_Q36_SER_TABLE's text: one "layer Kmin" line per layer, blank lines and whatever follows
+/// a '#' ignored.  kmin gets n_layers entries: a layer the table does not name takes ser_kmin (--ser's).  Returns false with
+/// err set (the line's number in it) when a line is not two integers, a layer is not in 0 .. n_layers - 1, a Kmin is not in
+/// 1 .. 8, or a layer is named twice.
+inline bool parse_ser_table(const std::string& text, int n_layers, int ser_kmin, std::vector<int>* kmin, std::string* err) {
+    kmin->assign((std::size_t) n_layers, ser_kmin);
+    std::vector<bool> named((std::size_t) n_layers, false);
+    std::istringstream in(text);
+    std::string line;
+    for (int no = 1; std::getline(in, line); ++no) {
+        const std::size_t hash = line.find('#');
+        if (hash != std::string::npos) line.erase(hash);
+        if (line.find_first_not_of(" \t\r") == std::string::npos) continue;
+        std::istringstream fields(line);
+        long long layer = 0, k = 0;
+        std::string extra;
+        if (!(fields >> layer >> k) || (fields >> extra)) {
+            *err = "line " + std::to_string(no) + ": expected two integers, the layer and its Kmin";
+            return false;
+        }
+        if (layer < 0 || layer >= n_layers) {
+            *err = "line " + std::to_string(no) + ": layer " + std::to_string(layer) + " is not in 0 .. " + std::to_string(n_layers - 1);
+            return false;
+        }
+        if (k < 1 || k > 8) {
+            *err = "line " + std::to_string(no) + ": Kmin " + std::to_string(k) + " is not in 1 .. 8";
+            return false;
+        }
+        if (named[(std::size_t) layer]) {
+            *err = "line " + std::to_string(no) + ": layer " + std::to_string(layer) + " is named twice";
+            return false;
+        }
+        named[(std::size_t) layer] = true;
+        (*kmin)[(std::size_t) layer] = (int) k;
+    }
+    return true;
 }
 
 }  // namespace strata::q36

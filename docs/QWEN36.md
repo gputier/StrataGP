@@ -208,8 +208,9 @@ Refusals at start (exit code 2, messages prefixed by `strata-q36:`):
 - `--cache-prior` with two or more sessions (`--batch` 2 or more): it "needs one session".
 - `--cache-prior` with MTP drafts (`--mtp N`, N above 0) on a model with an MTP block: "cannot be combined".
 - `--cache-prior` when every expert fits in VRAM: it "needs the hybrid expert mode".
-- `--cache-prior`, or `--ser` with Kmin below the 8 picks of the model: it "needs the fast routing path". That path is taken when `STRATA_Q36_OLD_KERNELS` is unset, the model has 256 experts and 8 picks. With `--ser 8,t`, the option is not refused.
+- `--cache-prior`, `--ser` with Kmin below the 8 picks of the model, or `STRATA_Q36_SER_TABLE`: "need the fast routing path". That path is taken when `STRATA_Q36_OLD_KERNELS` is unset, the model has 256 experts and 8 picks. With `--ser 8,t`, the option is not refused.
 - `--ser` not given as `Kmin,t` with 1 <= Kmin <= 8 and 0 <= t <= 1: "--ser must be Kmin,t".
+- `STRATA_Q36_SER_TABLE` (a file, read once the layer count is known): a line "layer Kmin" per layer, decimal integers, blank lines and whatever follows a `#` ignored. A layer must be in 0 to n_layers-1 and Kmin in 1 to 8, and no layer may be named twice. A layer the table does not name keeps `--ser`'s Kmin (8 without `--ser`). `t` is `--ser`'s for every layer, so without `--ser` (t = 0) a table prunes only picks of probability 0. The MTP block keeps `--ser`'s Kmin. A file that cannot be read or a line that fails a check stops the start with exit code 2 and the line's number. Measured gain: none yet; the layers are to be chosen with `tools/qwen35/ser_layer_map.ps1` (see docs/ORNITH_122B.md, "Per-layer SER table").
 - `--cache-prior` outside [0, 1]: "--cache-prior must be in [0, 1]".
 
 Environment variables. The q36 engine reads 19 of its own: 18 `STRATA_Q36_*` and `STRATA_DMA_BATCH`. It also reads `STRATA_BATCH_MTP`, `STRATA_MMQ_KQ` and `STRATA_Q8_PACKED`, which other engines share (on Windows it sets the last two to 1 when unset). Unset means the default shown.

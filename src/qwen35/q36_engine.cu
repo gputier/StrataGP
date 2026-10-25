@@ -66,6 +66,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -73,6 +74,7 @@
 #include <mutex>
 #include <random>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -2168,6 +2170,8 @@ struct Engine {
     int32_t* delta_count = nullptr;
     int ser_kmin = 8;           // the picks of rank >= ser_kmin are kept only above ser_t * the top probability
     float ser_t = 0.0f;
+    // each main layer's Kmin (STRATA_Q36_SER_TABLE, else ser_kmin); the MTP block past them takes ser_kmin
+    std::vector<int> ser_kmin_layer;
     bool verify_k = std::getenv("STRATA_Q36_VERIFY") != nullptr;
     // the verify scratch (vbuf), in floats: the start refuses a model whose matrices would not fit it
     static constexpr size_t kVerifyFloats = (size_t) 8 * 16384;
@@ -2404,16 +2408,17 @@ struct Engine {
         const int Kp = (int) m->top_k;
         grouped_by_route = false;
         if (!fast_route() || T > 8) return false;
-        const bool opt = cache_prior > 0.0f || ser_kmin < Kp;
+        const int kmin = li < ser_kmin_layer.size() ? ser_kmin_layer[li] : ser_kmin;
+        const bool opt = cache_prior > 0.0f || kmin < Kp;
         if (slot_of) {
             const auto kern = opt ? q36k::k_route_group<true, true> : q36k::k_route_group<true, false>;
             kern<<<1, dim3(32, 8), 0, st>>>(logits_r, ids, ewts, T, ld, slot_of, L.blobs, L.stride, grp_ptr, grp_start, n_groups,
-                                            ent_dst, ent_tok, cache_prior, ser_kmin, ser_t, delta_mean ? delta_mean + li : nullptr,
+                                            ent_dst, ent_tok, cache_prior, kmin, ser_t, delta_mean ? delta_mean + li : nullptr,
                                             delta_count ? delta_count + li : nullptr);
         } else {
             const auto kern = opt ? q36k::k_route_group<false, true> : q36k::k_route_group<false, false>;
             kern<<<1, dim3(32, 8), 0, st>>>(logits_r, ids, ewts, T, ld, nullptr, L.blobs, L.stride, grp_ptr, grp_start, n_groups,
-                                            ent_dst, ent_tok, cache_prior, ser_kmin, ser_t, nullptr, nullptr);
+                                            ent_dst, ent_tok, cache_prior, kmin, ser_t, nullptr, nullptr);
         }
         grouped_by_route = true;
         if (verify_k && !opt) {
@@ -5141,6 +5146,23 @@ int strata::qwen35::run(int argc, char** argv) {
         }
         E.verify_alloc();
     }
+    // STRATA_Q36_SER_TABLE: each main layer's Kmin, read now that the layer count is known (parse_ser_table, q36_rules.hpp)
+    const char* ser_table_path = std::getenv("STRATA_Q36_SER_TABLE");
+    std::vector<int> ser_kmin_layer((size_t) m.layers.size(), ser_kmin);
+    if (ser_table_path) {
+        std::ifstream f(ser_table_path);
+        if (!f) {
+            std::fprintf(stderr, "strata-q36: STRATA_Q36_SER_TABLE: cannot read %s\n", ser_table_path);
+            return 2;
+        }
+        std::stringstream text;
+        text << f.rdbuf();
+        std::string err;
+        if (!strata::q36::parse_ser_table(text.str(), (int) m.layers.size(), ser_kmin, &ser_kmin_layer, &err)) {
+            std::fprintf(stderr, "strata-q36: STRATA_Q36_SER_TABLE %s: %s\n", ser_table_path, err.c_str());
+            return 2;
+        }
+    }
     // the routing options that cannot hold their state or cannot apply are refused here, before anything runs
     if (cache_prior > 0.0f && E.n_sess > 1) {
         std::fprintf(stderr, "strata-q36: --cache-prior needs one session (--batch %d decodes %d at once): its Delta_avg state "
@@ -5157,9 +5179,9 @@ int strata::qwen35::run(int argc, char** argv) {
                      "expert resident there is no slot miss to bias\n");
         return 2;
     }
-    if ((cache_prior > 0.0f || ser_kmin < (int) m.top_k) && !E.fast_route()) {
-        std::fprintf(stderr, "strata-q36: --cache-prior and --ser need the fast routing path (STRATA_Q36_OLD_KERNELS unset, 256 "
-                     "experts, 8 picks); this model or setting is not on it\n");
+    if ((cache_prior > 0.0f || ser_kmin < (int) m.top_k || ser_table_path) && !E.fast_route()) {
+        std::fprintf(stderr, "strata-q36: --cache-prior, --ser and STRATA_Q36_SER_TABLE need the fast routing path (STRATA_Q36_OLD_KERNELS "
+                     "unset, 256 experts, 8 picks); this model or setting is not on it\n");
         return 2;
     }
     struct Report {
@@ -5182,9 +5204,16 @@ int strata::qwen35::run(int argc, char** argv) {
     E.cache_prior = cache_prior;
     E.ser_kmin = ser_kmin;
     E.ser_t = ser_t;
-    if (cache_prior > 0.0f || ser_kmin < (int) m.top_k)
+    E.ser_kmin_layer = ser_kmin_layer;
+    if (cache_prior > 0.0f || ser_kmin < (int) m.top_k || ser_table_path)
         std::fprintf(stderr, "strata-q36: routing options on: cache prior %g, SER Kmin %d t %g (decode and verify windows of up to 8 rows)\n",
                      (double) cache_prior, ser_kmin, (double) ser_t);
+    if (ser_table_path) {
+        int below = 0;
+        for (int k : ser_kmin_layer) below += k < (int) m.top_k;
+        std::fprintf(stderr, "strata-q36: SER table %s: %d of %zu main layers at a Kmin below %d\n", ser_table_path, below,
+                     ser_kmin_layer.size(), (int) m.top_k);
+    }
     E.reset();
     E.mtp_d = m.has_mtp ? mtp_d : 0;
     if (draft_vocab < 0 && std::getenv("STRATA_Q36_DRAFT_VOCAB") != nullptr) draft_vocab = std::atoi(std::getenv("STRATA_Q36_DRAFT_VOCAB"));
