@@ -500,7 +500,7 @@ def slow_by_stage(launches: list) -> list:
             out.append(f"{l.name}: no attribution: {why}")
             continue
         med = l.median_step()
-        if med is None:   # a one-token answer: its line lists no decode step, so there is no median to compare with
+        if med is None:   # the line lists no decode step (a one-token answer, or steps past the listed ones only): no median
             out.append(f"{l.name}: no attribution: no decode step listed")
             continue
         slow = l.slow_steps()

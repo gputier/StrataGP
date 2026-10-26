@@ -5061,27 +5061,28 @@ int strata::qwen35::run(int argc, char** argv) {
                                                                : (double) experts <= expert_vram * (double) (1ull << 30));
         chunk = fits ? 512 : 2048;
         const double GiB = (double) (1ull << 30);
+        // the sessions' K / V caches past the 8192 cells the measured buffers held, 50 KB per cell and session
+        const int ns = std::max(1, batch);
+        size_t n_attn = m.has_mtp ? 1 : 0;
+        for (const Layer& L : m.layers) n_attn += L.attn ? 1 : 0;
+        const size_t kv_cell = kv_cell_bytes_for(kv_q4, m.g.head_dim);
+        const double kv_one = (double) (n_attn * 2 * (size_t) m.g.n_head_kv * kv_cell);   // 45056 on Qwen3.6-35B (11 planes)
+        // per cell: the fp16 copies the prompt attention keeps.  5120 B is what was measured on Qwen3.6-35B-A3B; the formula
+        // 2 (K, V) x n_head_kv x head_dim x 2 B gives 2048 there, so the constant stays: in fp32 k16 / v16 grow with the
+        // context and it counts them; in q4 they hold one kKvWindow window, so that part drops
+        const double kv_f16_cell = 4.0 * (double) m.g.n_head_kv * (double) m.g.head_dim;
+        const double kv_shared = kv_q4 ? 5120.0 - kv_f16_cell : 5120.0;
+        const double sess_extra = std::max(0.0, (double) ctx * (kv_one * ns + kv_shared) - 8192.0 * (kv_one + kv_shared));
         if (fits && expert_vram < 0) {
             // a bigger prompt chunk feeds the MMQ expert kernels more rows per expert (R9700, UD-Q4_K_XL, pp4096: 512 3390, 1024
             // 4495, 2048 5353, 4096 5750 tok/s): the largest that fits beside the experts.  Its buffers grow by about 0.5 MiB per
-            // token (measured 0.47: 1.66 GiB more at 4096 than at 512), the sessions' K / V caches by 50 KB per cell and session.
+            // token (measured 0.47: 1.66 GiB more at 4096 than at 512), the sessions' K / V caches by sess_extra.
             // With several slots a long prompt would hold the other slots' windows for a whole chunk: 1024 at most there.
             // (measured on a 32 GB R9700 at 8192 cells, 512 chunk: 1.77 GiB of buffers + K / V; the free room after init must still hold
             // every expert and the 0.77 GiB reserve, or place_experts gives the packed decode copies back - slower decode - or goes hybrid)
-            const int ns = std::max(1, batch);
-            size_t n_attn = m.has_mtp ? 1 : 0;
-            for (const Layer& L : m.layers) n_attn += L.attn ? 1 : 0;
-            const size_t kv_cell = kv_cell_bytes_for(kv_q4, m.g.head_dim);
-            const double kv_one = (double) (n_attn * 2 * (size_t) m.g.n_head_kv * kv_cell);   // 45056 on Qwen3.6-35B (11 planes)
-            // per cell: the fp16 copies the prompt attention keeps.  5120 B is what was measured on Qwen3.6-35B-A3B; the formula
-            // 2 (K, V) x n_head_kv x head_dim x 2 B gives 2048 there, so the constant stays: in fp32 k16 / v16 grow with the
-            // context and it counts them; in q4 they hold one kKvWindow window, so that part drops
-            const double kv_f16_cell = 4.0 * (double) m.g.n_head_kv * (double) m.g.head_dim;
-            const double kv_shared = kv_q4 ? 5120.0 - kv_f16_cell : 5120.0;
-            const double sess_extra = std::max(0.0, (double) ctx * (kv_one * ns + kv_shared) - 8192.0 * (kv_one + kv_shared));
             const int cap = ns > 1 ? 1024 : 4096;
             for (int c : {4096, 2048, 1024})
-                if (c <= cap && (double) experts + 2.75 * GiB + (double) (c - 512) * 0.5 * 1048576.0 + sess_extra <= (double) fr_raw) {   // (no give-back of the packed decode copies for a bigger chunk)
+                if (c <= cap && strata::q36::forced_chunk_need(c, (double) experts + sess_extra) <= (double) fr_raw) {   // (no give-back of the packed decode copies for a bigger chunk)
                     chunk = c;
                     break;
                 }
@@ -5094,10 +5095,10 @@ int strata::qwen35::run(int argc, char** argv) {
         if (const char* cv = std::getenv("STRATA_Q36_CHUNK")) {
             // force a chunk (512: the old default), up to 8192 for the #104 measurement.  Above the auto cap of 4096, the room
             // the auto rule asks beside the buffers (2.75 GiB + 0.5 MiB per token over 512) must be free; when every expert fits,
-            // they keep their room too, measured as the auto rule does (before the packed copies count as given back)
+            // they and the sessions' K / V keep their room too, measured as the auto rule does (before the packed copies count as given back)
             chunk = std::max(256, std::min(8192, std::atoi(cv)));
-            const bool all_in = fits && expert_vram < 0;
-            const double need = strata::q36::forced_chunk_need(chunk, all_in ? (double) experts : 0.0);
+            const bool all_in = fits;   // every expert in VRAM, in the free room or in --expert-vram's budget
+            const double need = strata::q36::forced_chunk_need(chunk, all_in ? (double) experts + sess_extra : 0.0);
             const double room = all_in ? (double) fr_raw : (double) fr;
             if (chunk > 4096 && room < need) {
                 std::fprintf(stderr, "strata-q36: STRATA_Q36_CHUNK %d needs %.2f GiB of VRAM beside the engine%s, %.2f GiB free%s: "

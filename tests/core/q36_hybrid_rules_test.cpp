@@ -111,6 +111,8 @@ int main() {
         check(forced_chunk_need(4608, 0.0) == 4.75 * GiB, "4608 in hybrid mode: 2.75 GiB + 2 GiB");
         check(forced_chunk_need(8192, 18.0 * GiB) == 24.5 * GiB, "8192 with 18 GiB of experts all in VRAM: they keep their room");
         check(forced_chunk_need(8192, 18.0 * GiB) > 22.0 * GiB, "so 22 GiB free refuses 8192 when every expert must fit");
+        check(forced_chunk_need(8192, 18.0 * GiB + 1.5 * GiB) == 26.0 * GiB, "the sessions' K / V past 8192 cells keep their room too");
+        check(forced_chunk_need(4096, 0.0) == 4.5 * GiB, "4096, the auto cap: 2.75 GiB + 1.75 GiB");
     }
     std::printf("parse_ser_table:\n");
     {

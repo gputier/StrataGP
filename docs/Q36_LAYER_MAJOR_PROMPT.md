@@ -249,7 +249,7 @@ to measure.
    `--dump-full-logits` on the six parity prompts and on a long prompt at `--chunk 256`, `--chunk 2048` and `--chunk 4096`;
    then the decode at short context and after the 34K prompt with automatic slots, 3 alternated launches.
 3. Done, 25 October 2026 (issue #104): 4096 is the hybrid default with one session, from 20 GiB free
-   (`hybrid_prompt_chunk`, `src/qwen35/q36_rules.hpp:36`). The measurements and the identity dumps are in
+   (`hybrid_prompt_chunk`, `src/qwen35/q36_rules.hpp:42`). The measurements and the identity dumps are in
    docs/ORNITH_122B.md, "Prompt chunk size, issue #104". Step 2 is NOT done: the default shipped without it, so the
    sized buffers still take the slots' room (62 slots do not fit beside the 4096 chunk when the slots are given by hand).
 4. Opt-in equal chunks (+5.8 % under model A) and an opt-in run-by-run copy for cards that stay copy-bound (chunk 2048 or
