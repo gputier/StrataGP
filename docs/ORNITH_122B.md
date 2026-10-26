@@ -114,13 +114,26 @@ before any page is touched. If the registration does not cover the whole arena, 
 - `STRATA_Q36_STATS=1` prints the backing actually used: large pages, 4 KB pages pinned by registration, or the
   `cudaHostAlloc` fallback.
 - Prerequisite on Windows: the account that runs the engine needs `SeLockMemoryPrivilege`. The Ornith box's account did not
-  have it on 25 October 2026 (`whoami /priv`).
+  have it on 25 October 2026 (`whoami /priv`). It has had it since 26 October 2026, as `whoami /priv` shows in a new ssh
+  session, without restarting the machine.
 - Measured on 26 October 2026, rev12 against rev13 (fixed slots, `--cpu-threads 6`, rebalance every 8, p00 to p05): the
   stats line reads `stats: the expert arena (48.07 GiB) is 4 KB pages pinned by CUDA registration (... large pages refused
   ... VirtualAlloc error 1314; using 4 KB pages)`. Error 1314 is `ERROR_PRIVILEGE_NOT_HELD`, so the privilege was still missing.
   The full logits are byte-identical between rev12 and rev13 on six of six prompts.
-- Not measured. The throughput with large pages against `STRATA_NO_LARGEPAGES=1` is still open. It is to be measured on the
-  Ornith box with `tools/ornith/measure_partition.ps1`, three alternated rounds.
+- Measured on 26 October 2026, rev15 (commit `0715a998`, `--max-context 409600`, `--mtp 1`), in a series of 12 passes with one
+  cold start each: 300 tokens after 256 of warm-up, three alternated rounds. L is the default, with large pages; N is
+  `STRATA_NO_LARGEPAGES=1`. All 12 passes exited with code 0. The stats line reads `large pages pinned by CUDA registration`
+  for L and `4 KB pages pinned by CUDA registration` for N.
+  - Short prompt: L 52.4 tokens/s median (52.2, 52.4, 52.8), N 51.8 (51.8, 51.7, 52.2), so +1.2 %.
+  - After a 34K-token prompt: L 34.4 tokens/s median (34.3, 34.4, 34.6), N 33.9 (33.8, 33.9, 34.4), so +1.5 %.
+  - L is ahead of N in all six pairs.
+  - CPU pool read rate on the line phases: 55.50 GB/s for L against 54.54 for N (short), 55.72 against 54.50 (long). Median
+    pool time at the long prompt: 4969 ms against 5079 ms.
+  - Accepted MTP drafts are identical: 117 of 182 short, 115 of 184 long. Both backings run the same computation.
+  - The gain is 1 to 2 %, smaller than the gap between two sessions (rev14 gave 53.1 to 53.4 tokens/s on the short prompt
+    in the morning), so it is valid only within this alternated series.
+  - Limit: the Ornith service runs the installed engine `E:\ornith\build` (origin/main fe794ac7), which has no large-page
+    arena. The service gets the gain only after this branch is deployed.
 
 ### Identity bisection (21 October)
 
@@ -407,7 +420,7 @@ Estimated gains come from calculations in the sources, not from measurements on 
 6. Speculative decoding without MTP, issue #78 (AcceptMoE, Specter). Deferred. The gain depends on the union of experts across a verification window, where a two-token window touched 0.85 to 0.89 of the slots that two separate tokens would use. The published gains do not transfer without that measurement.
 7. Attention per head, issue #81. No gain estimated. The durations of 25 October (see the section above) put the slope at 10 to 11 µs per thousand tokens of context per call, which gives about 18.8 ms of attention per token at 128K (calculated). The cache re-read per head remains a hypothesis: it needs read counters, which Nsight Compute cannot give on this box. No kernel change has been made.
 8. PCIe share, issue #80. Under the 24 GB cap, the automatic share settled at 0.45, and the fixed optimum was 0.50 to 0.55 (22 October). Without the cap, measured on 24 October, the default share of 0.15 gives 41.40 tokens/s. Fixed 0.50 and 0.55 give 35.80 and 35.75 tokens/s, about 5.6 tokens/s less, and the automatic step gives 35.10, about 6.3 tokens/s less. A larger share raises the host time outside the pool from 1.4 to 8.5 ms per token. The optimum found under the cap does not carry over. The automatic step is off unless `--pcie-frac auto` is given; since 25 October the PCIe path itself is off by default (see "New defaults").
-9. CPU pool, issue #79. The recommended path works without large pages, which need a privilege the box does not grant. First measurement: busy time against wall time per thread.
+9. CPU pool, issue #79. The recommended path works without large pages, which need a privilege the box did not grant before 26 October 2026. First measurement: busy time against wall time per thread.
 10. Expert pruning (REAP), issue #75. Not measured on Ornith. The published figure is 95.8 % kept on BoolQ alone at 20 % pruning, on another model. First measurement: KL on the ten prompts.
 11. KV precision, issue #72. Accepted by the owner on 23 October 2026: KL 0.079 on the short prompts against the 0.061 bar, with `--kv q4`. The measurements are in the Ornith section of QWEN36.md.
 12. YaRN gate, issue #73. A 99 % top-1 target cannot be reached even by llama.cpp (91.6 %). The owner must choose a criterion.
