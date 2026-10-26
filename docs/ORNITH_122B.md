@@ -297,6 +297,25 @@ Parity: six greedy prompts in fixed slots, 128 tokens each, give identical conte
 
 Reading (an interpretation of the figures above, not a separate measurement): without the cap, a larger PCIe share is slower. The default 0.15 beats 0.50 and 0.55 by about 5.6 tokens/s, because the host time outside the pool rises from 1.4 to 8.5 ms per token. The fixed optimum of 0.50 to 0.55 found on 22 October was measured under the 24 GB cap and does not carry over. Rebalancing every 8 steps is the only setting that beats the default, and only by 3.5 % over two launches.
 
+On 26 October 2026 (13:16 to 13:27, test PC RTX 5090, 128 GB RAM), the same uncapped setup was measured with build rev15 (commit `0715a998`), `--max-context 409600`, `--kv q4`, `--mtp 1`, `STRATA_Q36_STATS=1`, large pages for the arena, and one cold launch per pass. Each launch is one 300-token request after 256 warm-up tokens. The short launches (`v21-lp-L-short-{1,2,3}`) send a prompt of 45 to 46 tokens; the long ones (`v21-lp-L-long-{1,2,3}`) send one of 34,257 tokens. The runner VMs (140, 141, 142) were off for the whole series, and free memory fell to 8.35 GiB at its lowest. The figures are from `tools/ornith/partition_summary.py`, which read all six launches without refusing one.
+
+| Launch | Tokens/s | Pool ms per token | Wait ms per token | Host outside pool, ms per token | Slow tokens above p95 (pool / wait / host / PCIe) |
+|---|---|---|---|---|---|
+| short-1 | 52.20 | 12.80 | 4.24 | 2.11 | 14 (13 / 1 / 0 / 0) |
+| short-2 | 52.40 | 12.76 | 4.25 | 2.07 | 14 (14 / 0 / 0 / 0) |
+| short-3 | 52.80 | 12.63 | 4.26 | 2.05 | 13 (13 / 0 / 0 / 0) |
+| long-1 | 34.30 | 16.63 | 10.42 | 2.09 | 14 (14 / 0 / 0 / 0) |
+| long-2 | 34.40 | 16.56 | 10.41 | 2.13 | 14 (14 / 0 / 0 / 0) |
+| long-3 | 34.60 | 16.39 | 10.42 | 2.13 | 13 (13 / 0 / 0 / 0) |
+
+The medians are 52.40 tokens/s for the short launches and 34.40 for the long ones. Per token, the CPU pool takes 12.76 ms short and 16.56 ms long, the wait on the GPU 4.25 ms and 10.42 ms, and the host outside the pool 2.07 ms and 2.13 ms. Of the 41 slow tokens of the short launches, 40 were attributed to the pool and 1 to the wait on the GPU. All 41 of the long launches were attributed to the pool. None was attributed to the host or to PCIe. In the slow steps, the pool took 72 to 74 % of the time short and 64 % long, and the wait 18 % short and 29 to 30 % long. The pool's share of the excess over the median step was 92 to 97 % short and 95 to 99 % long.
+
+The PCIe figure is n/a in these launches, not zero by measurement. The path is off by default (`PCIe share 0.00`, 0.0 MB per token over PCIe), so the engine prints no wire window line. The script's PCIe per-step figure divides by the token count (`tools/ornith/partition_summary.py:308`), which equals the step count only with `--mtp 0`. No PCIe copies were recorded here, so this changes no figure in this paragraph.
+
+With `--mtp 1`, one decode step gives one or two tokens. The short launches ran 182 steps for 300 tokens, and the long ones 184, about 1.6 tokens per step. The per-token partition above is each counter of the request divided by its 300 tokens, as the script's header states (`tools/ornith/partition_summary.py:1-44`). Per step, the median is 21.6 to 21.9 ms in the pool, 7.0 ms in the wait and 3.2 to 3.3 ms on the host short, and 26.2 to 26.6 ms, 17.7 ms and 3.3 ms long. Each slow token is matched to the decode step that produced it: the gap before a step's first token is that step's time.
+
+Against the 25 October series above (PCIe share 0.55, `--mtp 0`, 43.6 tokens/s, 13 slow tokens: 11 in the pool and 2 in PCIe), the 26 October launches make 81 of their 82 slow tokens in the pool and one in the wait, with the PCIe path off. Reading (an interpretation, not a separate measurement): the CPU pool is what makes a token slow at both short and long context. Long context adds the GPU wait, 10.4 ms per token against 4.3 ms, and it takes a larger share of the slow steps' time, but it makes no slow token by itself.
+
 ### New defaults (owner decision, 25 October 2026)
 
 Two defaults changed from these measurements, taken on the same test PC (RTX 5090, 128 GB RAM, Ryzen 9 9950X3D), decode, one 300-token prompt, three launches per setting, alternated. The table is the decision series: measured on 25 October, before this branch's code existed, with the settings passed by option and environment variable.
