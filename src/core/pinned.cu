@@ -393,13 +393,14 @@ std::vector<uint64_t> uniform_bounds(uint64_t bytes, uint64_t slice) {
 }
 }  // namespace
 
-PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, uniform_bounds(bytes, slice)) {
+PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice, bool lock_on_register_failure)
+    : PinnedArena(bytes, uniform_bounds(bytes, slice), 0, {}, 0, lock_on_register_failure) {
     if (slice_bytes) slice_bytes = slice;   // sliced registration: record the uniform size
 }
 
 PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
                          uint64_t max_pinned_bytes, const std::string& shared_file,
-                         uint64_t shared_pack_hash) : capacity(bytes) {
+                         uint64_t shared_pack_hash, bool lock_on_register_failure) : capacity(bytes) {
     if (bytes == 0) return;
     base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes);
     if (base != nullptr && mapping_base == nullptr) {
@@ -460,7 +461,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
                 const char* env = std::getenv("STRATA_ARENA_LOCK");
                 if (backing == PageBacking::LargePages) {   // #779: large pages cannot be paged out: nothing to lock
                     note = "large pages are resident without a lock; " + note;
-                } else if (env == nullptr || std::string(env) != "0") {
+                } else if (lock_on_register_failure && (env == nullptr || std::string(env) != "0")) {
                     const strata::platform::LockResult lr =
                         strata::platform::lock_resident((uint8_t*) base + registered_bytes, bytes - registered_bytes);
                     locked_bytes = lr.locked_bytes;
@@ -488,6 +489,8 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
             const char* env = std::getenv("STRATA_ARENA_LOCK");
             if (backing == PageBacking::LargePages) {       // #779: large pages cannot be paged out: nothing to lock
                 note = "large pages are resident without a lock; " + note;
+            } else if (!lock_on_register_failure) {         // #118: the caller releases this arena, so it stays unlocked
+                note = "arena not locked (the caller releases it when CUDA refuses it); " + note;
             } else if (env == nullptr || std::string(env) != "0") {
                 const strata::platform::LockResult lr = strata::platform::lock_resident(base, bytes);
                 locked_bytes = lr.locked_bytes;

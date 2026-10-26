@@ -3895,7 +3895,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     bool pinned = false;
     std::string how;
     // the arena is registered as one block: STRATA_ARENA_PIN_GIB caps only a registration by slices (PinnedArena's bounds, pinned.cu)
-    E.expert_arena = std::make_unique<strata::core::PinnedArena>(host);
+    // #118: an arena CUDA refuses is released below, so it is not locked resident first
+    E.expert_arena = std::make_unique<strata::core::PinnedArena>(host, 0, false);
     const strata::core::PinnedArena& pa = *E.expert_arena;
     if (pa.valid() && pa.registered_bytes == pa.capacity) {
         arena = pa.data();

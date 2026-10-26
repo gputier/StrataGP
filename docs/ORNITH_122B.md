@@ -105,7 +105,10 @@ The expert arena, about 34 GB of expert blobs in host memory, is built by `Pinne
 `src/qwen35/q36_engine.cu`, `place_experts`). It asks for large pages first: on Windows, `VirtualAlloc(MEM_LARGE_PAGES)`,
 which needs `SeLockMemoryPrivilege`; otherwise 4 KB pages (`src/core/pinned.cu:396-476`). The arena is registered with CUDA
 before any page is touched. If the registration does not cover the whole arena, the engine releases it and falls back to
-`cudaHostAlloc`, then to malloc, as before, and prints a warning that names the refusal.
+`cudaHostAlloc`, then to malloc, as before, and prints a warning that names the refusal. Since #118 (26 October 2026),
+`place_experts` builds this arena with `lock_on_register_failure = false` (`src/qwen35/q36_engine.cu:3899`), so an arena that
+CUDA refuses is not locked resident before it is released: `src/core/pinned.cu:492` skips `lock_resident` there, and the
+destructor unlocks nothing (`locked_bytes` stays 0).
 
 - `STRATA_NO_LARGEPAGES=1` forces 4 KB pages. No new variable was added.
 - `STRATA_ARENA_PIN_GIB` does not cap this arena. It caps only a registration by slices (`PinnedArena` given `bounds`,
