@@ -104,6 +104,14 @@ int main() {
     check(hybrid_prompt_chunk(23.2, 1, false) == 2048, "23.2 GiB free, one session, slots by hand: 2048");
     check(hybrid_prompt_chunk(20.0, 1, false) == 2048, "20.0 GiB free, one session, slots by hand: 2048");
     check(hybrid_prompt_chunk(5.49, 1, false) == 512, "5.49 GiB free, slots by hand: 512");
+    std::printf("forced_chunk_need:\n");
+    {
+        const double GiB = (double) (1ull << 30);
+        check(forced_chunk_need(8192, 0.0) == 6.5 * GiB, "8192 in hybrid mode: 2.75 GiB + 3.75 GiB of buffers");
+        check(forced_chunk_need(4608, 0.0) == 4.75 * GiB, "4608 in hybrid mode: 2.75 GiB + 2 GiB");
+        check(forced_chunk_need(8192, 18.0 * GiB) == 24.5 * GiB, "8192 with 18 GiB of experts all in VRAM: they keep their room");
+        check(forced_chunk_need(8192, 18.0 * GiB) > 22.0 * GiB, "so 22 GiB free refuses 8192 when every expert must fit");
+    }
     std::printf("parse_ser_table:\n");
     {
         // 48 main layers, --ser's Kmin 7: a table line names a layer's own Kmin, the others keep 7

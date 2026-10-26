@@ -5093,12 +5093,16 @@ int strata::qwen35::run(int argc, char** argv) {
         }
         if (const char* cv = std::getenv("STRATA_Q36_CHUNK")) {
             // force a chunk (512: the old default), up to 8192 for the #104 measurement.  Above the auto cap of 4096, the room
-            // the auto rule asks beside the buffers (2.75 GiB + 0.5 MiB per token over 512, the experts left out) must be free
+            // the auto rule asks beside the buffers (2.75 GiB + 0.5 MiB per token over 512) must be free; when every expert fits,
+            // they keep their room too, measured as the auto rule does (before the packed copies count as given back)
             chunk = std::max(256, std::min(8192, std::atoi(cv)));
-            const double need = 2.75 * GiB + (double) (chunk - 512) * 0.5 * 1048576.0;
-            if (chunk > 4096 && (double) fr < need) {
-                std::fprintf(stderr, "strata-q36: STRATA_Q36_CHUNK %d needs %.2f GiB of VRAM beside the engine, %.2f GiB free "
-                             "(the packed Q8_0 copies included): use a chunk of 4096 or less\n", chunk, need / GiB, (double) fr / GiB);
+            const bool all_in = fits && expert_vram < 0;
+            const double need = strata::q36::forced_chunk_need(chunk, all_in ? (double) experts : 0.0);
+            const double room = all_in ? (double) fr_raw : (double) fr;
+            if (chunk > 4096 && room < need) {
+                std::fprintf(stderr, "strata-q36: STRATA_Q36_CHUNK %d needs %.2f GiB of VRAM beside the engine%s, %.2f GiB free%s: "
+                             "use a chunk of 4096 or less\n", chunk, need / GiB, all_in ? " (every expert included)" : "", room / GiB,
+                             all_in ? "" : " (the packed Q8_0 copies included)");
                 return 1;
             }
         }

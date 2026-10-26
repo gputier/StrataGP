@@ -351,6 +351,16 @@ class DecodeSteps(unittest.TestCase):
         launch.steps_total = len(steps)
         return launch
 
+    def test_one_token_answer_lists_no_step_and_is_not_attributed(self):
+        # one token, no gap, a "0 steps, 0 listed:" line: the steps match, but there is no median step to compare with
+        launch = self.plain([], times=[440.0])
+        launch.tok_s, launch.stats_tied = 30.0, True   # measured: a rate, its own stats line, nothing asked
+        self.assertTrue(launch.measured)
+        self.assertEqual(launch.step_of_gaps(), ([], None))
+        self.assertIsNone(launch.median_step())
+        lines = ps.slow_by_stage([launch])
+        self.assertIn("x: no attribution: no decode step listed", lines)
+
     def test_plain_decode_one_step_per_gap(self):
         # CHUNK_MS: 21 tokens, 20 gaps; the 20th gap (130 ms, the only one above the p95) ends token 20, decode step 19's
         steps = [NORMAL] * 19 + [(15.0, 7.0, 105.0, 2.6)]

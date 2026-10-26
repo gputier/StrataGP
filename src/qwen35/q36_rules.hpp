@@ -44,6 +44,13 @@ inline int hybrid_prompt_chunk(double free_gib, int sessions, bool auto_slots) {
     return free_gib >= 7.5 ? 2048 : free_gib >= 5.5 ? 1024 : 512;
 }
 
+/// STRATA_Q36_CHUNK above the auto cap of 4096 (#104): the VRAM bytes a forced chunk needs beside the engine, as the auto rule
+/// asks: 2.75 GiB + 0.5 MiB per token over 512, plus `experts` (every expert's bytes when they all fit in VRAM, 0 in hybrid
+/// mode, where the slots shrink instead).  The engine refuses to start when its free VRAM is below it.
+inline double forced_chunk_need(int chunk, double experts) {
+    return experts + 2.75 * (double) (1ull << 30) + (double) (chunk - 512) * 0.5 * 1048576.0;
+}
+
 /// SER's Kmin per main layer, from STRATA_Q36_SER_TABLE's text: one "layer Kmin" line per layer, blank lines and whatever follows
 /// a '#' ignored.  kmin gets n_layers entries: a layer the table does not name takes ser_kmin (--ser's).  Returns false with
 /// err set (the line's number in it) when a line is not two integers, a layer is not in 0 .. n_layers - 1, a Kmin is not in

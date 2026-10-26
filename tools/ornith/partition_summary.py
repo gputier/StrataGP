@@ -499,8 +499,11 @@ def slow_by_stage(launches: list) -> list:
         if of is None:
             out.append(f"{l.name}: no attribution: {why}")
             continue
-        slow = l.slow_steps()
         med = l.median_step()
+        if med is None:   # a one-token answer: its line lists no decode step, so there is no median to compare with
+            out.append(f"{l.name}: no attribution: no decode step listed")
+            continue
+        slow = l.slow_steps()
         out.append(f"{l.name}: p95 {fmt(l.itl_p95, '{:.2f}')} ms, {len(l.slow_gaps)} tokens above it, {len(slow)} matched to the "
                    f"first token of a decode step; median step: " + ", ".join(f"{n} {med.stage(n):.1f}" for n in STAGES))
         if l.steps_total != len(l.steps):
