@@ -18,9 +18,11 @@ param(
     [int]$Steps = 32,
     [int]$Vocab = 248320,
     [switch]$Baseline,                                      # also the runs with --ser alone (layer -1)
-    [string]$Common = (Join-Path $PSScriptRoot '..\ornith\ornith_server_common.ps1')
+    [string]$Common                                         # the common script; defaults to ..\ornith\ornith_server_common.ps1
 )
 $ErrorActionPreference = 'Continue'   # (a native command's stderr must not throw; the exit codes are checked)
+# $PSScriptRoot is empty in this parameter default (the script has mandatory parameters; Windows PowerShell 5.1), so the default is set here.
+if (-not $Common) { $Common = Join-Path $PSScriptRoot '..\ornith\ornith_server_common.ps1' }
 $Port = 8091; $MinFreeGiB = 100; $MaxIdleGpuMiB = 4096   # (read by Assert-PreFlight, which the common script defines)
 . $Common
 Assert-File $Exe 'strata-q36.exe'

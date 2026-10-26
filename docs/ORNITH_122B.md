@@ -110,9 +110,12 @@ before any page is touched. If the registration does not cover the whole arena, 
   `cudaHostAlloc` fallback.
 - Prerequisite on Windows: the account that runs the engine needs `SeLockMemoryPrivilege`. The Ornith box's account did not
   have it on 25 October 2026 (`whoami /priv`).
-- Not measured. Whether CUDA registers a large-page region under WDDM is open, and so is the throughput and KL against the
-  previous build. Both are to be measured on the Ornith box with `tools/ornith/measure_partition.ps1`, three alternated
-  rounds, with and without `STRATA_NO_LARGEPAGES=1`.
+- Measured on 26 October 2026, rev12 against rev13 (fixed slots, `--cpu-threads 6`, rebalance every 8, p00 to p05): the
+  stats line reads `stats: the expert arena (48.07 GiB) is 4 KB pages pinned by CUDA registration (... large pages refused
+  ... VirtualAlloc error 1314; using 4 KB pages)`. Error 1314 is `ERROR_PRIVILEGE_NOT_HELD`, so the privilege was still missing.
+  The full logits are byte-identical between rev12 and rev13 on six of six prompts.
+- Not measured. The throughput with large pages against `STRATA_NO_LARGEPAGES=1` is still open. It is to be measured on the
+  Ornith box with `tools/ornith/measure_partition.ps1`, three alternated rounds.
 
 ### Identity bisection (21 October)
 
@@ -299,6 +302,10 @@ At 1,024 tokens with `--max-context 4096`, the median falls to 98 µs. That run 
 
 The per-head re-read of the K/V cache is still a hypothesis. Testing it needs read counters. Nsight Compute cannot provide them on this box (see the operational pitfalls). No kernel change has been made.
 
+### Non-temporal prefetch on AVX-512 (#111, 26 October)
+
+Measured on 26 October 2026 (rev13, 409600, `--mtp 1`, three alternated rounds): 53.1 tokens/s with the non-temporal hint on the expert-weight prefetches, against 53.0 without. The CPU pool takes 12.65 to 12.80 ms per token with the hint, against 12.66 to 12.82 ms without. The output is identical to the byte on p00 to p05. The gap is within noise, so the variable is removed and the kernel keeps its T0 hint.
+
 ## Measured launch settings (25 October 2026)
 
 Measured on the test PC (RTX 5090, 128 GB RAM, Ryzen 9 9950X3D) with build rev12 (commit `2e29c428`), on Ornith-1.5-122B with IQ3_XXS gate and up and IQ4_XS down. Each launch is one 300-token request after 256 warm-up tokens, with `--kv q4`, run by `tools/ornith/measure_partition.ps1`. Settings go in through `-ExtraArgs` or `-ExtraEnv`. Each setting is compared with the base of its own round, over three alternated rounds.
@@ -337,13 +344,16 @@ Combination at the service's contexts, round v17 (base 44.4 to 45.2 tokens/s at 
 
 - At the default `--max-context 409600`: 53.5 to 53.6 tokens/s at short context (+19.8 %), 34.8 to 35.0 after the 34K prompt (+15.1 %). This is the setting the service can run. Its KL on p00 to p09 is 0.0513 with 300 of 320 top-1, under the bar of 0.061 (the base gives 0.0485 and 301 of 320).
 - At `--max-context 262144`: 36.0 tokens/s at short context (-19.5 % against the base) and 27.9 after the 34K prompt, the same on all three rounds. It holds 73 expert slots per layer against 67 at 409600, yet the CPU pool takes 18.4 ms per step against 12.5. The cause is tracked in issue #112.
+- Not reproduced on 26 October 2026, after the machine's restart. Twelve launches (rev13 defaults, rev13 with `--cpu-threads 0`, rev12 with `--cpu-threads 0` and cadence 4) gave 52.7 to 53.5 tokens/s, against 36.1 for rev12 at the same setting on 25 October. The placement was the same: 73 expert slots per layer in VRAM, 12.92 GiB free. The PCIe link (gen 5 x16) and the clocks show no difference. The cause is not named. The state of the machine before its restart remains the working hypothesis, without proof.
 
 Output identity and KL:
 
 - Identity, `STRATA_Q36_FIXED_SLOTS=1 --expert-slots 52 --pcie-frac 0`, one setting at a time: with `--cpu-threads 0`, with `--max-context 65536` and with `--mtp 1`, the full logits are byte-identical to the base on six of six prompts (p00 to p05). The rebalance cadence moves experts between slots and is covered by the KL below, not by this check.
 - KL on p00 to p09 (32 forced steps, bar 0.061): the base gives 0.0485 and 301 of 320 top-1, identical over three launches. The combination with rebalance every 4 gives 0.0362 and 303 of 320. It passes. This base differs from the 0.0423 in the Result table; the cause is not established.
 
-Defaults changed by the batch of 25 October 2026: without any option, the pool runs one worker per worker processor, capped at 12 (`kAutoPoolWorkersCap`, `src/qwen35/q36_threads.hpp`), and the rebalance cadence is 4 (`kRebalanceEveryDefault`, `src/qwen35/q36_rebalance.hpp`). The figures behind them are round v13 (12 workers at 48.5 tokens/s, the best fixed count measured; `--cpu-threads 0` +7.4 %, cadence 4 +3.5 %, both above) and round v17 (the combination's KL of 0.0513 above). Not measured on the new defaults yet: their throughput against `--cpu-threads 0` with cadence 4, their KL, and the worker count the test PC retains (the engine prints no load line for it today; it is read from the pool's dump, `src/kernels/cpu/pool.cpp:490`).
+Defaults changed by the batch of 25 October 2026: without any option, the pool runs one worker per worker processor, capped at 12 (`kAutoPoolWorkersCap`, `src/qwen35/q36_threads.hpp`), and the rebalance cadence is 4 (`kRebalanceEveryDefault`, `src/qwen35/q36_rebalance.hpp`). The figures behind them are round v13 (12 workers at 48.5 tokens/s, the best fixed count measured; `--cpu-threads 0` +7.4 %, cadence 4 +3.5 %, both above) and round v17 (the combination's KL of 0.0513 above). The new defaults were measured on 26 October 2026, in the next paragraph.
+
+Measured on 26 October 2026 at `--max-context 409600`, `--mtp 1`, 300 tokens, median of three rounds, at short context and after a 34K prompt. Build rev12 with `--cpu-threads 0` and rebalance every 4 gave 52.7 and 34.7 tokens/s. The rev13 defaults (12 workers) gave 53.1 and 34.9. Build rev13 with `--cpu-threads 0` (15 workers) gave 52.6 and 34.5. The KL of the rev13 defaults on p00 to p09 is 0.0513, with 300 of 320 top-1 (93.75 %). The engine's journal reads "on 13 CPU threads": the 12 workers plus the host thread (`hybrid experts` line in `src/qwen35/q36_engine.cu`).
 
 Settings that fail the bar:
 
@@ -351,7 +361,7 @@ Settings that fail the bar:
 - `--cache-prior 0.005` alone: KL 0.0540, passes. `0.01`: KL 0.0609, just under the bar.
 - `--cache-prior` combined with the rest, without MTP (the option refuses to run with `--mtp` above 0): KL 0.0625 at 0.005, which fails.
 
-Names checked in `src/`: `--cpu-threads` (`src/qwen35/q36_engine.cu:4932`), `--max-context` (`:4909`), `--mtp` (`:4920`), `--ser` (`:4945`), `--cache-prior` (`:4944`), `--expert-slots` (`:4933`), `--pcie-frac` (`:4937`), `--kv` (`:4957`), `STRATA_Q36_FIXED_SLOTS` (`:3148`), `STRATA_Q36_REBALANCE_EVERY` (`:1898`, default 4 in `src/qwen35/q36_rebalance.hpp:23`), `kAutoPoolWorkersCap` (`src/qwen35/q36_threads.hpp`, the automatic worker cap), `STRATA_Q36_STATS` (`src/qwen35/q36_stats.hpp:1`), `STRATA_IQ_PREFETCH` (`src/kernels/cpu/iq_avx512.cpp:39`, the kernel this CPU runs), `STRATA_IQ_PREFETCH_NTA` (`src/kernels/cpu/iq_avx512.cpp:45`, a measurement variable, not measured), `STRATA_Q36_SER_TABLE` (`src/qwen35/q36_engine.cu:5127`), `STRATA_POOL_SPIN_US` (`src/kernels/cpu/pool.cpp:520`), `STRATA_POOL_UMWAIT` (`src/kernels/cpu/pool.cpp:43`).
+Names checked in `src/`: `--cpu-threads` (`src/qwen35/q36_engine.cu:4932`), `--max-context` (`:4909`), `--mtp` (`:4920`), `--ser` (`:4945`), `--cache-prior` (`:4944`), `--expert-slots` (`:4933`), `--pcie-frac` (`:4937`), `--kv` (`:4957`), `STRATA_Q36_FIXED_SLOTS` (`:3148`), `STRATA_Q36_REBALANCE_EVERY` (`:1898`, default 4 in `src/qwen35/q36_rebalance.hpp:23`), `kAutoPoolWorkersCap` (`src/qwen35/q36_threads.hpp`, the automatic worker cap), `STRATA_Q36_STATS` (`src/qwen35/q36_stats.hpp:1`), `STRATA_IQ_PREFETCH` (`src/kernels/cpu/iq_avx512.cpp:39`, the kernel this CPU runs), `STRATA_Q36_SER_TABLE` (`src/qwen35/q36_engine.cu:5127`), `STRATA_POOL_SPIN_US` (`src/kernels/cpu/pool.cpp:520`), `STRATA_POOL_UMWAIT` (`src/kernels/cpu/pool.cpp:43`).
 
 ## Per-layer SER table (issue #108)
 

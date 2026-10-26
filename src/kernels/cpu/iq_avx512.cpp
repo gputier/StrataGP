@@ -39,12 +39,6 @@ const int prefetch_ahead = [] {
     const char* v = std::getenv("STRATA_IQ_PREFETCH");
     return v ? std::atoi(v) : 2048;
 }();
-// measurement variable (#111): STRATA_IQ_PREFETCH_NTA=1 asks for the non-temporal hint on those prefetches, to compare it
-// with T0 on AVX-512; off by default, and it changes no result, only where the lines are kept
-const bool prefetch_nta = [] {
-    const char* v = std::getenv("STRATA_IQ_PREFETCH_NTA");
-    return v && std::atoi(v) == 1;
-}();
 
 // lanes 0-7 -> s0, 8-15 -> s1, 16-23 -> s2, 24-31 -> s3 (int16 lanes of a maddubs result: two values each)
 inline __m512i scales4(int s0, int s1, int s2, int s3) {
@@ -212,13 +206,8 @@ inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y,
         // blocks ahead (the next row's start included) before the decode needs them
         if (prefetch_ahead > 0) {
             const uint8_t* ahead = blk + (size_t) prefetch_ahead;
-            if (prefetch_nta) {
-                _mm_prefetch((const char*) ahead, _MM_HINT_NTA);
-                _mm_prefetch((const char*) ahead + 64, _MM_HINT_NTA);
-            } else {
-                _mm_prefetch((const char*) ahead, _MM_HINT_T0);
-                _mm_prefetch((const char*) ahead + 64, _MM_HINT_T0);
-            }
+            _mm_prefetch((const char*) ahead, _MM_HINT_T0);
+            _mm_prefetch((const char*) ahead + 64, _MM_HINT_T0);
         }
         __m512i acci[NT];
         for (int t = 0; t < NT; ++t) acci[t] = _mm512_setzero_si512();
