@@ -56,8 +56,11 @@ function Invoke-Prompts([string]$Tag, [string]$Dir, [string]$Table) {
         if ($proc.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $dump)) { Log "FAILED $Tag $p exit $($proc.ExitCode)"; exit 5 }
         $cmpOut = Join-Path $Dir "$p.cmp"
         & $Cmp --ref (Join-Path $Gates "$p.llama.full") --test $dump --vocab $Vocab --steps $Steps *> $cmpOut
-        $kl = [double]::Parse((Get-Figure $cmpOut 'KL\(ref\|\|test\): mean ([\d.]+)'), $inv)
-        $agree = [double]::Parse((Get-Figure $cmpOut 'top-1 agree (\d+)'), $inv)
+        if ($LASTEXITCODE -ne 0) { Log "FAILED $Tag $p logit_cmp exit $LASTEXITCODE"; exit 6 }
+        try {
+            $kl = [double]::Parse((Get-Figure $cmpOut 'KL\(ref\|\|test\): mean ([\d.]+)'), $inv)
+            $agree = [double]::Parse((Get-Figure $cmpOut 'top-1 agree (\d+)'), $inv)
+        } catch { Log "FAILED $Tag ${p}: $($_.Exception.Message)"; exit 6 }
         $kls += $kl; $tops += $agree / $Steps
         Log "KL $Tag $p $($kl.ToString('0.000000', $inv)) $agree"
         Remove-Item -LiteralPath $dump
@@ -68,6 +71,7 @@ function Invoke-Prompts([string]$Tag, [string]$Dir, [string]$Table) {
         top1 = ($tops | Measure-Object -Average).Average
     }
 }
+if ((Test-Path -LiteralPath $csv) -and @(Get-Content -LiteralPath $csv).Count -gt 1) { Log "REFUSED: $csv already holds rows; use a new -OutDir"; exit 2 }
 if (-not (Test-Path -LiteralPath $csv)) { 'layer,kl_mean,top1' | Set-Content -LiteralPath $csv }
 $env:PATH = (Split-Path -Parent $Exe) + ';' + $env:PATH
 Log "START $(Get-Date -Format s) ser $Ser table kmin $TableKmin layers $($Layers -join ',') baseline $($Baseline.IsPresent)"

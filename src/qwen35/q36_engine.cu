@@ -2408,7 +2408,7 @@ struct Engine {
         const int Kp = (int) m->top_k;
         grouped_by_route = false;
         if (!fast_route() || T > 8) return false;
-        const int kmin = li < ser_kmin_layer.size() ? ser_kmin_layer[li] : ser_kmin;
+        const int kmin = strata::q36::layer_kmin(ser_kmin_layer, li, ser_kmin);
         const bool opt = cache_prior > 0.0f || kmin < Kp;
         if (slot_of) {
             const auto kern = opt ? q36k::k_route_group<true, true> : q36k::k_route_group<true, false>;
@@ -3894,6 +3894,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     uint8_t* arena = nullptr;
     bool pinned = false;
     std::string how;
+    // the arena is registered as one block: STRATA_ARENA_PIN_GIB caps only a registration by slices (PinnedArena's bounds, pinned.cu)
     E.expert_arena = std::make_unique<strata::core::PinnedArena>(host);
     const strata::core::PinnedArena& pa = *E.expert_arena;
     if (pa.valid() && pa.registered_bytes == pa.capacity) {

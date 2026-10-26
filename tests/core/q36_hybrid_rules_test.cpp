@@ -1,5 +1,5 @@
-// tests/core/q36_hybrid_rules_test.cpp - the pure rules of strata-q36's hybrid mode, no GPU: the SER keep rule and the
-// cache-prior bias of the routing kernel (src/qwen35/q36_rules.hpp, the functions the kernel calls), the guard that turns
+// tests/core/q36_hybrid_rules_test.cpp - the pure rules of strata-q36's hybrid mode, no GPU: the SER keep rule, the Kmin of a
+// layer and the cache-prior bias of the routing kernel (src/qwen35/q36_rules.hpp, the functions the kernel calls), the guard that turns
 // the graphs off below the verify threshold, and the placement change of a rebalance swap (q36_rebalance.hpp).
 #include "check.hpp"
 #include "q36_rebalance.hpp"
@@ -141,6 +141,22 @@ int main() {
         check(refused("-1 6\n", 48, "line 1"), "layer -1 is refused");
         check(parse_ser_table("47 8\n", 48, 8, &kmin, &err), "layer 47 of 48 is accepted");
         check(refused("2 6\n2 7\n", 48, "line 2"), "a layer named twice is refused, the error names line 2");
+    }
+    std::printf("layer_kmin:\n");
+    {
+        // 48 main layers, --ser's Kmin 7, the table names layer 5 (Kmin 6) and layer 47 (Kmin 1)
+        std::vector<int> kmin;
+        std::string err;
+        parse_ser_table("5 6\n47 1\n", 48, 7, &kmin, &err);
+        check(layer_kmin(kmin, 5, 7) == 6, "a layer the table names takes its own Kmin");
+        check(layer_kmin(kmin, 47, 7) == 1, "the last main layer takes its own Kmin, 1");
+        check(layer_kmin(kmin, 4, 7) == 7, "a layer the table does not name takes --ser's Kmin");
+        check(layer_kmin(kmin, 48, 7) == 7 && layer_kmin(kmin, 49, 7) == 7,
+              "the MTP block, past the main layers, takes --ser's Kmin whatever the table holds at 47");
+        std::vector<int> none;
+        check(parse_ser_table("", 48, 6, &none, &err) && layer_kmin(none, 0, 6) == 6 && layer_kmin(none, 48, 6) == 6,
+              "an empty table gives every layer, the MTP block too, --ser's Kmin");
+        check(layer_kmin(std::vector<int>(), 3, 5) == 5, "a layer list with no entries gives --ser's Kmin");
     }
     std::printf("%s\n", g_fail ? "FAILED" : "all passed");
     return g_fail ? 1 : 0;

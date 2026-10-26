@@ -82,4 +82,9 @@ inline bool parse_ser_table(const std::string& text, int n_layers, int ser_kmin,
     return true;
 }
 
+/// The Kmin of layer `li`: its entry of the table, or ser_kmin past the table's end (the MTP block).
+inline int layer_kmin(const std::vector<int>& kmin_layer, std::size_t li, int ser_kmin) {
+    return li < kmin_layer.size() ? kmin_layer[li] : ser_kmin;
+}
+
 }  // namespace strata::q36

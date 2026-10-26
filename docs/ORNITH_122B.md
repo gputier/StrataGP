@@ -108,6 +108,9 @@ before any page is touched. If the registration does not cover the whole arena, 
 `cudaHostAlloc`, then to malloc, as before, and prints a warning that names the refusal.
 
 - `STRATA_NO_LARGEPAGES=1` forces 4 KB pages. No new variable was added.
+- `STRATA_ARENA_PIN_GIB` does not cap this arena. It caps only a registration by slices (`PinnedArena` given `bounds`,
+  `src/core/pinned.cu:421`), and `place_experts` registers the arena in one block, so the variable has no effect on it (read in
+  the code on 26 October 2026).
 - `STRATA_Q36_STATS=1` prints the backing actually used: large pages, 4 KB pages pinned by registration, or the
   `cudaHostAlloc` fallback.
 - Prerequisite on Windows: the account that runs the engine needs `SeLockMemoryPrivilege`. The Ornith box's account did not
@@ -363,7 +366,7 @@ Settings that fail the bar:
 - `--cache-prior 0.005` alone: KL 0.0540, passes. `0.01`: KL 0.0609, just under the bar.
 - `--cache-prior` combined with the rest, without MTP (the option refuses to run with `--mtp` above 0): KL 0.0625 at 0.005, which fails.
 
-Names checked in `src/`: `--cpu-threads` (`src/qwen35/q36_engine.cu:4932`), `--max-context` (`:4909`), `--mtp` (`:4920`), `--ser` (`:4945`), `--cache-prior` (`:4944`), `--expert-slots` (`:4933`), `--pcie-frac` (`:4937`), `--kv` (`:4957`), `STRATA_Q36_FIXED_SLOTS` (`:3148`), `STRATA_Q36_REBALANCE_EVERY` (`:1898`, default 4 in `src/qwen35/q36_rebalance.hpp:23`), `kAutoPoolWorkersCap` (`src/qwen35/q36_threads.hpp`, the automatic worker cap), `STRATA_Q36_STATS` (`src/qwen35/q36_stats.hpp:1`), `STRATA_IQ_PREFETCH` (`src/kernels/cpu/iq_avx512.cpp:39`, the kernel this CPU runs), `STRATA_Q36_SER_TABLE` (`src/qwen35/q36_engine.cu:5127`), `STRATA_POOL_SPIN_US` (`src/kernels/cpu/pool.cpp:520`), `STRATA_POOL_UMWAIT` (`src/kernels/cpu/pool.cpp:43`).
+Names checked in `src/`: `--cpu-threads` (`src/qwen35/q36_engine.cu:4932`), `--max-context` (`:4909`), `--mtp` (`:4920`), `--ser` (`:4945`), `--cache-prior` (`:4944`), `--expert-slots` (`:4933`), `--pcie-frac` (`:4937`), `--kv` (`:4957`), `STRATA_Q36_FIXED_SLOTS` (`:3148`), `STRATA_Q36_REBALANCE_EVERY` (`:1898`, default 4 in `src/qwen35/q36_rebalance.hpp:23`), `kAutoPoolWorkersCap` (`src/qwen35/q36_threads.hpp`, the automatic worker cap), `STRATA_Q36_STATS` (`src/qwen35/q36_stats.hpp:1`), `STRATA_IQ_PREFETCH` (`src/kernels/cpu/iq_avx512.cpp:39`, the kernel this CPU runs), `STRATA_Q36_SER_TABLE` (`src/qwen35/q36_engine.cu:5151`), `STRATA_POOL_SPIN_US` (`src/kernels/cpu/pool.cpp:520`), `STRATA_POOL_UMWAIT` (`src/kernels/cpu/pool.cpp:43`).
 
 ## Per-layer SER table (issue #108)
 
