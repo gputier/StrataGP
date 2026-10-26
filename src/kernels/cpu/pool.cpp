@@ -30,6 +30,7 @@
 #include "pool_affinity_linux.hpp"
 #endif
 #include "pool_core_list.hpp"
+#include "pool_l3_groups.hpp"
 
 namespace strata::kernels::cpu {
 
@@ -459,6 +460,31 @@ bool pin_this_thread(int core, [[maybe_unused]] int worker = -1) {
 #endif
 }
 
+#if defined(_WIN32)
+// The L3 caches of processor group 0, one entry per cache, from RelationCache (level 3, unified or data).  Empty when
+// the OS call fails.  A cache of another group is left out (L3Group holds 64 logical processors), so a machine of more
+// than 64 of them reports what group 0 has.  One OS call, made once when the pool starts.
+std::vector<L3Group> read_l3_groups() {
+    std::vector<L3Group> groups;
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationCache, nullptr, &len);
+    if (len == 0) return groups;
+    std::vector<char> buf(len);
+    if (!GetLogicalProcessorInformationEx(RelationCache, (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) buf.data(), &len))
+        return groups;
+    const char* p = buf.data();
+    const char* end = p + len;
+    while (p < end) {
+        const auto* e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*) p;
+        if (e->Relationship == RelationCache && e->Cache.Level == 3 &&
+            (e->Cache.Type == CacheUnified || e->Cache.Type == CacheData) && e->Cache.GroupMask.Group == 0)
+            groups.push_back({(uint64_t) e->Cache.CacheSize, (uint64_t) e->Cache.GroupMask.Mask});
+        p += e->Size;
+    }
+    return groups;
+}
+#endif
+
 }  // namespace
 
 ThreadAffinity pin_current_thread(int core) {
@@ -600,6 +626,15 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
         stop_started();
         throw;
     }
+#if defined(_WIN32)
+    // One line, to tell which cores sit under the 3D V-Cache of a CCD pair; the order and the pinning are as above.
+    if (pin) {
+        const std::vector<int> pinned(topo_.worker_cores.begin(),
+                                      topo_.worker_cores.begin() + (std::min)((size_t) n_, topo_.worker_cores.size()));
+        const std::string l3 = l3_report(read_l3_groups(), pinned);
+        if (!l3.empty()) std::fprintf(stderr, "strata cpu pool: %s\n", l3.c_str());
+    }
+#endif
     {
         std::lock_guard<std::mutex> lk(diag_mu());
         g_diag_pool.store(this);
