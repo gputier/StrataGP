@@ -1669,6 +1669,11 @@ struct Engine {
             d.pool_gu_ms = pool->ms_multi_gu;
             d.pool_q_ms = pool->ms_multi_q;
             d.pool_down_ms = pool->ms_multi_down;
+            d.skim_on = strata::q36::swiglu_skim_tau() > 0.f;
+            uint64_t seen = 0, cut = 0;
+            strata::kernels::cpu::native_swiglu_skim_totals(seen, cut);
+            d.skim_seen = (long long) seen;
+            d.skim_cut = (long long) cut;
         }
 #endif
         return d;
@@ -3966,6 +3971,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         // (native_expert_ff1024_test --bench), so the default is the Flash-Next selection
         static const bool one_token = std::getenv("STRATA_Q36_ONE_TOKEN_CPU") != nullptr;
         H.fmt.one_token_512 = one_token;
+        H.fmt.skim_tau = strata::q36::swiglu_skim_tau();   // STRATA_Q36_SWIGLU_SKIM (#110): this engine's experts only
         if (H.fmt.up_off != L.L.up_off || H.fmt.down_off != L.L.down_off || H.fmt.bytes != L.L.bytes) {
             err = "the CPU and GPU expert layouts differ";
             return false;

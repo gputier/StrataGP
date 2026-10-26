@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +24,29 @@ inline bool stats_flag(const char* v) { return v != nullptr && v[0] == '1' && v[
 inline bool stats_enabled() {
     static const bool on = stats_flag(std::getenv("STRATA_Q36_STATS"));
     return on;
+}
+
+/// STRATA_Q36_SWIGLU_SKIM=<tau> (#110): the SwiGLU skim threshold of the CPU expert rows, a finite number >= 0 with nothing
+/// after it.  Unset gives 0 (off).  Any other value gives 0 as well, and `err` (when given) gets the line the engine prints
+/// for it; an accepted value leaves `err` alone.
+inline float swiglu_skim_tau_from_env(const char* v, std::string* err) {
+    if (v == nullptr) return 0.f;
+    char* end = nullptr;
+    const float t = std::strtof(v, &end);
+    if (end != v && *end == '\0' && t >= 0.f && t < HUGE_VALF) return t;
+    if (err != nullptr) *err = std::string("STRATA_Q36_SWIGLU_SKIM=") + v + " is not a finite number >= 0: the skim is off";
+    return 0.f;
+}
+
+/// STRATA_Q36_SWIGLU_SKIM, read once; a rejected value is printed once and gives 0
+inline float swiglu_skim_tau() {
+    static const float tau = [] {
+        std::string err;
+        const float t = swiglu_skim_tau_from_env(std::getenv("STRATA_Q36_SWIGLU_SKIM"), &err);
+        if (!err.empty()) std::fprintf(stderr, "strata: %s\n", err.c_str());
+        return t;
+    }();
+    return tau;
 }
 
 /// Whether a request's stats describe one session's decode: no other session decoded at its start (`alone`), and no decode
@@ -110,6 +134,9 @@ struct DecodeStats {
     long long rb_blob_bytes = 0; // bytes they copied as expert blobs (host to VRAM slots)
     long long rb_slot_bytes = 0; // bytes they uploaded as slot tables (slot_of), one per changed layer
     double rb_ms = 0;            // their host time: the decode step's stream sync before them (after_rows) and their own included
+    // the SwiGLU skim (#110, STRATA_Q36_SWIGLU_SKIM): the pool's neurons seen and cut on the paths that apply it; shown only when on
+    bool skim_on = false;
+    long long skim_seen = 0, skim_cut = 0;
 };
 
 inline DecodeStats operator-(const DecodeStats& a, const DecodeStats& b) {
@@ -132,6 +159,9 @@ inline DecodeStats operator-(const DecodeStats& a, const DecodeStats& b) {
     d.rb_blob_bytes = a.rb_blob_bytes - b.rb_blob_bytes;
     d.rb_slot_bytes = a.rb_slot_bytes - b.rb_slot_bytes;
     d.rb_ms = a.rb_ms - b.rb_ms;
+    d.skim_on = a.skim_on;
+    d.skim_seen = a.skim_seen - b.skim_seen;
+    d.skim_cut = a.skim_cut - b.skim_cut;
     return d;
 }
 
@@ -239,7 +269,13 @@ inline std::string format_decode_stats(int session, const DecodeStats& d, long l
                   d.steps ? 1e3 * d.serve_ms / (double) d.steps : 0.0, (double) d.pcie_demand / t, (double) d.pf_issued / t,
                   (double) d.pf_hits / t, d.pf_issued ? 100.0 * (double) d.pf_hits / (double) d.pf_issued : 0.0, d.rb_swaps,
                   (double) d.rb_blob_bytes / 1e6, (double) d.rb_slot_bytes / 1e3, d.rb_ms);
-    return b;
+    std::string s = b;
+    if (d.skim_on) {
+        std::snprintf(b, sizeof b, ", swiglu skim %.1f %% of %lld covered neurons",
+                      d.skim_seen ? 100.0 * (double) d.skim_cut / (double) d.skim_seen : 0.0, d.skim_seen);
+        s += b;
+    }
+    return s;
 }
 
 /// The doorbell wait of each layer, summed over the request.

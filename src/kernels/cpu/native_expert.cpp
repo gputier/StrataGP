@@ -14,6 +14,7 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -129,7 +130,37 @@ bool iq512_on() {
 }
 // SwiGLU as ggml-cpu's path applies it: one expression in this translation unit for every path that must match it
 inline float swiglu(float g, float u) { return (g / (1.f + std::exp(-g))) * u; }
+// STRATA_Q36_SWIGLU_SKIM (#110): the totals, and one call's own count, added to them once when the call ends (no atomic
+// per neuron; a call with the skim off has seen nothing and adds nothing)
+std::atomic<uint64_t> skim_seen_total{0}, skim_cut_total{0};
+struct SkimTally {
+    uint64_t seen = 0, cut = 0;
+    ~SkimTally() {
+        if (seen == 0) return;
+        skim_seen_total.fetch_add(seen, std::memory_order_relaxed);
+        skim_cut_total.fetch_add(cut, std::memory_order_relaxed);
+    }
+};
+// #110: counts the neuron, and cuts it (ff = 0) when its gate's |silu| is below tau
+inline bool skim_cut(float g, float tau, float& ff, SkimTally& t) {
+    ++t.seen;
+    if (!swiglu_skim(g, tau)) return false;
+    ff = 0.f;
+    ++t.cut;
+    return true;
+}
+// #110: one line per covered path and process, naming the path the skim runs on
+void announce_skim(std::once_flag& once, float tau, const char* path) {
+    std::call_once(once, [tau, path] {
+        std::fprintf(stderr, "strata: STRATA_Q36_SWIGLU_SKIM %g: gate/up rows on %s\n", (double) tau, path);
+    });
+}
 }  // namespace
+
+void native_swiglu_skim_totals(uint64_t& seen, uint64_t& cut) {
+    seen = skim_seen_total.load(std::memory_order_relaxed);
+    cut = skim_cut_total.load(std::memory_order_relaxed);
+}
 
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
     if (q8k_avx2(f.gu_act)) { q8k_quant_avx2(x, dst, f.n_embd); return; }
@@ -180,6 +211,8 @@ bool native_gu_ggml_order(int gu_type, bool one_token_512) {
 
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
+    SkimTally skim;   // #110: this call's count, when the skim is on
+    const float tau = f.skim_tau;
     // the multi-token kernels decode the weights once for all tokens: 2.0-2.4x ggml-cpu at three tokens, no faster
     // at one (all are bound by the codebook lookups, ~5 GB/s per core), measured by native_expert_parity.  AVX-512
     // first, then the AVX-2 one (Zen 2/3, Intel 12th-14th gen).  STRATA_NO_IQ512 drops an AVX-512 CPU to the
@@ -248,6 +281,12 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 #endif
             for (int t = 0; t < nt; ++t) ff[t][r] = swiglu(gbuf[t][r], ubuf[t][r]);
         }
+        if (tau > 0.f) {   // #110: the cut is a pass after the SwiGLU above, so the expression and its order stay as they are
+            static std::once_flag announced;
+            announce_skim(announced, tau, "the ggml-order kernel");
+            for (int r = r0; r < r1; ++r)
+                for (int t = 0; t < nt; ++t) skim_cut(gbuf[t][r], tau, ff[t][r], skim);
+        }
         return;
     }
     if (nt >= mt_min && (iq512_supported(f.gu_type) || (!cpu512 && iq256_supported(f.gu_type)))) {
@@ -289,6 +328,10 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         return;
     }
     const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
+    if (tau > 0.f) {   // #110: the neuron is cut on its gate, after the up row was read as without the skim
+        static std::once_flag announced;
+        announce_skim(announced, tau, "ggml-cpu's dot");
+    }
     for (int r = r0; r < r1; ++r) {
         const uint8_t* gr = blob + (size_t) r * f.gu_row;
         const uint8_t* ur = blob + f.up_off + (size_t) r * f.gu_row;
@@ -298,6 +341,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
             dot(n, &u, 0, ur, 0, act[t], 0, 1);
             g *= sg;
             u *= su;
+            if (tau > 0.f && skim_cut(g, tau, ff[t][r], skim)) continue;
             ff[t][r] = swiglu(g, u);
         }
     }

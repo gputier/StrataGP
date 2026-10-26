@@ -7,6 +7,7 @@
 // is one `vec_dot`, exactly what llama.cpp's CPU backend computes for the same tensor.
 #pragma once
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -46,6 +47,9 @@ struct NativeFmt {
     /// multi-token kernel instead of the AVX-512 one, and STRATA_NO_IQ4NL=1 removes the AVX-2 IQ4_NL down kernel, so
     /// neither reproduces a build without the flag; only STRATA_IQ_MT_MIN (or leaving the flag off) does.
     bool one_token_512 = false;
+    /// SwiGLU skim threshold (#110, STRATA_Q36_SWIGLU_SKIM, set by q36 only): on the paths native_gu_rows marks as applying
+    /// it, a neuron with swiglu_skim(gate, skim_tau) has ff = 0.  The up rows are still read.  0 (the default) is off.
+    float skim_tau = 0.f;
 };
 constexpr int kNvfp4Type = 40;
 constexpr int kQ2_0Type = 42;
@@ -74,5 +78,12 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 /// out[t][r] = down_r . hq[t] for rows r in [r0, r1).
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1);
+
+/// The SwiGLU skim (#110): a neuron is cut when |silu(g)| < tau, g being its gate value alone (the up row's product is
+/// not needed then).  tau <= 0 cuts nothing, and a NaN g is never cut: the comparison is false.
+inline bool swiglu_skim(float g, float tau) { return std::fabs(g / (1.f + std::exp(-g))) < tau; }
+/// STRATA_Q36_SWIGLU_SKIM's totals since the start (#110): the neurons native_gu_rows has seen on the paths that apply the
+/// skim, and the neurons it has cut.  Each call adds its own count once, when it ends.
+void native_swiglu_skim_totals(uint64_t& seen, uint64_t& cut);
 
 }  // namespace strata::kernels::cpu

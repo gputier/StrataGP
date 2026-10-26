@@ -96,7 +96,22 @@ int main() {
         check(has(line, "decode rebalances: 3 slot swaps, 2.5 MB of expert blobs, 5.0 KB of slot tables, 12.5 ms of host time"),
               "the decode cadence's rebalances: swaps, blob bytes, slot table bytes and host time");
         check(has(format_decode_stats(0, DecodeStats(), 0), "(0 tokens)"), "no token, no division by zero");
+        check(!has(line, "swiglu skim"), "the skim's part is absent from the pool line with the skim off");
+        DecodeStats k = d;
+        k.skim_on = true;
+        k.skim_seen = 400;
+        k.skim_cut = 100;
+        check(has(format_decode_stats(3, k, 100), "5.0 KB of slot tables, 12.5 ms of host time, swiglu skim 25.0 % of 400 covered neurons"),
+              "the skim on: the cut share and the neurons seen, at the end of the pool line");
         check(has(format_wait_layers(3, d), "by layer (ms): 6.0 15.0"), "the wait by layer line");
+        std::string err;
+        check(swiglu_skim_tau_from_env(nullptr, &err) == 0.f && err.empty(), "STRATA_Q36_SWIGLU_SKIM unset: off, no line");
+        check(swiglu_skim_tau_from_env("0.05", &err) == 0.05f && err.empty(), "a threshold is read as given");
+        check(swiglu_skim_tau_from_env("0", &err) == 0.f && err.empty(), "0 is accepted, and is off");
+        for (const char* bad : {"abc", "0.05x", "", "-0.1", "inf", "nan"}) {
+            err.clear();
+            check(swiglu_skim_tau_from_env(bad, &err) == 0.f && !err.empty(), "a value that is not a finite number >= 0 is refused");
+        }
     }
     {
         ExpertUnion u;
