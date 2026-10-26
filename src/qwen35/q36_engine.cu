@@ -1908,6 +1908,9 @@ struct Engine {
         std::string every_err;   // STRATA_Q36_REBALANCE_EVERY: read once, here (the rebalance cadence and the draft bound follow it)
         rebalance_every = strata::q36::rebalance_every_from_env(std::getenv("STRATA_Q36_REBALANCE_EVERY"), &every_err);
         if (!every_err.empty()) std::fprintf(stderr, "strata-q36: %s\n", every_err.c_str());
+        std::string swaps_err;   // STRATA_Q36_PROMPT_SWAPS: read once, here (the cap of the rebalance after a prompt)
+        hybrid_swaps_after_prompt = strata::q36::prompt_swaps_from_env(std::getenv("STRATA_Q36_PROMPT_SWAPS"), &swaps_err);
+        if (!swaps_err.empty()) std::fprintf(stderr, "strata-q36: %s\n", swaps_err.c_str());
         const auto& g = m->g;
         const size_t T = (size_t) tmax, N = (size_t) g.n_embd, Kp = (size_t) m->top_k, FF = (size_t) g.n_ff;
         const size_t C = (size_t) g.ssm_conv_channels;
@@ -2175,6 +2178,7 @@ struct Engine {
     int32_t* delta_count = nullptr;
     int ser_kmin = 8;           // the picks of rank >= ser_kmin are kept only above ser_t * the top probability
     float ser_t = 0.0f;
+    bool ser_pool = false;      // --ser-pool: the picks whose expert has a VRAM slot are never cut by SER (q36_rules.hpp)
     // each main layer's Kmin (STRATA_Q36_SER_TABLE, else ser_kmin); the MTP block past them takes ser_kmin
     std::vector<int> ser_kmin_layer;
     bool verify_k = std::getenv("STRATA_Q36_VERIFY") != nullptr;
@@ -2418,12 +2422,12 @@ struct Engine {
         if (slot_of) {
             const auto kern = opt ? q36k::k_route_group<true, true> : q36k::k_route_group<true, false>;
             kern<<<1, dim3(32, 8), 0, st>>>(logits_r, ids, ewts, T, ld, slot_of, L.blobs, L.stride, grp_ptr, grp_start, n_groups,
-                                            ent_dst, ent_tok, cache_prior, kmin, ser_t, delta_mean ? delta_mean + li : nullptr,
+                                            ent_dst, ent_tok, cache_prior, kmin, ser_t, ser_pool, delta_mean ? delta_mean + li : nullptr,
                                             delta_count ? delta_count + li : nullptr);
         } else {
             const auto kern = opt ? q36k::k_route_group<false, true> : q36k::k_route_group<false, false>;
             kern<<<1, dim3(32, 8), 0, st>>>(logits_r, ids, ewts, T, ld, nullptr, L.blobs, L.stride, grp_ptr, grp_start, n_groups,
-                                            ent_dst, ent_tok, cache_prior, kmin, ser_t, nullptr, nullptr);
+                                            ent_dst, ent_tok, cache_prior, kmin, ser_t, ser_pool, nullptr, nullptr);
         }
         grouped_by_route = true;
         if (verify_k && !opt) {
@@ -3580,7 +3584,7 @@ struct Engine {
         b.imgs = a.imgs;
         if (dst == cur) load_cur();
     }
-    int hybrid_swaps_after_prompt = 2048;
+    int hybrid_swaps_after_prompt = strata::q36::kPromptSwapsDefault;   // STRATA_Q36_PROMPT_SWAPS, read by init()
     /// The prompt's routing moves the slots at once; the decode windows' rebalances add up in hy_swaps (the request's log line).
     /// Its swaps, bytes and time stay out of the stats' rebalance counters, which count the decode cadence's only (issue #96).
     void rebalance_after_prompt() {
@@ -4920,6 +4924,8 @@ int strata::qwen35::run(int argc, char** argv) {
     double expert_vram = -1.0;
     float cache_prior = 0.0f, ser_t = 0.0f;   // routing options, off
     int ser_kmin = 8;
+    std::string ser_opt;                      // the SER option given: "--ser" or "--ser-pool"
+    bool ser_pool = false;
     strata::q36::PcieOption pcie;   // the PCIe share of the missed experts: off by default, --pcie-frac F or auto
     bool warm = true;
     int expert_slots = 0, batch = 0, draft_vocab = -1;
@@ -4978,16 +4984,23 @@ int strata::qwen35::run(int argc, char** argv) {
             }
         }
         else if (a == "--cache-prior") cache_prior = (float) std::atof(next().c_str());   // 0 off, else in (0, 1]
-        else if (a == "--ser") {                                                          // Kmin,t
+        else if (a == "--ser" || a == "--ser-pool") {                                     // Kmin,t; --ser-pool cuts only the picks outside the slots
             const std::string v = next();
             char* end = nullptr;
             const long k = std::strtol(v.c_str(), &end, 10);
             const bool comma = end != nullptr && *end == ',';
             ser_t = comma ? (float) std::atof(end + 1) : -1.0f;
             if (!comma || k < 1 || k > 8 || !(ser_t >= 0.0f && ser_t <= 1.0f)) {
-                std::fprintf(stderr, "strata-q36: --ser must be Kmin,t with 1 <= Kmin <= 8 and 0 <= t <= 1 (got '%s')\n", v.c_str());
+                std::fprintf(stderr, "strata-q36: %s must be Kmin,t with 1 <= Kmin <= 8 and 0 <= t <= 1 (got '%s')\n", a.c_str(), v.c_str());
                 return 2;
             }
+            if (!ser_opt.empty() && ser_opt != a) {
+                std::fprintf(stderr, "strata-q36: --ser and --ser-pool cannot be combined: --ser cuts every pick below Kmin, --ser-pool "
+                                     "only those outside the VRAM slots. Use one of them\n");
+                return 2;
+            }
+            ser_opt = a;
+            ser_pool = a == "--ser-pool";
             ser_kmin = (int) k;
         }
         else if (a == "--kv") {                                                    // fp32 (default) | q4, as setup writes it
@@ -5010,7 +5023,7 @@ int strata::qwen35::run(int argc, char** argv) {
                          "usage: strata-q36 --model GGUF [--max-context 32768] [--chunk 512] [--no-graph] [--kv fp32|q4]\n"
                          "       [--rope-scaling none|linear|yarn [--rope-scale F] [--rope-orig-ctx N]]\n"
                          "       [--expert-profile FILE] [--expert-profile-save FILE] [--pcie-frac F|auto]\n"
-                         "       [--cache-prior L] [--ser Kmin,t]\n"
+                         "       [--cache-prior L] [--ser Kmin,t | --ser-pool Kmin,t]\n"
                          "       (--serve | --tokens IDS [--n 64] [--force IDS] [--dump-full-logits F] | --bench-pp N "
                          "--bench-tg N)\n");
             return 2;
@@ -5203,7 +5216,7 @@ int strata::qwen35::run(int argc, char** argv) {
         return 2;
     }
     if ((cache_prior > 0.0f || ser_kmin < (int) m.top_k || ser_table_path) && !E.fast_route()) {
-        std::fprintf(stderr, "strata-q36: --cache-prior, --ser and STRATA_Q36_SER_TABLE need the fast routing path (STRATA_Q36_OLD_KERNELS "
+        std::fprintf(stderr, "strata-q36: --cache-prior, --ser, --ser-pool and STRATA_Q36_SER_TABLE need the fast routing path (STRATA_Q36_OLD_KERNELS "
                      "unset, 256 experts, 8 picks); this model or setting is not on it\n");
         return 2;
     }
@@ -5227,10 +5240,13 @@ int strata::qwen35::run(int argc, char** argv) {
     E.cache_prior = cache_prior;
     E.ser_kmin = ser_kmin;
     E.ser_t = ser_t;
+    E.ser_pool = ser_pool;
     E.ser_kmin_layer = ser_kmin_layer;
     if (cache_prior > 0.0f || ser_kmin < (int) m.top_k || ser_table_path)
-        std::fprintf(stderr, "strata-q36: routing options on: cache prior %g, SER Kmin %d t %g (decode and verify windows of up to 8 rows)\n",
-                     (double) cache_prior, ser_kmin, (double) ser_t);
+        std::fprintf(stderr, "strata-q36: routing options on: cache prior %g, SER Kmin %d t %g%s (decode and verify windows of up to 8 rows)\n",
+                     (double) cache_prior, ser_kmin, (double) ser_t, ser_pool ? " (--ser-pool: outside the VRAM slots only)" : "");
+    if (ser_pool && !m.hybrid && ser_kmin < (int) m.top_k)
+        std::fprintf(stderr, "strata-q36: --ser-pool without the hybrid expert mode (every expert has a slot): it acts as --ser\n");
     if (ser_table_path) {
         int below = 0;
         for (int k : ser_kmin_layer) below += k < (int) m.top_k;

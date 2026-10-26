@@ -2011,6 +2011,9 @@ if(STRATA_BUILD_TESTS)
     target_link_libraries(pool_affinity_test PRIVATE strata_kernels_cpu)
     add_test(NAME pool_affinity_test COMMAND pool_affinity_test)
   endif()
+  # STRATA_POOL_CORES: the list grammar alone (pool_core_list.hpp), no OS call, so every platform builds it
+  add_executable(pool_core_list_test src/kernels/cpu/pool_core_list_test.cpp)
+  add_test(NAME pool_core_list_test COMMAND pool_core_list_test)
   # Plan v0.3 P6: one expert applied to several tokens, bitwise vs the single-token kernel (synthetic, CPU only).
   # plan v0.3 P5: the device dequantizers vs the artifact's CPU dequantizers on the real shards (not a ctest: needs
   # the 38 GB model; run it by hand or from tools/gpu_session.py)

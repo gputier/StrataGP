@@ -339,7 +339,7 @@ __global__ void __launch_bounds__(256) k_route_group(const float* __restrict__ l
                                                      const uint8_t* blobs, unsigned long long blob,
                                                      unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups,
                                                      int32_t* ent_dst, int32_t* ent_tok, float cache_prior, int ser_kmin,
-                                                     float ser_t, float* delta_mean, int32_t* delta_count) {
+                                                     float ser_t, bool ser_pool, float* delta_mean, int32_t* delta_count) {
     constexpr int NE = 256, K = 8, V = NE / 32;
     __shared__ int sids[64], sid[64];
     __shared__ float row_delta[8];   // OPT, HY: row t's Delta_avg
@@ -425,7 +425,9 @@ __global__ void __launch_bounds__(256) k_route_group(const float* __restrict__ l
                 // the pick's probability to every lane; the top probability is 1 / sum (the max logit's exp is 1)
                 const float p = __shfl_sync(0xffffffffu, values[expert / 32], expert & 31, 32);
                 if (rank == 0) first = expert;
-                const bool keep = strata::q36::ser_keep(rank, ser_kmin, p, ser_t, reciprocal);
+                // --ser-pool: the slot table is read only with the option on (ser_pool && ... short-circuits), so the default path reads nothing more
+                const bool resident = ser_pool && HY && slot_of[expert] >= 0;
+                const bool keep = strata::q36::ser_pool_keep(rank, p, reciprocal, ser_kmin, ser_t, resident);
                 best = keep ? p : 0.0f;
                 if (!keep) out_id = first;
             }

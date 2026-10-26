@@ -8,6 +8,7 @@
 #pragma once
 
 #include <algorithm>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -22,6 +23,8 @@ inline constexpr double kRebalanceMinGain = 1.5;    // and beats the expert it r
 inline constexpr double kRebalanceDecay = 0.7;      // the counts' factor after each rebalance, in every layer
 inline constexpr int kRebalanceEveryDefault = 4;    // positions between two rebalances (STRATA_Q36_REBALANCE_EVERY unset): 4 since round v13 (25 October 2026)
 inline constexpr int kRebalanceEveryMax = 1024;     // the largest value the variable accepts
+inline constexpr int kPromptSwapsDefault = 2048;    // slot replacements after a prompt (STRATA_Q36_PROMPT_SWAPS unset)
+inline constexpr int kPromptSwapsUnlimited = INT_MAX;   // the variable's 0: no cap (choose_swaps takes any budget up to INT_MAX)
 
 /// STRATA_Q36_REBALANCE_EVERY: the positions between two rebalances, decimal digits only (no sign, no space, nothing after
 /// them) for a value from 1 to 1024; leading zeros are read as decimal ("08" is 8).  Unset gives 4.  Any other value gives 4
@@ -36,6 +39,21 @@ inline int rebalance_every_from_env(const char* v, std::string* err) {
         *err = std::string("STRATA_Q36_REBALANCE_EVERY=") + v + " is not a whole number from 1 to " +
                std::to_string(kRebalanceEveryMax) + " in decimal digits: using " + std::to_string(kRebalanceEveryDefault);
     return kRebalanceEveryDefault;
+}
+
+/// STRATA_Q36_PROMPT_SWAPS: the slot replacements of the rebalance after a prompt, decimal digits only (no sign, no space,
+/// nothing after them) for a value from 1 to INT_MAX; 0 gives no cap. Unset or empty gives 2048. Any other value gives 2048
+/// as well, and `err` (when given) gets the line the engine prints for it; an accepted value leaves `err` alone.
+inline int prompt_swaps_from_env(const char* v, std::string* err) {
+    if (v == nullptr || v[0] == '\0') return kPromptSwapsDefault;
+    char* end = nullptr;
+    const bool digit = v[0] >= '0' && v[0] <= '9';   // strtoll alone would also take a leading space or sign
+    const long long n = digit ? std::strtoll(v, &end, 10) : 0;   // a value out of the long long range comes back above INT_MAX
+    if (digit && *end == '\0' && n <= INT_MAX) return n == 0 ? kPromptSwapsUnlimited : (int) n;
+    if (err != nullptr)
+        *err = std::string("STRATA_Q36_PROMPT_SWAPS=") + v + " is not a whole number from 0 to " + std::to_string(INT_MAX) +
+               " in decimal digits (0: no cap): using " + std::to_string(kPromptSwapsDefault);
+    return kPromptSwapsDefault;
 }
 
 /// The draft depth a window at position `pos` may use: its rows are the positions pos .. pos + D, so D stops short of the next

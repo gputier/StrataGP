@@ -1,5 +1,5 @@
-// tests/core/q36_hybrid_rules_test.cpp - the pure rules of strata-q36's hybrid mode, no GPU: the SER keep rule, the Kmin of a
-// layer and the cache-prior bias of the routing kernel (src/qwen35/q36_rules.hpp, the functions the kernel calls), the guard that turns
+// tests/core/q36_hybrid_rules_test.cpp - the pure rules of strata-q36's hybrid mode, no GPU: the SER keep rule and its
+// --ser-pool variant, the Kmin of a layer and the cache-prior bias of the routing kernel (src/qwen35/q36_rules.hpp, the functions the kernel calls), the guard that turns
 // the graphs off below the verify threshold, and the placement change of a rebalance swap (q36_rebalance.hpp).
 #include "check.hpp"
 #include "q36_rebalance.hpp"
@@ -28,6 +28,18 @@ int main() {
               "ser_kmin 3 keeps ranks 0 .. 2 and applies the threshold from rank 3");
         check(ser_keep(4, 0, 0.5f, 0.25f, 0.5f) && !ser_keep(4, 0, 0.1f, 0.25f, 0.5f),
               "ser_kmin 0: no rank is kept outright, rank 4 is kept at p 0.5 and dropped at p 0.1");
+    }
+    std::printf("ser_pool_keep:\n");
+    {
+        // top probability 0.5, ser_t 0.25 (threshold 0.125), ser_kmin 3
+        check(ser_pool_keep(3, 0.0f, 0.5f, 3, 0.25f, true), "a resident pick past ser_kmin is kept under the threshold");
+        check(!ser_pool_keep(3, 0.0f, 0.5f, 3, 0.25f, false), "a pick outside the slots past ser_kmin is cut under the threshold");
+        check(ser_pool_keep(3, 0.25f, 0.5f, 3, 0.25f, false), "a pick outside the slots above the threshold is kept");
+        check(ser_pool_keep(1, 0.0f, 0.5f, 3, 0.25f, false) && ser_pool_keep(1, 0.0f, 0.5f, 3, 0.25f, true),
+              "a pick of rank below ser_kmin is kept, resident or not");
+        // without slots the rule is ser_keep's: --ser-pool acts as --ser
+        check(ser_pool_keep(4, 0.1f, 0.5f, 3, 0.25f, false) == ser_keep(4, 3, 0.1f, 0.25f, 0.5f),
+              "outside the slots the rule is ser_keep's, the same answer as --ser");
     }
     std::printf("cache_prior_bias:\n");
     {

@@ -29,6 +29,7 @@
 #include <sched.h>
 #include "pool_affinity_linux.hpp"
 #endif
+#include "pool_core_list.hpp"
 
 namespace strata::kernels::cpu {
 
@@ -82,6 +83,37 @@ HostCore host_core_setting() { return (HostCore) g_host_core.load(); }
 
 static CpuTopology detect_cpu_topology_impl(bool skip_first, PoolAffinity affinity);
 
+namespace {
+// STRATA_POOL_CORES=<list> (`8-15`, the grammar in pool_core_list.hpp): the workers take these CPU IDs in this order,
+// not the OS's.  Read once.  A list that does not parse, or names a CPU the topology does not have, is refused with one
+// line on stderr and the default order is kept.  Every physical core counts as known, whatever skip_first and the
+// affinity say, so the check does not depend on the caller.
+const std::vector<int>& explicit_pool_cores() {
+    static const std::vector<int> cores = [] {
+        std::vector<int> out;
+        const char* e = std::getenv("STRATA_POOL_CORES");
+        if (e == nullptr) return out;
+        std::string why;
+        if (!parse_core_list(e, out, &why)) {
+            std::fprintf(stderr, "strata cpu pool: STRATA_POOL_CORES '%s': %s; the default order is kept\n", e, why.c_str());
+            return std::vector<int>();
+        }
+        const std::vector<int> known = detect_cpu_topology_impl(false, PoolAffinity::All).worker_cores;
+        for (int cpu : out) {
+            if (std::find(known.begin(), known.end(), cpu) != known.end()) continue;
+            std::fprintf(stderr, "strata cpu pool: STRATA_POOL_CORES '%s': CPU %d is not in the detected topology; the default order is kept\n",
+                         e, cpu);
+            return std::vector<int>();
+        }
+        std::string list;
+        for (int cpu : out) list += (list.empty() ? "" : ",") + std::to_string(cpu);
+        std::fprintf(stderr, "strata cpu pool: STRATA_POOL_CORES applied, the workers take CPUs %s in this order\n", list.c_str());
+        return out;
+    }();
+    return cores;
+}
+}  // namespace
+
 CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
     CpuTopology topo = detect_cpu_topology_impl(skip_first, affinity);
     // --host-core last: the host takes the last core, the workers the others (the first included)
@@ -99,6 +131,10 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
                                 topo.worker_cores.end());
         topo.host_core = topo.host_sibling;
     }
+    // STRATA_POOL_CORES replaces the workers' list as written, last, so the host-core moves above do not touch it.
+    // skip_first has no effect on it: a listed first core is a worker, and the affinity does not filter the list.
+    // The host core is not taken out of it either: a host core that is listed also runs a worker.
+    if (const auto& listed = explicit_pool_cores(); !listed.empty()) topo.worker_cores = listed;
     return topo;
 }
 
