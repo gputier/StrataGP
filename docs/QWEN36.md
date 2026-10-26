@@ -123,7 +123,7 @@ speed gain is small. On a card that holds every expert (R9700 32 GB, 8K prompts)
 
 In the hybrid mode the text of a request can differ a little between running alone and running beside others: the experts that sit on the
 GPU or on the CPU change with the routing of all the requests, and the two compute with different rounding. With the slot tables fixed (`STRATA_Q36_FIXED_SLOTS=1`, a test setting) every slot equals its
-solo run there too, with and without `--batch-mtp`.
+solo run there too, with and without `--batch-mtp`. Under load the intended behavior is not a fixed text: its measured bound and the test setting are in `docs/ORNITH_122B.md`, in the server-side check for #71.
 
 ## Speed (0.1.45)
 
