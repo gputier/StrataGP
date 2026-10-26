@@ -26,8 +26,10 @@ first of the same session after the last generated line, and so is the decode st
 for K = 1 and 96 after; only the windows printed during the measured request are read (a window that straddles the warm-up's
 end is counted whole).
 The "PCIe copies ms per decode step" figure is the busy time of those windows over the decode steps of the measured request,
-taken from its stats line (the "(T tokens)" count: one step per token with --mtp 0), not over the printed windows' steps: the
-engine counts every window and prints only those with copies. It is n/a without the stats line or without a wire window.
+taken from its decode steps line (its "N steps" count, the steps it does not list included), not over the printed windows'
+steps: the engine counts every window and prints only those with copies. Without that line (an older engine) the figure
+divides by the stats line's "(T tokens)" count instead, which is the step count only with --mtp 0: the launch is then marked
+approximate. It is n/a without a wire window.
 
 chunks.tsv: one line per streamed chunk that carried text, "index<TAB>t_ms<TAB>chars", t_ms counted from the moment the
 request was sent. The inter-token time is the time between two consecutive such chunks (one chunk per token when the chunk
@@ -143,6 +145,8 @@ class Launch:
     pcie_mb: Optional[float] = None
     cpu_mb: Optional[float] = None
     pcie_busy_ms: Optional[float] = None   # copy streams' busy time per decode step (overlaps the rest; not additive)
+    pcie_approx: bool = False              # pcie_busy_ms divides by the tokens: the log has no decode steps line
+    decode_steps: Optional[int] = None     # the measured request's decode steps, the ones the line does not list included
     rb_swaps: Optional[int] = None         # the decode rebalances of the request: slot swaps (None: an older stats line)
     rb_mb: Optional[float] = None          # their expert blob copies, MB (with the slot table uploads on an older line)
     rb_slot_kb: Optional[float] = None     # their slot table uploads, KB (None: a line of before the split)
@@ -303,9 +307,20 @@ def parse_engine_log(text: str, launch: Launch) -> None:
         launch.problems.append(f"token counts differ: {gen.group(7)} generated, {launch.tokens} in the stats line: not measured")
     else:
         launch.stats_tied = True
+    for m in RE_STEPS.finditer(text, gen.end()):
+        if m.group(1) == gen.group(1):
+            launch.decode_steps = int(m.group(2))
+            steps = parse_steps(m.group(4))
+            if steps is None or len(steps) != int(m.group(3)):
+                launch.problems.append("the decode steps line is malformed: no attribution of the slow tokens")
+            else:
+                launch.steps = steps
+                launch.steps_total = int(m.group(2))
+            break
     # the copy streams' busy time over the wire windows of the measured request (after the request before it), per decode step
-    # of the request: the step count is the stats line's, because the engine counts every window and prints only those with
-    # copies (the printed windows' steps would leave the others out); one decode step is one token with --mtp 0
+    # of the request: the step count is the decode steps line's, because the engine counts every window and prints only those
+    # with copies (the printed windows' steps would leave the others out); without that line the stats line's token count
+    # stands in, which is the step count only with --mtp 0
     begin = gens[-2].end() if len(gens) >= 2 else 0
     busy_us = 0.0
     wires = 0
@@ -314,19 +329,13 @@ def parse_engine_log(text: str, launch: Launch) -> None:
             continue
         busy_us += float(m.group(6))
         wires += 1
-    if wires and launch.tokens > 0:
+    if wires and launch.decode_steps:
+        launch.pcie_busy_ms = busy_us / 1000.0 / launch.decode_steps
+    elif wires and launch.tokens > 0:
         launch.pcie_busy_ms = busy_us / 1000.0 / launch.tokens
+        launch.pcie_approx = True
     else:
-        launch.problems.append("no wire window line or no step count in the stats line: the PCIe copy time is not measured")
-    for m in RE_STEPS.finditer(text, gen.end()):
-        if m.group(1) == gen.group(1):
-            steps = parse_steps(m.group(4))
-            if steps is None or len(steps) != int(m.group(3)):
-                launch.problems.append("the decode steps line is malformed: no attribution of the slow tokens")
-            else:
-                launch.steps = steps
-                launch.steps_total = int(m.group(2))
-            break
+        launch.problems.append("no wire window line: the PCIe copy time is not measured")
 
 
 def parse_mem_log(text: str, mem: Mem) -> None:
@@ -534,6 +543,8 @@ def summary(folders: list) -> str:
             status = "measured"
         if l.problems:
             status += "; " + "; ".join(l.problems)
+        if l.pcie_approx:
+            status += "; PCIe copies per step approximate: divided by the tokens, no decode steps line"
         ms_pt = (l.pool_ms / l.tokens) if (l.pool_ms is not None and l.tokens) else None
         wait_pt = (l.wait_ms / l.tokens) if (l.wait_ms is not None and l.tokens) else None
         asked = "n/a" if l.asked is None else str(l.asked)
@@ -551,6 +562,8 @@ def summary(folders: list) -> str:
     for label, get, spec in METRICS:
         med = median_of([get(l) for l in kept])
         out.append(f"  {label:<38}{fmt(med, spec):>10}")
+    if any(l.pcie_approx for l in kept):
+        out.append("  PCIe copies per decode step is approximate in the launches marked so: no decode steps line in their logs")
     with_steps = any(l.steps is not None for l in launches)
     if with_steps:
         out.append("")

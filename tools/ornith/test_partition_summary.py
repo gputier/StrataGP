@@ -119,6 +119,21 @@ class ParseEngineLog(unittest.TestCase):
         ps.parse_engine_log(log, launch)
         self.assertAlmostEqual(launch.pcie_busy_ms, 2.4)
 
+    def test_decode_steps_line_gives_the_step_count(self):
+        # 150 decode steps for the 300 tokens (--mtp 1): 1,440,000 us over 150 steps = 9.6 ms per step, not 4.8 per token
+        launch = ps.Launch("x")
+        ps.parse_engine_log(ENGINE_LOG + steps_line([NORMAL] * 150), launch)
+        self.assertEqual(launch.decode_steps, 150)
+        self.assertAlmostEqual(launch.pcie_busy_ms, 9.6)
+        self.assertFalse(launch.pcie_approx)
+
+    def test_no_decode_steps_line_is_approximate(self):
+        launch = ps.Launch("x")
+        ps.parse_engine_log(ENGINE_LOG, launch)
+        self.assertIsNone(launch.decode_steps)
+        self.assertAlmostEqual(launch.pcie_busy_ms, 4.8)
+        self.assertTrue(launch.pcie_approx)
+
     def test_no_stats_line_gives_na_for_the_copy_time(self):
         log = "\n".join(line for line in ENGINE_LOG.splitlines() if ": stats: pool " not in line) + "\n"
         launch = ps.Launch("x")
