@@ -5085,7 +5085,17 @@ int strata::qwen35::run(int argc, char** argv) {
             const double fr_gib = (double) fr / GiB;
             chunk = strata::q36::hybrid_prompt_chunk(fr_gib, std::max(1, batch), expert_slots <= 0 && expert_vram < 0);
         }
-        if (const char* cv = std::getenv("STRATA_Q36_CHUNK")) chunk = std::max(256, std::min(4096, std::atoi(cv)));   // force a chunk (512: the old default)
+        if (const char* cv = std::getenv("STRATA_Q36_CHUNK")) {
+            // force a chunk (512: the old default), up to 8192 for the #104 measurement.  Above the auto cap of 4096, the room
+            // the auto rule asks beside the buffers (2.75 GiB + 0.5 MiB per token over 512, the experts left out) must be free
+            chunk = std::max(256, std::min(8192, std::atoi(cv)));
+            const double need = 2.75 * GiB + (double) (chunk - 512) * 0.5 * 1048576.0;
+            if (chunk > 4096 && (double) fr < need) {
+                std::fprintf(stderr, "strata-q36: STRATA_Q36_CHUNK %d needs %.2f GiB of VRAM beside the engine, %.2f GiB free "
+                             "(the packed Q8_0 copies included): use a chunk of 4096 or less\n", chunk, need / GiB, (double) fr / GiB);
+                return 1;
+            }
+        }
         if (std::getenv("STRATA_Q36_PLACE_DEBUG"))
             std::fprintf(stderr, "strata-q36: chunk rule: free %.2f GiB (raw %.2f, with %.2f packed), main experts %.2f GiB, chunk %d\n",
                          fr / 1073741824.0, fr_raw / 1073741824.0, packed / 1073741824.0, experts / 1073741824.0, chunk);
