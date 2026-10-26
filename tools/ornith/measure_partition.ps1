@@ -319,7 +319,7 @@ for ($n = 1; $n -le $Launches; $n++) {
 
     # The server's config: the engine's arguments (Ornith's launcher options, docs/ORNITH_122B.md) and the expert profile
     # read at start. No --expert-slots, and no --pcie-frac unless -ExtraArgs gives one: the engine defaults are measured (rebalance
-    # every 8, PCIe path off); -ExtraArgs "--pcie-frac auto" measures the automatic PCIe share (PcieAuto, and the step search with
+    # every 4 since round v13, kRebalanceEveryDefault in src/qwen35/q36_rebalance.hpp; PCIe path off); -ExtraArgs "--pcie-frac auto" measures the automatic PCIe share (PcieAuto, and the step search with
     # -ExtraEnv STRATA_Q36_PCIE_AUTO_STEP=1).
     $engineArgs = @('--native', $Gguf, '--max-context', '409600', '--prefill', 'auto', '--mtp', '0',
               '--rope-scaling', 'yarn', '--rope-scale', '2', '--rope-orig-ctx', '262144', '--kv', 'q4',

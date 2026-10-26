@@ -16,11 +16,11 @@ bool refused(const char* v, int* got) {
     *got = strata::q36::rebalance_every_from_env(v, &err);
     return *got == 4 && err.find("STRATA_Q36_REBALANCE_EVERY=") == 0 && err.find("using 4") != std::string::npos;
 }
-// the same for STRATA_Q36_PROMPT_SWAPS: 2048 and its message
+// the same for STRATA_Q36_PROMPT_SWAPS: 4096 and its message
 bool swaps_refused(const char* v, int* got) {
     std::string err;
     *got = strata::q36::prompt_swaps_from_env(v, &err);
-    return *got == 2048 && err.find("STRATA_Q36_PROMPT_SWAPS=") == 0 && err.find("using 2048") != std::string::npos;
+    return *got == 4096 && err.find("STRATA_Q36_PROMPT_SWAPS=") == 0 && err.find("using 4096") != std::string::npos;
 }
 }  // namespace
 
@@ -57,27 +57,27 @@ int main() {
     std::printf("prompt_swaps_from_env:\n");
     {
         std::string err;
-        check(prompt_swaps_from_env(nullptr, &err) == 2048 && err.empty(), "unset: 2048, no message");
-        check(prompt_swaps_from_env("", &err) == 2048 && err.empty(), "empty: 2048, no message");
-        check(prompt_swaps_from_env(nullptr, nullptr) == kPromptSwapsDefault && kPromptSwapsDefault == 2048, "the default is 2048");
-        check(prompt_swaps_from_env("4096", &err) == 4096 && err.empty(), "4096 is accepted");
+        check(prompt_swaps_from_env(nullptr, &err) == 4096 && err.empty(), "unset: 4096, no message");
+        check(prompt_swaps_from_env("", &err) == 4096 && err.empty(), "empty: 4096, no message");
+        check(prompt_swaps_from_env(nullptr, nullptr) == kPromptSwapsDefault && kPromptSwapsDefault == 4096, "the default is 4096");
+        check(prompt_swaps_from_env("2048", &err) == 2048 && err.empty(), "2048 is accepted: the former default is an explicit value");
         check(prompt_swaps_from_env("1", &err) == 1 && err.empty(), "1 is accepted");
         check(prompt_swaps_from_env("0", &err) == INT_MAX && err.empty(), "0: no cap, INT_MAX");
         check(prompt_swaps_from_env("2147483647", &err) == INT_MAX && err.empty(), "INT_MAX itself is accepted");
         check(prompt_swaps_from_env("08", &err) == 8 && err.empty(), "a leading zero is read as decimal (08 is 8)");
-        check(prompt_swaps_from_env("4096", nullptr) == 4096, "no message pointer: the value is still read");
+        check(prompt_swaps_from_env("8192", nullptr) == 8192, "no message pointer: the value is still read");
         int got = 0;
-        check(swaps_refused("-1", &got) && got == 2048, "a negative value is refused: 2048 and the message");
-        check(swaps_refused("abc", &got) && got == 2048, "a value that is not a number is refused");
-        check(swaps_refused("99999999999", &got) && got == 2048, "99999999999 is refused: above INT_MAX");
-        check(swaps_refused("2147483648", &got) && got == 2048, "INT_MAX + 1 is refused");
-        check(swaps_refused("99999999999999999999", &got) && got == 2048, "a value out of the long long range is refused");
-        check(swaps_refused("12x", &got) && got == 2048, "trailing text after the number is refused");
-        check(swaps_refused("+8", &got) && got == 2048, "a leading plus sign is refused");
-        check(swaps_refused(" 8", &got) && got == 2048, "a leading space is refused");
-        check(swaps_refused("3.5", &got) && got == 2048, "a fraction is refused");
-        check(prompt_swaps_from_env("-1", nullptr) == 2048 && prompt_swaps_from_env("abc", nullptr) == 2048,
-              "a refused value with no message pointer: 2048, and nothing is written through the null pointer");
+        check(swaps_refused("-1", &got) && got == 4096, "a negative value is refused: 4096 and the message");
+        check(swaps_refused("abc", &got) && got == 4096, "a value that is not a number is refused");
+        check(swaps_refused("99999999999", &got) && got == 4096, "99999999999 is refused: above INT_MAX");
+        check(swaps_refused("2147483648", &got) && got == 4096, "INT_MAX + 1 is refused");
+        check(swaps_refused("99999999999999999999", &got) && got == 4096, "a value out of the long long range is refused");
+        check(swaps_refused("12x", &got) && got == 4096, "trailing text after the number is refused");
+        check(swaps_refused("+8", &got) && got == 4096, "a leading plus sign is refused");
+        check(swaps_refused(" 8", &got) && got == 4096, "a leading space is refused");
+        check(swaps_refused("3.5", &got) && got == 4096, "a fraction is refused");
+        check(prompt_swaps_from_env("-1", nullptr) == 4096 && prompt_swaps_from_env("abc", nullptr) == 4096,
+              "a refused value with no message pointer: 4096, and nothing is written through the null pointer");
     }
     std::printf("draft_depth_limit:\n");
     {

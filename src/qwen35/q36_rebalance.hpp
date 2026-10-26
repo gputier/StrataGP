@@ -23,7 +23,7 @@ inline constexpr double kRebalanceMinGain = 1.5;    // and beats the expert it r
 inline constexpr double kRebalanceDecay = 0.7;      // the counts' factor after each rebalance, in every layer
 inline constexpr int kRebalanceEveryDefault = 4;    // positions between two rebalances (STRATA_Q36_REBALANCE_EVERY unset): 4 since round v13 (25 October 2026)
 inline constexpr int kRebalanceEveryMax = 1024;     // the largest value the variable accepts
-inline constexpr int kPromptSwapsDefault = 2048;    // slot replacements after a prompt (STRATA_Q36_PROMPT_SWAPS unset)
+inline constexpr int kPromptSwapsDefault = 4096;    // slot replacements after a prompt (STRATA_Q36_PROMPT_SWAPS unset): 4096 since round v25 (26 October 2026)
 inline constexpr int kPromptSwapsUnlimited = INT_MAX;   // the variable's 0: no cap (choose_swaps takes any budget up to INT_MAX)
 
 /// STRATA_Q36_REBALANCE_EVERY: the positions between two rebalances, decimal digits only (no sign, no space, nothing after
@@ -42,7 +42,7 @@ inline int rebalance_every_from_env(const char* v, std::string* err) {
 }
 
 /// STRATA_Q36_PROMPT_SWAPS: the slot replacements of the rebalance after a prompt, decimal digits only (no sign, no space,
-/// nothing after them) for a value from 1 to INT_MAX; 0 gives no cap. Unset or empty gives 2048. Any other value gives 2048
+/// nothing after them) for a value from 1 to INT_MAX; 0 gives no cap. Unset or empty gives 4096. Any other value gives 4096
 /// as well, and `err` (when given) gets the line the engine prints for it; an accepted value leaves `err` alone.
 inline int prompt_swaps_from_env(const char* v, std::string* err) {
     if (v == nullptr || v[0] == '\0') return kPromptSwapsDefault;
