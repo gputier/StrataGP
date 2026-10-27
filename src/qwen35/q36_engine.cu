@@ -4089,10 +4089,12 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
                      (long long) ne);
     else
     std::fprintf(stderr, "strata-q36: hybrid experts: %d of %lld per layer in VRAM (%.2f GiB), all %.2f GiB in %s host "
-                 "memory, the rest of a batch of <= %d rows on %d CPU threads, bigger prompt chunks streamed (%.2f GiB "
-                 "staging); %.1f s\n", S, (long long) ne, (double) S * per_slot / (1 << 30), (double) host / (1 << 30),
-                 pinned ? "pinned" : "pageable", E.hybrid_t, E.pool->workers() + (E.pool->host_works() ? 1 : 0),
-                 (double) staging / (1 << 30), ms_since(t0) / 1000.0);
+                 "memory, the rest of a batch of <= %d rows on %d CPU threads (%d pool workers%s), bigger prompt chunks "
+                 "streamed (%.2f GiB staging); %.1f s\n", S, (long long) ne, (double) S * per_slot / (1 << 30),
+                 (double) host / (1 << 30), pinned ? "pinned" : "pageable", E.hybrid_t,
+                 E.pool->workers() + (E.pool->host_works() ? 1 : 0), E.pool->workers(),
+                 E.pool->host_works() ? " + the host thread, not pinned" : "", (double) staging / (1 << 30),
+                 ms_since(t0) / 1000.0);
     return true;
 #endif
 }
