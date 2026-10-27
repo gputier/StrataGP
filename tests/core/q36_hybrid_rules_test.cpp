@@ -37,9 +37,15 @@ int main() {
         check(ser_pool_keep(3, 0.25f, 0.5f, 3, 0.25f, false), "a pick outside the slots above the threshold is kept");
         check(ser_pool_keep(1, 0.0f, 0.5f, 3, 0.25f, false) && ser_pool_keep(1, 0.0f, 0.5f, 3, 0.25f, true),
               "a pick of rank below ser_kmin is kept, resident or not");
-        // without slots the rule is ser_keep's: --ser-pool acts as --ser
         check(ser_pool_keep(4, 0.1f, 0.5f, 3, 0.25f, false) == ser_keep(4, 3, 0.1f, 0.25f, 0.5f),
               "outside the slots the rule is ser_keep's, the same answer as --ser");
+    }
+    std::printf("ser_pool_resident:\n");
+    {
+        const int slot_of[3] = {0, -1, 5};
+        check(ser_pool_resident(slot_of, 0) && ser_pool_resident(slot_of, 2), "an expert with a slot is resident");
+        check(!ser_pool_resident(slot_of, 1), "an expert without a slot is not resident");
+        check(ser_pool_resident(nullptr, 1), "a layer without a slot table holds every expert in VRAM: resident");
     }
     std::printf("cache_prior_bias:\n");
     {

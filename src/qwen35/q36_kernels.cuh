@@ -426,7 +426,7 @@ __global__ void __launch_bounds__(256) k_route_group(const float* __restrict__ l
                 const float p = __shfl_sync(0xffffffffu, values[expert / 32], expert & 31, 32);
                 if (rank == 0) first = expert;
                 // --ser-pool: the slot table is read only with the option on (ser_pool && ... short-circuits), so the default path reads nothing more
-                const bool resident = ser_pool && HY && slot_of[expert] >= 0;
+                const bool resident = ser_pool && strata::q36::ser_pool_resident(HY ? slot_of : nullptr, expert);
                 const bool keep = strata::q36::ser_pool_keep(rank, p, reciprocal, ser_kmin, ser_t, resident);
                 best = keep ? p : 0.0f;
                 if (!keep) out_id = first;

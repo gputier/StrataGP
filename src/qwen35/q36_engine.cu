@@ -5247,8 +5247,8 @@ int strata::qwen35::run(int argc, char** argv) {
     if (cache_prior > 0.0f || ser_kmin < (int) m.top_k || ser_table_path)
         std::fprintf(stderr, "strata-q36: routing options on: cache prior %g, SER Kmin %d t %g%s (decode and verify windows of up to 8 rows)\n",
                      (double) cache_prior, ser_kmin, (double) ser_t, ser_pool ? " (--ser-pool: outside the VRAM slots only)" : "");
-    if (ser_pool && !m.hybrid && ser_kmin < (int) m.top_k)
-        std::fprintf(stderr, "strata-q36: --ser-pool without the hybrid expert mode (every expert has a slot): it acts as --ser\n");
+    if (ser_pool && !E.main_hybrid && ser_kmin < (int) m.top_k)
+        std::fprintf(stderr, "strata-q36: --ser-pool with every main layer's experts in VRAM: it cuts no pick there\n");
     if (ser_table_path) {
         int below = 0;
         for (int k : ser_kmin_layer) below += k < (int) m.top_k;

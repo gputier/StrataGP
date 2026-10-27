@@ -20,10 +20,15 @@ Q36_HD inline bool ser_keep(int rank, int ser_kmin, float p, float ser_t, float 
 }
 
 /// --ser-pool, k_route_group: SER only on the picks whose expert has no VRAM slot.  A pick with a slot (`resident`) is always
-/// kept: that expert is read almost for free, only a pick served by the CPU pool costs.  Without slots (no hybrid mode) every
-/// pick takes ser_keep's rule, which is --ser.
+/// kept: that expert is read almost for free, only a pick served by the CPU pool costs.
 Q36_HD inline bool ser_pool_keep(int rank, float p, float top, int ser_kmin, float ser_t, bool resident) {
     return resident || ser_keep(rank, ser_kmin, p, ser_t, top);
+}
+
+/// --ser-pool's `resident`: the expert has a VRAM slot.  A layer without a slot table (`slot_of` null: not hybrid, or the
+/// MTP-only hybrid mode's main layers) holds every expert in VRAM, so each of its picks is resident and none is cut.
+Q36_HD inline bool ser_pool_resident(const int* slot_of, int expert) {
+    return slot_of == nullptr || slot_of[expert] >= 0;
 }
 
 /// cache-prior (arXiv 2412.00099, Eq. 9), k_route_group: the amount added to an expert's logit in the ranking.  It is

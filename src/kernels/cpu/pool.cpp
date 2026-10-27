@@ -626,13 +626,20 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
         stop_started();
         throw;
     }
+    if (pin && n_ > (int) topo_.worker_cores.size() && !explicit_pool_cores().empty())
+        std::fprintf(stderr, "strata cpu pool: STRATA_POOL_CORES names %zu CPUs for %d workers: the last %d are not pinned\n",
+                     topo_.worker_cores.size(), n_, n_ - (int) topo_.worker_cores.size());
 #if defined(_WIN32)
     // One line, to tell which cores sit under the 3D V-Cache of a CCD pair; the order and the pinning are as above.
+    // Information only: the workers already run, so nothing here may throw out of the constructor.
     if (pin) {
-        const std::vector<int> pinned(topo_.worker_cores.begin(),
-                                      topo_.worker_cores.begin() + (std::min)((size_t) n_, topo_.worker_cores.size()));
-        const std::string l3 = l3_report(read_l3_groups(), pinned);
-        if (!l3.empty()) std::fprintf(stderr, "strata cpu pool: %s\n", l3.c_str());
+        try {
+            const std::vector<int> pinned(topo_.worker_cores.begin(),
+                                          topo_.worker_cores.begin() + (std::min)((size_t) n_, topo_.worker_cores.size()));
+            const std::string l3 = l3_report(read_l3_groups(), pinned);
+            if (!l3.empty()) std::fprintf(stderr, "strata cpu pool: %s\n", l3.c_str());
+        } catch (...) {
+        }
     }
 #endif
     {
