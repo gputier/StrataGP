@@ -7,3 +7,7 @@ import tempfile
 _home = tempfile.mkdtemp(prefix="strata-pytest-config-")
 os.environ["APPDATA"] = _home
 os.environ["XDG_CONFIG_HOME"] = _home
+
+# tools/*_test.py are scripts run by hand against a live server (python3 tools/x_test.py CFG|URL), not pytest tests:
+# collected, the ones that read sys.argv or a config at import fail before any test runs
+collect_ignore_glob = ["tools/*_test.py"]

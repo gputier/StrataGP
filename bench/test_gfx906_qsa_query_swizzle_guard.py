@@ -18,7 +18,7 @@ source = (ROOT / "src/kernels/cuda/qsa_decode_attn.cu").read_text()
 start = source.index("bool query_swizzle_gfx906_device() {")
 end = source.index("\n}\n", start) + 3
 guard = source[start:end]
-dispatch = re.search(r"^    const bool use_query_swizzle = .*;", source, re.MULTILINE)
+dispatch = re.search(r"^    const bool use_query_swizzle = [^;]*;", source, re.MULTILINE)   # may wrap lines
 if dispatch is None or "if (use_query_swizzle) {" not in source:
     raise RuntimeError("production query-swizzle dispatch changed; update the test")
 
@@ -66,6 +66,7 @@ tests = r'''
 int main() {
     require(!active(false, false, 1), "opt-in off");
     require(!active(true, true, 1), "lane-cell wins");
+    for (int forced : {0, 1}) require(!active(true, false, 1, forced), "a forced kernel skips the swizzle");
     for (int mode : {0, 2, 3}) require(!active(true, false, mode), "other pool modes");
     require(mock.device_calls == 0 && mock.property_calls == 0, "inactive dispatch makes no HIP queries");
     require(active(true, false, 1), "gfx906 wave64 accepted");
@@ -117,7 +118,7 @@ int main() {
 }
 '''
 
-program = prefix + guard + "\nbool active(bool query_swizzle, bool lane_cell, int kv_mode) {\n"
+program = prefix + guard + "\nbool active(bool query_swizzle, bool lane_cell, int kv_mode, int kernel = -1) {\n"
 program += dispatch.group(0) + "\n    return use_query_swizzle;\n}\n" + tests
 with tempfile.TemporaryDirectory(prefix="qsa-swizzle-guard-") as directory:
     cpp = Path(directory) / "guard_test.cpp"
