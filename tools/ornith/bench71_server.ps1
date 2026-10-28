@@ -21,9 +21,9 @@ running from the engine binary's path, a server already answering on the port, a
 holds a double quote.
 
 .EXAMPLE
-powershell -File tools\ornith\bench71_server.ps1 -BuildDir E:\StrataGP-89\final -OutDir E:\ornith\runs\bench71_server_01
+powershell -File tools\ornith\bench71_server.ps1 -BuildDir E:\llm\stratagp\build -OutDir E:\llm\runs\bench71_server_01
 .EXAMPLE
-powershell -File tools\ornith\bench71_server.ps1 -BuildDir E:\StrataGP-89\final -OutDir E:\ornith\runs\bench71_trial -Trial
+powershell -File tools\ornith\bench71_server.ps1 -BuildDir E:\llm\stratagp\build -OutDir E:\llm\runs\bench71_trial -Trial
 #>
 [CmdletBinding()]
 param(
@@ -31,9 +31,9 @@ param(
     [Parameter(Mandatory = $true)][string]$OutDir,                # new folder: it must not exist yet
     [int]$Runs = 40,                                              # prompt p00 resumed this many times (run 0 is the reference)
     [switch]$Trial,                                               # 2 runs only
-    [string]$Gguf = 'E:\ornith\models\Ornith-1.5-122B-IQ3XXS-IQ4XS.gguf',
-    [string]$IdsFile = 'E:\ornith\gates\p00.ids',                 # token ids of p00, space separated
-    [string]$ForceFile = 'E:\ornith\gates\p00.force',             # the CLI's forced continuation; here only its length is used
+    [string]$Gguf = 'E:\llm\models\ornith-1.5-122b\gguf\Ornith-1.5-122B-IQ3XXS-IQ4XS.gguf',
+    [string]$IdsFile = 'E:\llm\models\ornith-1.5-122b\parity\p00.ids',      # token ids of p00, space separated
+    [string]$ForceFile = 'E:\llm\models\ornith-1.5-122b\parity\p00.force',  # the CLI's forced continuation; here only its length is used
     [string]$Binary = '',                                         # empty = strata.exe of -BuildDir
     [int]$Port = 8090,
     [int]$Tokens = 0,                                             # tokens asked for p00; 0 = ids in the force file + 1 (as the CLI)

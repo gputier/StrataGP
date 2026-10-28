@@ -221,8 +221,9 @@ class Client:
                     raise TimeoutError("Absolute request timeout exceeded")
                 if not done or row["finish_reason"] is None or not row["usage"]:
                     raise ValueError("Incomplete SSE: [DONE], finish reason, and usage are required")
-        except Exception:
-            if timed_out.is_set():
+        except Exception as error:
+            # The socket's own timeout is the same budget as the timer, so either one may fire first
+            if timed_out.is_set() or isinstance(error, TimeoutError):
                 raise TimeoutError("Absolute request timeout exceeded") from None
             raise
         finally:

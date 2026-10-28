@@ -152,7 +152,8 @@ The start-up time on a machine where CUDA refuses the registration is not measur
   - The gain is 1 to 2 %, smaller than the gap between two sessions (rev14 gave 53.1 to 53.4 tokens/s on the short prompt
     in the morning), so it is valid only within this alternated series.
   - Limit: the Ornith service runs the installed engine `E:\ornith\build` (origin/main fe794ac7), which has no large-page
-    arena. The service gets the gain only after this branch is deployed.
+    arena. The service gets the gain only after this branch is deployed. Since 28 October 2026 the service runs
+    `E:\llm\stratagp\build`, built from main `58b53b97`, which has it.
 
 ### Identity bisection (21 October)
 
