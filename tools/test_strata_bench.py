@@ -3,9 +3,9 @@ writing and the comparison.  Light: no GPU, no Strata server, a few seconds."""
 from __future__ import annotations
 
 import contextlib
+import getpass
 import io
 import json
-import os
 import sys
 import tempfile
 import threading
@@ -169,7 +169,7 @@ class SuiteTests(unittest.TestCase):
 class RedactionTests(unittest.TestCase):
     def test_paths_names_ips_and_keys(self):
         red = B.redactor(extra=["Jane Roe Laptop"], key="sk-secret-123456")
-        user = os.environ.get("USERNAME") or os.environ.get("USER") or "tester"
+        user = getpass.getuser()                              # #129: the name redactor reads, not an env guess
         cases = [r"C:\Users\someone_else\models\a.gguf", "/home/bob/strata/x.json", "/Users/alice/Library",
                  "peer 192.168.1.20 and 10.0.0.7 and 100.101.102.103", "Authorization: Bearer abcdefghijkl12345",
                  "key sk-secret-123456 here", "name Jane Roe Laptop"]
@@ -180,8 +180,9 @@ class RedactionTests(unittest.TestCase):
         self.assertIn("<user>", text)
         self.assertIn("<ip>", text)
         self.assertEqual(red("127.0.0.1:8080 and version 0.1.40.3 and driver 32.0.15.7"), "127.0.0.1:8080 and version 0.1.40.3 and driver 32.0.15.7")
-        self.assertNotIn(str(B.ROOT), red(f"loading {B.ROOT / 'strata-x.json'}"))
-        self.assertIn("<strata>", red(f"loading {B.ROOT / 'strata-x.json'}"))
+        if len(str(B.ROOT)) >= 4:                             # #129: shorter values are left alone on purpose
+            self.assertNotIn(str(B.ROOT), red(f"loading {B.ROOT / 'strata-x.json'}"))
+            self.assertIn("<strata>", red(f"loading {B.ROOT / 'strata-x.json'}"))
         self.assertNotIn(str(Path.home()), red(f"in {Path.home() / 'data'}"))
         if len(user) >= 4:
             self.assertNotIn(user, red(f"hello {user} world"))
