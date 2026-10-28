@@ -2061,17 +2061,18 @@ class StrataEngine:
                         raise self._silent("the engine did not finish the request after it was stopped (STOP) "
                                            f"within {allow:.0f} s") from None
                     if line is None or line.startswith("ERR"):
+                        self.overrun = None                         # #127: an engine in error: nothing is put back
                         break
                     if line.startswith("DONE"):
                         self._parse_done(line)
                         break
                     if not self.can_stop:
                         heard = time.monotonic()
-                    elif line.startswith("T "):
+                    elif line.startswith("T ") and self.overrun is not None:
                         try:
                             self.overrun.append(int(line[2:]))      # #127: kept, not thrown away
                         except ValueError:
-                            pass
+                            self.overrun = None                     # a hole: what follows it is not what it holds
 
     def _activity(self) -> tuple[float, int] | None:
         """#1317: (CPU seconds, I/O bytes) the engine process has used so far, or None when they cannot be read."""
@@ -4588,6 +4589,9 @@ class Service:
                             after = REASONING_WRAP_UP + (force or "") if wrap else "\n\n" + force
                             room = max_new - n - len(self.tok.encode(after, parse_special=True)) - 1
                             for t in clean_overrun(ov[:max(0, room)], detok, parser, self.stop_ids):
+                                if t in self.stop_ids and parser.state == "reasoning" and parser.buf != THINK_END:
+                                    break       # it ended its turn inside its thinking: left out, the wrap-up closes
+                                                # the thinking and it answers, as before #127
                                 n += 1
                                 if t in self.stop_ids:
                                     if force and parser.state == "reasoning" and parser.buf == THINK_END:

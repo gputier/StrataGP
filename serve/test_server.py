@@ -4399,25 +4399,37 @@ class ThinkingBudgetOverrun(unittest.TestCase):
         self.assertEqual(b["choices"][0]["finish_reason"], "stop")
         self.assertEqual(b["usage"]["completion_tokens"], len(ThinkingEngine.ANSWER) + 20 + len("</think>\n\n") + 1)
 
-    def test_an_overrun_with_a_stop_token_ends_the_reply(self):
-        self.start(5, THOUGHT="x" * 22, CLOSE="")             # two more tokens, the stop token, then nothing
+    def test_a_stop_token_after_the_answer_ends_the_reply(self):
+        self.start(40, THOUGHT="x" * 22)                       # the overrun closes the thinking, answers, stops
         b = self.openai(reasoning_budget_tokens=20)
         msg = b["choices"][0]["message"]
         self.assertEqual(len(self.engine.prompts), 1)         # no wrap-up, no second pass
-        self.assertEqual(self.engine.overrun[-1], self.tok.encode("<|im_end|>", parse_special=True)[0])
         self.assertEqual(msg["reasoning_content"], "x" * 22)
+        self.assertEqual(msg["content"], ThinkingEngine.ANSWER)
         self.assertEqual(b["choices"][0]["finish_reason"], "stop")
-        self.assertEqual(b["usage"]["completion_tokens"], 23)  # the stop token counts, as for any stop
+        # the stop token counts, as for any stop
+        self.assertEqual(b["usage"]["completion_tokens"], 22 + len("</think>\n\n") + len(ThinkingEngine.ANSWER) + 1)
+
+    def test_a_stop_token_inside_the_thinking_still_gets_the_wrap_up(self):
+        from serve.server import REASONING_WRAP_UP
+        self.start(5, THOUGHT="x" * 22, CLOSE="")             # two more tokens, the stop token, then nothing
+        b = self.openai(reasoning_budget_tokens=20)
+        extra = self.tok.encode(REASONING_WRAP_UP, parse_special=True)
+        first, second = self.engine.prompts
+        # it ended its turn before it answered: the stop token is left out and it answers after the wrap-up
+        self.assertEqual(second, first + self.tok.encode("x" * 22) + extra)
+        self.assertTrue(b["choices"][0]["message"]["content"])
 
     def test_a_stop_token_in_the_middle_drops_what_follows_it(self):
+        from serve.server import REASONING_WRAP_UP
         self.start(0, THOUGHT="x" * 22, CLOSE="")
         end = self.tok.encode("<|im_end|>", parse_special=True)
         self.engine.generate = lambda ids, max_new, sampling, cancel, embeddings=None: self._with_overrun(
             ids, max_new, cancel, [120, 121, *end, 122, 123])
-        b = self.openai(reasoning_budget_tokens=20)
-        self.assertEqual(len(self.engine.prompts), 1)
-        self.assertEqual(b["choices"][0]["finish_reason"], "stop")
-        self.assertEqual(b["usage"]["completion_tokens"], 23)
+        self.openai(reasoning_budget_tokens=20)
+        first, second = self.engine.prompts[:2]
+        self.assertEqual(second, first + self.tok.encode("x" * 20) + [120, 121]
+                         + self.tok.encode(REASONING_WRAP_UP, parse_special=True))
 
     def _with_overrun(self, ids, max_new, cancel, overrun):
         self.engine.prompts.append(list(ids))
@@ -4536,6 +4548,17 @@ class EngineOverrunDrain(unittest.TestCase):
         gen.close()
         self.assertNotIn("STOP", engine.proc.stdin.getvalue())
         self.assertEqual(engine.overrun, [])
+
+    def test_a_line_it_cannot_read_or_an_error_gives_none(self):
+        # a hole in the list, or an engine in error: what it holds is not known, so nothing is put back
+        for lines in (("T 5", "T 6", "T x", "T 8", "DONE 4 1 1 1 length"), ("T 5", "T 6", "ERR boom")):
+            engine = self.bare()
+            for line in lines:
+                engine.lines.put(line)
+            gen = engine.generate([1], 10, {}, threading.Event())
+            next(gen)
+            gen.close()
+            self.assertIsNone(engine.overrun, lines)
 
 
 class CallingEngine(MockEngine):
