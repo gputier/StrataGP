@@ -56,7 +56,8 @@ def normalize(v, t: Path):
     if isinstance(v, list):
         return [normalize(x, t) for x in v]
     if isinstance(v, str):
-        return re.sub(rf"(?<![w.-]){re.escape(setup.EXE)}(?![w.-])", "<EXE>", v.replace(str(t), "<T>").replace("\\", "/"))   # #973: only the whole name, not "strata-x.log" on Linux
+        v = re.sub(rf"(?<![\w.-]){re.escape(setup.VEXE)}(?![\w.-])", "<VEXE>", v.replace(str(t), "<T>").replace("\\", "/"))
+        return re.sub(rf"(?<![\w.-]){re.escape(setup.EXE)}(?![\w.-])", "<EXE>", v)   # #973: only the whole name, not "strata-x.log" on Linux
     return v
 
 
@@ -102,6 +103,7 @@ def install(ram, found, argv, answers=None, extra=(), avx512=False, configs=()):
             mock.patch.object(setup, "ram_gb", lambda: ram),
             mock.patch.object(setup, "cpu_info", lambda: ("Test CPU", True, avx512)),
             mock.patch.object(setup, "cpu_cores", lambda: None),   # #642: not a hybrid CPU
+            mock.patch.object(setup.os, "cpu_count", lambda: 12),  # #129: the baseline's PC (vision threads)
             mock.patch.object(setup, "page_file_gb", lambda: 16.0),
             mock.patch.object(setup, "is_wsl", lambda: False),
             mock.patch.object(setup, "rotational_disk", lambda p: None),   # #605: the test PC's own disk
