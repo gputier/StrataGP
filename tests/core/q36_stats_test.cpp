@@ -72,9 +72,11 @@ int main() {
         b.pf_hits = 120;
         b.wait_layer_ms = {4, 5};
         a.rb_swaps = 7;
-        a.rb_bytes = 3'500'000LL;
+        a.rb_blob_bytes = 3'500'000LL;
+        a.rb_slot_bytes = 9'000LL;
         b.rb_swaps = 4;
-        b.rb_bytes = 1'000'000LL;
+        b.rb_blob_bytes = 1'000'000LL;
+        b.rb_slot_bytes = 4'000LL;
         a.rb_ms = 20.0;
         b.rb_ms = 7.5;
         const DecodeStats d = a - b;
@@ -89,11 +91,27 @@ int main() {
         check(has(line, "PCIe blobs per token: on demand 2.00, prefetched 2.00, prefetch hits 1.80 (90.0% of the prefetched)"),
               "the PCIe blobs by token: on demand, prefetched, hits and the hit rate");
         check(has(line, "host wait on the doorbell 20 ms over 100 layer steps (200.0 us each)"), "the doorbell wait");
-        check(d.rb_swaps == 3 && d.rb_bytes == 2'500'000LL && near(d.rb_ms, 12.5), "the difference of the rebalance counters");
-        check(has(line, "decode rebalances: 3 slot swaps, 2.5 MB copied, 12.5 ms of host time"),
-              "the decode cadence's rebalances: swaps, bytes copied and host time");
+        check(d.rb_swaps == 3 && d.rb_blob_bytes == 2'500'000LL && d.rb_slot_bytes == 5'000LL && near(d.rb_ms, 12.5),
+              "the difference of the rebalance counters");
+        check(has(line, "decode rebalances: 3 slot swaps, 2.5 MB of expert blobs, 5.0 KB of slot tables, 12.5 ms of host time"),
+              "the decode cadence's rebalances: swaps, blob bytes, slot table bytes and host time");
         check(has(format_decode_stats(0, DecodeStats(), 0), "(0 tokens)"), "no token, no division by zero");
+        check(!has(line, "swiglu skim"), "the skim's part is absent from the pool line with the skim off");
+        DecodeStats k = d;
+        k.skim_on = true;
+        k.skim_seen = 400;
+        k.skim_cut = 100;
+        check(has(format_decode_stats(3, k, 100), "5.0 KB of slot tables, 12.5 ms of host time, swiglu skim 25.0 % of 400 covered neurons"),
+              "the skim on: the cut share and the neurons seen, at the end of the pool line");
         check(has(format_wait_layers(3, d), "by layer (ms): 6.0 15.0"), "the wait by layer line");
+        std::string err;
+        check(swiglu_skim_tau_from_env(nullptr, &err) == 0.f && err.empty(), "STRATA_Q36_SWIGLU_SKIM unset: off, no line");
+        check(swiglu_skim_tau_from_env("0.05", &err) == 0.05f && err.empty(), "a threshold is read as given");
+        check(swiglu_skim_tau_from_env("0", &err) == 0.f && err.empty(), "0 is accepted, and is off");
+        for (const char* bad : {"abc", "0.05x", "", "-0.1", "inf", "nan"}) {
+            err.clear();
+            check(swiglu_skim_tau_from_env(bad, &err) == 0.f && !err.empty(), "a value that is not a finite number >= 0 is refused");
+        }
     }
     {
         ExpertUnion u;

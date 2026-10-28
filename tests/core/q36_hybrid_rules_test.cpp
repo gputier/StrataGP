@@ -1,5 +1,5 @@
-// tests/core/q36_hybrid_rules_test.cpp - the pure rules of strata-q36's hybrid mode, no GPU: the SER keep rule and the
-// cache-prior bias of the routing kernel (src/qwen35/q36_rules.hpp, the functions the kernel calls), the guard that turns
+// tests/core/q36_hybrid_rules_test.cpp - the pure rules of strata-q36's hybrid mode, no GPU: the SER keep rule and its
+// --ser-pool variant, the Kmin of a layer and the cache-prior bias of the routing kernel (src/qwen35/q36_rules.hpp, the functions the kernel calls), the guard that turns
 // the graphs off below the verify threshold, and the placement change of a rebalance swap (q36_rebalance.hpp).
 #include "check.hpp"
 #include "q36_rebalance.hpp"
@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -27,6 +28,24 @@ int main() {
               "ser_kmin 3 keeps ranks 0 .. 2 and applies the threshold from rank 3");
         check(ser_keep(4, 0, 0.5f, 0.25f, 0.5f) && !ser_keep(4, 0, 0.1f, 0.25f, 0.5f),
               "ser_kmin 0: no rank is kept outright, rank 4 is kept at p 0.5 and dropped at p 0.1");
+    }
+    std::printf("ser_pool_keep:\n");
+    {
+        // top probability 0.5, ser_t 0.25 (threshold 0.125), ser_kmin 3
+        check(ser_pool_keep(3, 0.0f, 0.5f, 3, 0.25f, true), "a resident pick past ser_kmin is kept under the threshold");
+        check(!ser_pool_keep(3, 0.0f, 0.5f, 3, 0.25f, false), "a pick outside the slots past ser_kmin is cut under the threshold");
+        check(ser_pool_keep(3, 0.25f, 0.5f, 3, 0.25f, false), "a pick outside the slots above the threshold is kept");
+        check(ser_pool_keep(1, 0.0f, 0.5f, 3, 0.25f, false) && ser_pool_keep(1, 0.0f, 0.5f, 3, 0.25f, true),
+              "a pick of rank below ser_kmin is kept, resident or not");
+        check(ser_pool_keep(4, 0.1f, 0.5f, 3, 0.25f, false) == ser_keep(4, 3, 0.1f, 0.25f, 0.5f),
+              "outside the slots the rule is ser_keep's, the same answer as --ser");
+    }
+    std::printf("ser_pool_resident:\n");
+    {
+        const int slot_of[3] = {0, -1, 5};
+        check(ser_pool_resident(slot_of, 0) && ser_pool_resident(slot_of, 2), "an expert with a slot is resident");
+        check(!ser_pool_resident(slot_of, 1), "an expert without a slot is not resident");
+        check(ser_pool_resident(nullptr, 1), "a layer without a slot table holds every expert in VRAM: resident");
     }
     std::printf("cache_prior_bias:\n");
     {
@@ -89,6 +108,83 @@ int main() {
         const int s3 = apply_slot_swap(self, {0, 1, 1, 0.0}, [&](int slot, int in) { self_copies.emplace_back(slot, in); });
         check(s3 == 1 && self == std::vector<int>({0, 1, -1, -1}), "a swap of an expert with itself keeps it in its slot (1)");
         check(self_copies == std::vector<Pair>({{1, 1}}), "and copies it into that slot again");
+    }
+    std::printf("hybrid_prompt_chunk:\n");
+    check(hybrid_prompt_chunk(23.2, 1, true) == 4096, "23.2 GiB free, one session: 4096");
+    check(hybrid_prompt_chunk(20.0, 1, true) == 4096, "20.0 GiB free, one session: 4096");
+    check(hybrid_prompt_chunk(19.99, 1, true) == 2048, "19.99 GiB free, one session: 2048");
+    check(hybrid_prompt_chunk(23.2, 2, true) == 2048, "23.2 GiB free, two sessions: 2048");
+    check(hybrid_prompt_chunk(23.2, 0, true) == 4096, "23.2 GiB free, 0 sessions (one at a time): 4096");
+    check(hybrid_prompt_chunk(7.5, 1, true) == 2048, "7.5 GiB free: 2048");
+    check(hybrid_prompt_chunk(7.49, 1, true) == 1024, "7.49 GiB free: 1024");
+    check(hybrid_prompt_chunk(5.5, 1, true) == 1024, "5.5 GiB free: 1024");
+    check(hybrid_prompt_chunk(5.49, 1, true) == 512, "5.49 GiB free: 512");
+    check(hybrid_prompt_chunk(23.2, 1, false) == 2048, "23.2 GiB free, one session, slots by hand: 2048");
+    check(hybrid_prompt_chunk(20.0, 1, false) == 2048, "20.0 GiB free, one session, slots by hand: 2048");
+    check(hybrid_prompt_chunk(5.49, 1, false) == 512, "5.49 GiB free, slots by hand: 512");
+    std::printf("forced_chunk_need:\n");
+    {
+        const double GiB = (double) (1ull << 30);
+        check(forced_chunk_need(8192, 0.0) == 6.5 * GiB, "8192 in hybrid mode: 2.75 GiB + 3.75 GiB of buffers");
+        check(forced_chunk_need(4608, 0.0) == 4.75 * GiB, "4608 in hybrid mode: 2.75 GiB + 2 GiB");
+        check(forced_chunk_need(8192, 18.0 * GiB) == 24.5 * GiB, "8192 with 18 GiB of experts all in VRAM: they keep their room");
+        check(forced_chunk_need(8192, 18.0 * GiB) > 22.0 * GiB, "so 22 GiB free refuses 8192 when every expert must fit");
+        check(forced_chunk_need(8192, 18.0 * GiB + 1.5 * GiB) == 26.0 * GiB, "the sessions' K / V past 8192 cells keep their room too");
+        check(forced_chunk_need(4096, 0.0) == 4.5 * GiB, "4096, the auto cap: 2.75 GiB + 1.75 GiB");
+    }
+    std::printf("parse_ser_table:\n");
+    {
+        // 48 main layers, --ser's Kmin 7: a table line names a layer's own Kmin, the others keep 7
+        std::vector<int> kmin;
+        std::string err;
+        const bool ok = parse_ser_table("# SER table\n\n5 6\n  12\t8   # all picks\r\n47 1\n", 48, 7, &kmin, &err);
+        check(ok && err.empty(), "a table with comments, blank lines, tabs and CRs is read");
+        check(ok && kmin.size() == 48 && kmin[5] == 6 && kmin[12] == 8 && kmin[47] == 1 && kmin[0] == 7 && kmin[46] == 7,
+              "the named layers take their Kmin, the others --ser's Kmin 7");
+        std::vector<int> none;
+        check(parse_ser_table("", 4, 6, &none, &err) && none == std::vector<int>({6, 6, 6, 6}),
+              "an empty table gives every layer --ser's Kmin");
+        std::vector<int> two;
+        check(parse_ser_table("0 5\n3 4\n", 4, 8, &two, &err) && two == std::vector<int>({5, 8, 8, 4}),
+              "layers 0 and 3 are named, layers 1 and 2 take the default Kmin 8");
+    }
+    {
+        // each refusal names its line: a bad line is never skipped
+        std::vector<int> kmin;
+        std::string err;
+        const auto refused = [&](const char* text, int n_layers, const char* line) {
+            err.clear();
+            const bool ok = parse_ser_table(text, n_layers, 8, &kmin, &err);
+            return !ok && err.find(line) != std::string::npos;
+        };
+        check(refused("5\n", 48, "line 1"), "a line with one number is refused");
+        check(refused("5 6 7\n", 48, "line 1"), "a line with three numbers is refused");
+        check(refused("5 6x\n", 48, "line 1"), "a Kmin with text after it is refused");
+        check(refused("5 x\n", 48, "line 1"), "a non-number is refused");
+        check(refused("1.5 6\n", 48, "line 1"), "a layer that is not an integer is refused");
+        check(refused("3 6\n\n# c\n47 9\n", 48, "line 4"), "Kmin 9 is refused, the error names line 4");
+        check(refused("0 0\n", 48, "line 1"), "Kmin 0 is refused");
+        check(parse_ser_table("0 1\n", 48, 8, &kmin, &err), "Kmin 1 is accepted");
+        check(refused("48 6\n", 48, "line 1"), "layer 48 is out of 0 .. 47 and refused");
+        check(refused("-1 6\n", 48, "line 1"), "layer -1 is refused");
+        check(parse_ser_table("47 8\n", 48, 8, &kmin, &err), "layer 47 of 48 is accepted");
+        check(refused("2 6\n2 7\n", 48, "line 2"), "a layer named twice is refused, the error names line 2");
+    }
+    std::printf("layer_kmin:\n");
+    {
+        // 48 main layers, --ser's Kmin 7, the table names layer 5 (Kmin 6) and layer 47 (Kmin 1)
+        std::vector<int> kmin;
+        std::string err;
+        parse_ser_table("5 6\n47 1\n", 48, 7, &kmin, &err);
+        check(layer_kmin(kmin, 5, 7) == 6, "a layer the table names takes its own Kmin");
+        check(layer_kmin(kmin, 47, 7) == 1, "the last main layer takes its own Kmin, 1");
+        check(layer_kmin(kmin, 4, 7) == 7, "a layer the table does not name takes --ser's Kmin");
+        check(layer_kmin(kmin, 48, 7) == 7 && layer_kmin(kmin, 49, 7) == 7,
+              "the MTP block, past the main layers, takes --ser's Kmin whatever the table holds at 47");
+        std::vector<int> none;
+        check(parse_ser_table("", 48, 6, &none, &err) && layer_kmin(none, 0, 6) == 6 && layer_kmin(none, 48, 6) == 6,
+              "an empty table gives every layer, the MTP block too, --ser's Kmin");
+        check(layer_kmin(std::vector<int>(), 3, 5) == 5, "a layer list with no entries gives --ser's Kmin");
     }
     std::printf("%s\n", g_fail ? "FAILED" : "all passed");
     return g_fail ? 1 : 0;

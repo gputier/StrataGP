@@ -23,6 +23,7 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/family_layout.hpp"
 #include "strata/core/pcie_share.hpp"
+#include "strata/core/pinned.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/fused_gdn.hpp"
@@ -65,6 +66,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -72,6 +74,7 @@
 #include <mutex>
 #include <random>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -1549,6 +1552,9 @@ struct Engine {
         const Layer& L = li < m->layers.size() ? m->layers[li] : m->mtp;
         return L.n_slots < (int) m->g.n_expert;
     }
+    // place_experts: the host copy of every expert, which L.hblobs points into. Declared before `pool`, so it is released
+    // after the pool's threads have stopped.
+    std::unique_ptr<strata::core::PinnedArena> expert_arena;
 #if defined(STRATA_Q36_CPU_POOL)
     std::unique_ptr<strata::kernels::cpu::ExpertPool> pool;
     std::vector<strata::kernels::cpu::ExpertJobMulti> jobs;
@@ -1663,6 +1669,11 @@ struct Engine {
             d.pool_gu_ms = pool->ms_multi_gu;
             d.pool_q_ms = pool->ms_multi_q;
             d.pool_down_ms = pool->ms_multi_down;
+            d.skim_on = strata::q36::swiglu_skim_tau() > 0.f;
+            uint64_t seen = 0, cut = 0;
+            strata::kernels::cpu::native_swiglu_skim_totals(seen, cut);
+            d.skim_seen = (long long) seen;
+            d.skim_cut = (long long) cut;
         }
 #endif
         return d;
@@ -1897,6 +1908,9 @@ struct Engine {
         std::string every_err;   // STRATA_Q36_REBALANCE_EVERY: read once, here (the rebalance cadence and the draft bound follow it)
         rebalance_every = strata::q36::rebalance_every_from_env(std::getenv("STRATA_Q36_REBALANCE_EVERY"), &every_err);
         if (!every_err.empty()) std::fprintf(stderr, "strata-q36: %s\n", every_err.c_str());
+        std::string swaps_err;   // STRATA_Q36_PROMPT_SWAPS: read once, here (the cap of the rebalance after a prompt)
+        hybrid_swaps_after_prompt = strata::q36::prompt_swaps_from_env(std::getenv("STRATA_Q36_PROMPT_SWAPS"), &swaps_err);
+        if (!swaps_err.empty()) std::fprintf(stderr, "strata-q36: %s\n", swaps_err.c_str());
         const auto& g = m->g;
         const size_t T = (size_t) tmax, N = (size_t) g.n_embd, Kp = (size_t) m->top_k, FF = (size_t) g.n_ff;
         const size_t C = (size_t) g.ssm_conv_channels;
@@ -2164,6 +2178,9 @@ struct Engine {
     int32_t* delta_count = nullptr;
     int ser_kmin = 8;           // the picks of rank >= ser_kmin are kept only above ser_t * the top probability
     float ser_t = 0.0f;
+    bool ser_pool = false;      // --ser-pool: the picks whose expert has a VRAM slot are never cut by SER (q36_rules.hpp)
+    // each main layer's Kmin (STRATA_Q36_SER_TABLE, else ser_kmin); the MTP block past them takes ser_kmin
+    std::vector<int> ser_kmin_layer;
     bool verify_k = std::getenv("STRATA_Q36_VERIFY") != nullptr;
     // the verify scratch (vbuf), in floats: the start refuses a model whose matrices would not fit it
     static constexpr size_t kVerifyFloats = (size_t) 8 * 16384;
@@ -2400,16 +2417,17 @@ struct Engine {
         const int Kp = (int) m->top_k;
         grouped_by_route = false;
         if (!fast_route() || T > 8) return false;
-        const bool opt = cache_prior > 0.0f || ser_kmin < Kp;
+        const int kmin = strata::q36::layer_kmin(ser_kmin_layer, li, ser_kmin);
+        const bool opt = cache_prior > 0.0f || kmin < Kp;
         if (slot_of) {
             const auto kern = opt ? q36k::k_route_group<true, true> : q36k::k_route_group<true, false>;
             kern<<<1, dim3(32, 8), 0, st>>>(logits_r, ids, ewts, T, ld, slot_of, L.blobs, L.stride, grp_ptr, grp_start, n_groups,
-                                            ent_dst, ent_tok, cache_prior, ser_kmin, ser_t, delta_mean ? delta_mean + li : nullptr,
+                                            ent_dst, ent_tok, cache_prior, kmin, ser_t, ser_pool, delta_mean ? delta_mean + li : nullptr,
                                             delta_count ? delta_count + li : nullptr);
         } else {
             const auto kern = opt ? q36k::k_route_group<false, true> : q36k::k_route_group<false, false>;
             kern<<<1, dim3(32, 8), 0, st>>>(logits_r, ids, ewts, T, ld, nullptr, L.blobs, L.stride, grp_ptr, grp_start, n_groups,
-                                            ent_dst, ent_tok, cache_prior, ser_kmin, ser_t, nullptr, nullptr);
+                                            ent_dst, ent_tok, cache_prior, kmin, ser_t, ser_pool, nullptr, nullptr);
         }
         grouped_by_route = true;
         if (verify_k && !opt) {
@@ -3163,13 +3181,13 @@ struct Engine {
             });
             changed[(size_t) w.layer] = 1;
             ++hy_swaps;
-            if (count) stat_acc.rb_bytes += (long long) L.L.bytes;
+            if (count) stat_acc.rb_blob_bytes += (long long) L.L.bytes;
         }
         for (size_t li = 0; li < hy.size(); ++li) {
             if (changed[li]) {
                 CK(cudaMemcpyAsync(hy[li].slot_of_d, hy[li].slot_of.data(), (size_t) m->g.n_expert * 4,
                                    cudaMemcpyHostToDevice, st));
-                if (count) stat_acc.rb_bytes += (long long) m->g.n_expert * 4;
+                if (count) stat_acc.rb_slot_bytes += (long long) m->g.n_expert * 4;
             }
             for (double& v : hy[li].score) v *= strata::q36::kRebalanceDecay;
         }
@@ -3566,7 +3584,7 @@ struct Engine {
         b.imgs = a.imgs;
         if (dst == cur) load_cur();
     }
-    int hybrid_swaps_after_prompt = 2048;
+    int hybrid_swaps_after_prompt = strata::q36::kPromptSwapsDefault;   // STRATA_Q36_PROMPT_SWAPS, read by init()
     /// The prompt's routing moves the slots at once; the decode windows' rebalances add up in hy_swaps (the request's log line).
     /// Its swaps, bytes and time stay out of the stats' rebalance counters, which count the decode cadence's only (issue #96).
     void rebalance_after_prompt() {
@@ -3875,24 +3893,45 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             return false;
         }
     }
-    // host memory: every expert, pinned where the driver allows it (the prompt's stream and the slot copies)
+    // host memory: every expert, pinned where the driver allows it (the prompt's stream and the slot copies). First a
+    // PinnedArena, in large pages where the OS grants them and in 4 KB pages otherwise, registered with CUDA before any
+    // page is touched. An arena that CUDA does not register in full is released, and the experts take cudaHostAlloc,
+    // then malloc, as before.
     size_t host = 0;
     for (Layer* L : all)
         if (!mtp_only || L == &m.mtp) host += L->stride * (size_t) ne + kMmqTail;
     uint8_t* arena = nullptr;
-    bool pinned = cudaHostAlloc((void**) &arena, host, cudaHostAllocDefault) == cudaSuccess;
-    if (!pinned) {
-        (void) cudaGetLastError();
-        arena = (uint8_t*) std::malloc(host);
-        if (!arena) {
-            err = "no host memory for the experts (" + std::to_string(host >> 20) + " MiB)";
-            return false;
+    bool pinned = false;
+    std::string how;
+    // the arena is registered as one block: STRATA_ARENA_PIN_GIB caps only a registration by slices (PinnedArena's bounds, pinned.cu)
+    // #118: an arena CUDA refuses is released below, so it is not locked resident first
+    E.expert_arena = std::make_unique<strata::core::PinnedArena>(host, 0, false);
+    const strata::core::PinnedArena& pa = *E.expert_arena;
+    if (pa.valid() && pa.registered_bytes == pa.capacity) {
+        arena = pa.data();
+        pinned = true;
+        how = std::string(pa.backing == strata::core::PageBacking::LargePages ? "large pages" : "4 KB pages") +
+              " pinned by CUDA registration (" + pa.note + ")";
+    } else {
+        if (pa.valid())
+            std::fprintf(stderr, "strata-q36: the expert arena is not pinned (%s); falling back to cudaHostAlloc\n",
+                         pa.note.c_str());
+        E.expert_arena.reset();   // `pa` is not read past this line
+        (void) cudaGetLastError();   // releasing an arena that CUDA never registered can leave its error set
+        pinned = cudaHostAlloc((void**) &arena, host, cudaHostAllocDefault) == cudaSuccess;
+        if (!pinned) {
+            (void) cudaGetLastError();
+            arena = (uint8_t*) std::malloc(host);
+            if (!arena) {
+                err = "no host memory for the experts (" + std::to_string(host >> 20) + " MiB)";
+                return false;
+            }
         }
+        how = pinned ? "cudaHostAlloc memory (pinned, default flags)" : "malloc memory (cudaHostAlloc failed, not pinned)";
     }
     if (E.stats_on)
         std::fprintf(stderr, "strata-q36: stats: the expert arena (%.2f GiB) is %s\n", (double) host / (1024.0 * 1024.0 * 1024.0),
-                     pinned ? "cudaHostAlloc memory (pinned, default flags, no large pages)"
-                            : "malloc memory (cudaHostAlloc failed, not pinned)");
+                     how.c_str());
     size_t off = 0;
     E.hy.resize(all.size());
     for (size_t li = 0; li < all.size(); ++li) {
@@ -3936,6 +3975,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         // (native_expert_ff1024_test --bench), so the default is the Flash-Next selection
         static const bool one_token = std::getenv("STRATA_Q36_ONE_TOKEN_CPU") != nullptr;
         H.fmt.one_token_512 = one_token;
+        H.fmt.skim_tau = strata::q36::swiglu_skim_tau();   // STRATA_Q36_SWIGLU_SKIM (#110): this engine's experts only
         if (H.fmt.up_off != L.L.up_off || H.fmt.down_off != L.L.down_off || H.fmt.bytes != L.L.bytes) {
             err = "the CPU and GPU expert layouts differ";
             return false;
@@ -4049,10 +4089,12 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
                      (long long) ne);
     else
     std::fprintf(stderr, "strata-q36: hybrid experts: %d of %lld per layer in VRAM (%.2f GiB), all %.2f GiB in %s host "
-                 "memory, the rest of a batch of <= %d rows on %d CPU threads, bigger prompt chunks streamed (%.2f GiB "
-                 "staging); %.1f s\n", S, (long long) ne, (double) S * per_slot / (1 << 30), (double) host / (1 << 30),
-                 pinned ? "pinned" : "pageable", E.hybrid_t, E.pool->workers() + (E.pool->host_works() ? 1 : 0),
-                 (double) staging / (1 << 30), ms_since(t0) / 1000.0);
+                 "memory, the rest of a batch of <= %d rows on %d CPU threads (%d pool workers%s), bigger prompt chunks "
+                 "streamed (%.2f GiB staging); %.1f s\n", S, (long long) ne, (double) S * per_slot / (1 << 30),
+                 (double) host / (1 << 30), pinned ? "pinned" : "pageable", E.hybrid_t,
+                 E.pool->workers() + (E.pool->host_works() ? 1 : 0), E.pool->workers(),
+                 E.pool->host_works() ? " + the host thread, not pinned" : "", (double) staging / (1 << 30),
+                 ms_since(t0) / 1000.0);
     return true;
 #endif
 }
@@ -4884,6 +4926,8 @@ int strata::qwen35::run(int argc, char** argv) {
     double expert_vram = -1.0;
     float cache_prior = 0.0f, ser_t = 0.0f;   // routing options, off
     int ser_kmin = 8;
+    std::string ser_opt;                      // the SER option given: "--ser" or "--ser-pool"
+    bool ser_pool = false;
     strata::q36::PcieOption pcie;   // the PCIe share of the missed experts: off by default, --pcie-frac F or auto
     bool warm = true;
     int expert_slots = 0, batch = 0, draft_vocab = -1;
@@ -4942,16 +4986,23 @@ int strata::qwen35::run(int argc, char** argv) {
             }
         }
         else if (a == "--cache-prior") cache_prior = (float) std::atof(next().c_str());   // 0 off, else in (0, 1]
-        else if (a == "--ser") {                                                          // Kmin,t
+        else if (a == "--ser" || a == "--ser-pool") {                                     // Kmin,t; --ser-pool cuts only the picks outside the slots
             const std::string v = next();
             char* end = nullptr;
             const long k = std::strtol(v.c_str(), &end, 10);
             const bool comma = end != nullptr && *end == ',';
             ser_t = comma ? (float) std::atof(end + 1) : -1.0f;
             if (!comma || k < 1 || k > 8 || !(ser_t >= 0.0f && ser_t <= 1.0f)) {
-                std::fprintf(stderr, "strata-q36: --ser must be Kmin,t with 1 <= Kmin <= 8 and 0 <= t <= 1 (got '%s')\n", v.c_str());
+                std::fprintf(stderr, "strata-q36: %s must be Kmin,t with 1 <= Kmin <= 8 and 0 <= t <= 1 (got '%s')\n", a.c_str(), v.c_str());
                 return 2;
             }
+            if (!ser_opt.empty() && ser_opt != a) {
+                std::fprintf(stderr, "strata-q36: --ser and --ser-pool cannot be combined: --ser cuts every pick below Kmin, --ser-pool "
+                                     "only those outside the VRAM slots. Use one of them\n");
+                return 2;
+            }
+            ser_opt = a;
+            ser_pool = a == "--ser-pool";
             ser_kmin = (int) k;
         }
         else if (a == "--kv") {                                                    // fp32 (default) | q4, as setup writes it
@@ -4974,7 +5025,7 @@ int strata::qwen35::run(int argc, char** argv) {
                          "usage: strata-q36 --model GGUF [--max-context 32768] [--chunk 512] [--no-graph] [--kv fp32|q4]\n"
                          "       [--rope-scaling none|linear|yarn [--rope-scale F] [--rope-orig-ctx N]]\n"
                          "       [--expert-profile FILE] [--expert-profile-save FILE] [--pcie-frac F|auto]\n"
-                         "       [--cache-prior L] [--ser Kmin,t]\n"
+                         "       [--cache-prior L] [--ser Kmin,t | --ser-pool Kmin,t]\n"
                          "       (--serve | --tokens IDS [--n 64] [--force IDS] [--dump-full-logits F] | --bench-pp N "
                          "--bench-tg N)\n");
             return 2;
@@ -5025,37 +5076,52 @@ int strata::qwen35::run(int argc, char** argv) {
                                                                : (double) experts <= expert_vram * (double) (1ull << 30));
         chunk = fits ? 512 : 2048;
         const double GiB = (double) (1ull << 30);
+        // the sessions' K / V caches past the 8192 cells the measured buffers held, 50 KB per cell and session
+        const int ns = std::max(1, batch);
+        size_t n_attn = m.has_mtp ? 1 : 0;
+        for (const Layer& L : m.layers) n_attn += L.attn ? 1 : 0;
+        const size_t kv_cell = kv_cell_bytes_for(kv_q4, m.g.head_dim);
+        const double kv_one = (double) (n_attn * 2 * (size_t) m.g.n_head_kv * kv_cell);   // 45056 on Qwen3.6-35B (11 planes)
+        // per cell: the fp16 copies the prompt attention keeps.  5120 B is what was measured on Qwen3.6-35B-A3B; the formula
+        // 2 (K, V) x n_head_kv x head_dim x 2 B gives 2048 there, so the constant stays: in fp32 k16 / v16 grow with the
+        // context and it counts them; in q4 they hold one kKvWindow window, so that part drops
+        const double kv_f16_cell = 4.0 * (double) m.g.n_head_kv * (double) m.g.head_dim;
+        const double kv_shared = kv_q4 ? 5120.0 - kv_f16_cell : 5120.0;
+        const double sess_extra = std::max(0.0, (double) ctx * (kv_one * ns + kv_shared) - 8192.0 * (kv_one + kv_shared));
         if (fits && expert_vram < 0) {
             // a bigger prompt chunk feeds the MMQ expert kernels more rows per expert (R9700, UD-Q4_K_XL, pp4096: 512 3390, 1024
             // 4495, 2048 5353, 4096 5750 tok/s): the largest that fits beside the experts.  Its buffers grow by about 0.5 MiB per
-            // token (measured 0.47: 1.66 GiB more at 4096 than at 512), the sessions' K / V caches by 50 KB per cell and session.
+            // token (measured 0.47: 1.66 GiB more at 4096 than at 512), the sessions' K / V caches by sess_extra.
             // With several slots a long prompt would hold the other slots' windows for a whole chunk: 1024 at most there.
             // (measured on a 32 GB R9700 at 8192 cells, 512 chunk: 1.77 GiB of buffers + K / V; the free room after init must still hold
             // every expert and the 0.77 GiB reserve, or place_experts gives the packed decode copies back - slower decode - or goes hybrid)
-            const int ns = std::max(1, batch);
-            size_t n_attn = m.has_mtp ? 1 : 0;
-            for (const Layer& L : m.layers) n_attn += L.attn ? 1 : 0;
-            const size_t kv_cell = kv_cell_bytes_for(kv_q4, m.g.head_dim);
-            const double kv_one = (double) (n_attn * 2 * (size_t) m.g.n_head_kv * kv_cell);   // 45056 on Qwen3.6-35B (11 planes)
-            // per cell: the fp16 copies the prompt attention keeps.  5120 B is what was measured on Qwen3.6-35B-A3B; the formula
-            // 2 (K, V) x n_head_kv x head_dim x 2 B gives 2048 there, so the constant stays: in fp32 k16 / v16 grow with the
-            // context and it counts them; in q4 they hold one kKvWindow window, so that part drops
-            const double kv_f16_cell = 4.0 * (double) m.g.n_head_kv * (double) m.g.head_dim;
-            const double kv_shared = kv_q4 ? 5120.0 - kv_f16_cell : 5120.0;
-            const double sess_extra = std::max(0.0, (double) ctx * (kv_one * ns + kv_shared) - 8192.0 * (kv_one + kv_shared));
             const int cap = ns > 1 ? 1024 : 4096;
             for (int c : {4096, 2048, 1024})
-                if (c <= cap && (double) experts + 2.75 * GiB + (double) (c - 512) * 0.5 * 1048576.0 + sess_extra <= (double) fr_raw) {   // (no give-back of the packed decode copies for a bigger chunk)
+                if (c <= cap && strata::q36::forced_chunk_need(c, (double) experts + sess_extra) <= (double) fr_raw) {   // (no give-back of the packed decode copies for a bigger chunk)
                     chunk = c;
                     break;
                 }
         } else if (!fits) {
-            // the hybrid mode: 2048 (a chunk streams every layer's experts over PCIe once); a small card, where the chunk's buffers
-            // would take the slots' room, falls back to less
+            // the hybrid mode: hybrid_prompt_chunk (q36_rules.hpp), 2048 by default, 4096 on a big card with one session and automatic
+            // slots, less on a small card where the chunk's buffers would take the slots' room
             const double fr_gib = (double) fr / GiB;
-            chunk = fr_gib >= 7.5 ? 2048 : fr_gib >= 5.5 ? 1024 : 512;
+            chunk = strata::q36::hybrid_prompt_chunk(fr_gib, std::max(1, batch), expert_slots <= 0 && expert_vram < 0);
         }
-        if (const char* cv = std::getenv("STRATA_Q36_CHUNK")) chunk = std::max(256, std::min(4096, std::atoi(cv)));   // force a chunk (512: the old default)
+        if (const char* cv = std::getenv("STRATA_Q36_CHUNK")) {
+            // force a chunk (512: the old default), up to 8192 for the #104 measurement.  Above the auto cap of 4096, the room
+            // the auto rule asks beside the buffers (2.75 GiB + 0.5 MiB per token over 512) must be free; when every expert fits,
+            // they and the sessions' K / V keep their room too, measured as the auto rule does (before the packed copies count as given back)
+            chunk = std::max(256, std::min(8192, std::atoi(cv)));
+            const bool all_in = fits;   // every expert in VRAM, in the free room or in --expert-vram's budget
+            const double need = strata::q36::forced_chunk_need(chunk, all_in ? (double) experts + sess_extra : 0.0);
+            const double room = all_in ? (double) fr_raw : (double) fr;
+            if (chunk > 4096 && room < need) {
+                std::fprintf(stderr, "strata-q36: STRATA_Q36_CHUNK %d needs %.2f GiB of VRAM beside the engine%s, %.2f GiB free%s: "
+                             "use a chunk of 4096 or less\n", chunk, need / GiB, all_in ? " (every expert included)" : "", room / GiB,
+                             all_in ? "" : " (the packed Q8_0 copies included)");
+                return 1;
+            }
+        }
         if (std::getenv("STRATA_Q36_PLACE_DEBUG"))
             std::fprintf(stderr, "strata-q36: chunk rule: free %.2f GiB (raw %.2f, with %.2f packed), main experts %.2f GiB, chunk %d\n",
                          fr / 1073741824.0, fr_raw / 1073741824.0, packed / 1073741824.0, experts / 1073741824.0, chunk);
@@ -5118,6 +5184,23 @@ int strata::qwen35::run(int argc, char** argv) {
         }
         E.verify_alloc();
     }
+    // STRATA_Q36_SER_TABLE: each main layer's Kmin, read now that the layer count is known (parse_ser_table, q36_rules.hpp)
+    const char* ser_table_path = std::getenv("STRATA_Q36_SER_TABLE");
+    std::vector<int> ser_kmin_layer((size_t) m.layers.size(), ser_kmin);
+    if (ser_table_path) {
+        std::ifstream f(ser_table_path);
+        if (!f) {
+            std::fprintf(stderr, "strata-q36: STRATA_Q36_SER_TABLE: cannot read %s\n", ser_table_path);
+            return 2;
+        }
+        std::stringstream text;
+        text << f.rdbuf();
+        std::string err;
+        if (!strata::q36::parse_ser_table(text.str(), (int) m.layers.size(), ser_kmin, &ser_kmin_layer, &err)) {
+            std::fprintf(stderr, "strata-q36: STRATA_Q36_SER_TABLE %s: %s\n", ser_table_path, err.c_str());
+            return 2;
+        }
+    }
     // the routing options that cannot hold their state or cannot apply are refused here, before anything runs
     if (cache_prior > 0.0f && E.n_sess > 1) {
         std::fprintf(stderr, "strata-q36: --cache-prior needs one session (--batch %d decodes %d at once): its Delta_avg state "
@@ -5134,9 +5217,9 @@ int strata::qwen35::run(int argc, char** argv) {
                      "expert resident there is no slot miss to bias\n");
         return 2;
     }
-    if ((cache_prior > 0.0f || ser_kmin < (int) m.top_k) && !E.fast_route()) {
-        std::fprintf(stderr, "strata-q36: --cache-prior and --ser need the fast routing path (STRATA_Q36_OLD_KERNELS unset, 256 "
-                     "experts, 8 picks); this model or setting is not on it\n");
+    if ((cache_prior > 0.0f || ser_kmin < (int) m.top_k || ser_table_path) && !E.fast_route()) {
+        std::fprintf(stderr, "strata-q36: --cache-prior, --ser, --ser-pool and STRATA_Q36_SER_TABLE need the fast routing path (STRATA_Q36_OLD_KERNELS "
+                     "unset, 256 experts, 8 picks); this model or setting is not on it\n");
         return 2;
     }
     struct Report {
@@ -5159,9 +5242,19 @@ int strata::qwen35::run(int argc, char** argv) {
     E.cache_prior = cache_prior;
     E.ser_kmin = ser_kmin;
     E.ser_t = ser_t;
-    if (cache_prior > 0.0f || ser_kmin < (int) m.top_k)
-        std::fprintf(stderr, "strata-q36: routing options on: cache prior %g, SER Kmin %d t %g (decode and verify windows of up to 8 rows)\n",
-                     (double) cache_prior, ser_kmin, (double) ser_t);
+    E.ser_pool = ser_pool;
+    E.ser_kmin_layer = ser_kmin_layer;
+    if (cache_prior > 0.0f || ser_kmin < (int) m.top_k || ser_table_path)
+        std::fprintf(stderr, "strata-q36: routing options on: cache prior %g, SER Kmin %d t %g%s (decode and verify windows of up to 8 rows)\n",
+                     (double) cache_prior, ser_kmin, (double) ser_t, ser_pool ? " (--ser-pool: outside the VRAM slots only)" : "");
+    if (ser_pool && !E.main_hybrid && ser_kmin < (int) m.top_k)
+        std::fprintf(stderr, "strata-q36: --ser-pool with every main layer's experts in VRAM: it cuts no pick there\n");
+    if (ser_table_path) {
+        int below = 0;
+        for (int k : ser_kmin_layer) below += k < (int) m.top_k;
+        std::fprintf(stderr, "strata-q36: SER table %s: %d of %zu main layers at a Kmin below %d\n", ser_table_path, below,
+                     ser_kmin_layer.size(), (int) m.top_k);
+    }
     E.reset();
     E.mtp_d = m.has_mtp ? mtp_d : 0;
     if (draft_vocab < 0 && std::getenv("STRATA_Q36_DRAFT_VOCAB") != nullptr) draft_vocab = std::atoi(std::getenv("STRATA_Q36_DRAFT_VOCAB"));

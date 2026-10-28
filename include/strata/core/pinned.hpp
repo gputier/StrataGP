@@ -43,7 +43,8 @@ struct PinnedArena {
 
     PinnedArena() = default;
     /// `slice`: the piece size for the per-slice registration fallback (0 = none).
-    explicit PinnedArena(uint64_t bytes, uint64_t slice = 0);
+    /// `lock_on_register_failure`: false leaves an arena that CUDA refuses unlocked, for a caller that releases it.
+    explicit PinnedArena(uint64_t bytes, uint64_t slice = 0, bool lock_on_register_failure = true);
     /// Plan v0.3 P6: slices of different sizes (one per layer of a native pack), given as their start offsets
     /// followed by the end of the last one.  `slice_starts` holds the registered ones.
     /// `max_pinned_bytes`: optional cap on CUDA registration. 0 preserves the normal unrestricted path.
@@ -52,7 +53,8 @@ struct PinnedArena {
     /// small header and is refused when its stored hash does not match.  Empty `shared_file` preserves the
     /// existing allocation path.  Population/coordination and backing-file lifetime remain the caller's job.
     PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes = 0,
-                const std::string& shared_file = {}, uint64_t shared_pack_hash = 0);
+                const std::string& shared_file = {}, uint64_t shared_pack_hash = 0,
+                bool lock_on_register_failure = true);
     /// Pin by need (STRATA_PIN_BY_NEED=1): register only the given byte ranges (offset, length), in the given order
     /// (the caller's priority: the hottest experts the GPU does not hold first), each rounded out to 4 KiB pages and
     /// trimmed against the ranges already registered; stops at the first refusal of the driver (the WDDM budget is

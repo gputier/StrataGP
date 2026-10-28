@@ -21,6 +21,18 @@ Figures marked "calculated" are arithmetic on measured values, not measurements.
 The branch is faster than its start under the 24 GB working-set cap (see below). No uncapped comparison with the start exists; the uncapped series of 24 October measured the branch alone (see its section). The N5 build (task 5) gave a KL of 0.0455 and 299 of 320; the start was not measured on this test. The target of 100 tokens/s is
 not reached. By owner decision of 23 October 2026, there is no fixed throughput threshold: each result is judged case by case.
 
+Prompt chunk size, issue #104. Measured on 25 October 2026 on the test PC without the cap (rev8, main's code, defaults otherwise, `STRATA_Q36_STATS=1`), one 34,257-token prompt then 300 decode tokens, three launches per setting alternated. `STRATA_Q36_CHUNK=2048` (then the hybrid default): 77 of 256 experts per layer in VRAM, prompt read in 15.21 s (2,252.3, 2,252.2 and 2,251.8 tokens/s), then 30.7, 30.6 and 30.8 tokens/s of decode. `STRATA_Q36_CHUNK=4096`: 68 per layer, prompt read in 9.37 s (3,656.2, 3,656.9 and 3,653.5 tokens/s, 62 % faster), then 30.4, 30.5 and 30.5 tokens/s. At short context the decode fell from 46.8 to 44.9 tokens/s on average (4 % slower, 9 fewer slots per layer). With fewer than half the experts of a layer in a slot, `stream_kick` copies the whole layer, 48.07 GiB per chunk (`q36_engine.cu:2826`): at chunk 2048 the read runs at the probed PCIe rate (calculated). The design note `docs/Q36_LAYER_MAJOR_PROMPT.md` weighs the next steps: giving back the slots the chunk buffers take, then a bigger default chunk, and a layer-major read only if the compute floor stays far below the copy time. The bigger default has shipped as a hybrid rule: with one session, the chunk is 4096 from 20 GiB free, 2048 from 7.5 GiB, 1024 from 5.5 GiB and 512 below (`hybrid_prompt_chunk`, `src/qwen35/q36_rules.hpp:42`, called at `src/qwen35/q36_engine.cu:5093`; `STRATA_Q36_CHUNK` still overrides it, `:5095`). The 4096 step needs automatic slots: with `--expert-slots` given by hand the packed Q8_0 copies are kept, and the 62 slots fit beside a 2048 chunk but not beside 4096 (measured below). With several sessions it stays 2048, because a chunk holds the other sessions' decode windows for its whole length. The verification series of 25 October 2026 ran on the test PC (RTX 5090, 128 GB RAM), new build against the previous one. Identity: the six parity prompts p00 to p05, forced greedy with full logits, `STRATA_Q36_FIXED_SLOTS=1 --expert-slots 52 --pcie-frac 0`: the old build at `--chunk 4096` and the new build at `--chunk auto` gave byte-identical dumps, 6 of 6. The new build's chunk rule line read "free 23.21 GiB (raw 19.41, with 3.80 packed), main experts 46.83 GiB, chunk 4096". The 62 slots, the count first planned, do not fit beside the 4096 chunk when the slots are given by hand (14,576 MiB needed, 13,645 free), because the packed Q8_0 copies are then kept. Server, `tools/ornith/measure_partition.ps1`, one launch per setting, alternated, three launches each, `STRATA_Q36_STATS=1`: the 34,257-token prompt was read in 9.37 s by default (3,656.6, 3,655.7 and 3,654.4 tokens/s) against 15.21 s with `STRATA_Q36_CHUNK=2048` (2,252.0, 2,251.9 and 2,251.9 tokens/s); 300 decode tokens after it ran at 30.5, 30.5 and 30.4 tokens/s against 30.7, 30.7 and 30.6. Experts per layer in VRAM: 67 by default against 76 at 2048 (engine line "67 instead of 47 per layer" and "76 instead of 56"). Long prompt, one launch each: the 128K request of an earlier run with its whitespace collapsed, 112,768 tokens, was read in 49.98 s (2,256.5 tokens/s) by default against 66.14 s (1,704.9 tokens/s) at 2048, 32 % faster; 128 decode tokens after it ran at 19.6 against 20.7 tokens/s. Short-context decode on the 256-token warm-up of those two launches: 44.8 against 47.0 tokens/s. The issue's criterion (chunk 8192 on the 127,685-token prompt) is not met, because `STRATA_Q36_CHUNK` and `--chunk` are capped at 4096. Issue #104 stays open.
+
+Code change for the 8192 measurement: `STRATA_Q36_CHUNK` now accepts up to 8192 (`src/qwen35/q36_engine.cu:5095`), while `--chunk` (refused above 4096) and the default (`hybrid_prompt_chunk`, at most 4096) are unchanged. Above 4096 the forced chunk refuses at start, with a message, when the free VRAM is below 2.75 GiB + 0.5 MiB per token over 512 (`:5103`, the room the auto rule asks beside the buffers), plus every expert and the sessions' K / V past 8192 cells when the experts all fit in VRAM, counted before the packed copies are given back as the auto rule does (both use `forced_chunk_need`, `src/qwen35/q36_rules.hpp:51`). In hybrid mode, the test PC's case, the experts are not counted: the slots per layer of 4096 and 8192 then differ, and the series reads them. Read against the code at 8192: the buffers are allocated with `size_t` sizes (`:1919` to `:1958`), so the `int` products stay under 2^31 (the routed rows `T * Kp` are 65,536, `:2951` and `:3086`, and any product of them with a dimension under 32,768 fits; `n_embd` and the expert width are not read from the GGUF here); the prompt kernels launch with `T` as grid y (`:2527`, `:2552`, `:2573`), 8,192 under the 65,535 limit; the split-K attention runs only for `T <= 8` (`:2634`, `:2638`); the prompt attention's score buffer is fixed at 64 M floats, so the query slice shrinks instead (`:1481`, `:2592`); the logits buffer holds `kVerify` rows, not the chunk (`:1924`), and the MTP verify window stays at 8.
+
+Measured on 26 October 2026 on the test PC, rev16, with `STRATA_Q36_STATS=1`, `STRATA_Q36_PLACE_DEBUG=1`, `--max-context 409600`, `--mtp 1`, 300 tokens after 256 warm-up tokens, three alternating runs, medians, 4096 against 8192. Short decode: 51.7 against 39.7 tokens/s (-23 %). Prompt read of 34,257 tokens: about 3,508 against 3,752 tokens/s (+7 %). Decode after 34K: 34.6 against 27.4 tokens/s. Prompt read of 112,768 tokens: about 2,125 against 2,186 tokens/s (+2.9 %). Decode after 112K: 22.5 against 20.5 tokens/s. Slots per layer: 67 against 50. Free VRAM after placement: 11.91 against 8.63 GiB.
+
+At 52 fixed slots, 8192 refuses to start, with this message: `strata-q36: not enough VRAM left for the hybrid experts' buffers and slots (13038 MiB needed, 10287 MiB free after the weights, the context and the sessions): use fewer slots ("parallel" / --batch), a shorter --max-context, or fewer --expert-slots`.
+
+Identity with automatic slots: 8192 against 4096 gives 0 of 6 identical outputs (SHA256). The 4096 against 4096 witness, with two separate launches, automatic slots and `--mtp 0`, gives 6 of 6 identical. The witness runs on rev17 and the 8192 comparison on rev16; the rev17 guard changes nothing in hybrid mode (commit `49b6157e`). The gap therefore comes from the 8192 setting and the placement it changes, not from non-determinism.
+
+The regime of the day is slower than on 25 October at 112K (2,125 against 2,256.5 tokens/s at 4096) and faster at short decode (51.7 against 44.8). The cause is not established. The default stays at 4096; 8192 stays a measurement option.
+
 Without the cap, one series run outside the protocol gave 43.2 tokens/s for the branch against 43.8 for the start at
 1,024 tokens, and 18.8 against 17.2 at 128K. The memory guard was not armed in that run, free memory fell to 703 MB, and
 the series does not count as a result. The first uncapped measurement under the protocol completed on 24 October 2026: 41.40 tokens/s for the default (see the uncapped series section).
@@ -32,6 +44,12 @@ tokens each, with `STRATA_Q36_FIXED_SLOTS=1 --pcie-frac 0 --expert-slots 62 --cp
 placement of expert slots changes over the steps, and the output can change from one run to the next.
 
 Logit determinism (issue #71). On the test PC, 40 forced greedy runs of p00 were made from the CLI (62 slots, chunk 2048, `--pcie-frac 0`, yarn scale 1), with the full logits dumped and each row compared bit for bit with the first run. This branch gave 40 of 40 identical runs with the CUDA graph, 40 of 40 with `--no-graph` and 40 of 40 with `--cpu-threads 16`. Main (ac27f23f) gave 40 of 40 with the graph. The divergence reported in #71 (one of eleven resumed runs, on branch feat/ornith-122b at e82d1fc3) did not reproduce in 160 runs, so its first differing step and its cause are not identified.
+
+Server-side check for #71 (`tools/ornith/bench71_server.ps1`), run on 25 October 2026 on the test PC with main plus #96 (rev9), 8,192 cells per session (three sessions with 62 slots do not fit at 16,384: 14,384 MiB needed, 14,231 free). With the defaults, 5 of the 5 resumed runs under load differed from run 00, from the 21st, 40th or 127th character ("Thornwood Light for eleven years" against "Blackwood Light for thirty-one years"). With `STRATA_Q36_FIXED_SLOTS=1` and nothing else changed, 5 of 5 were identical to their run 00. A `-Trial` run of the script in its committed form diverged again at the 21st character. So the divergence follows the slot placement: the rebalances move experts between the VRAM slots and the CPU pool according to every session's routing (367 slot replacements after the prompt in one run), the two paths do not round an expert's output the same way, and the greedy choice flips when two logits are close. A single session repeats its own placement, which is why 160 CLI runs were all identical. The original divergence happened in the server while other sessions decoded; the CLI bench does not recreate that. The script starts one `serve/server.py` process (config with `"parallel": 3`, engine arguments `--expert-slots 62 --chunk 2048 --pcie-frac 0 --rope-scaling yarn --rope-scale 1`, plus `-ExtraArgs` and `-ExtraEnv`), keeps two greedy long-answer requests in flight (`-LoadTokens`, default 4096) and resumes p00 `-Runs` times (default 40, `-Trial` runs 2) in greedy decoding, each time with both loads decoding. Its start checks and its server stop live in `tools/ornith/ornith_server_common.ps1`, shared with `measure_partition.ps1`. It refuses to start when a `gitlab-runner*` VM is not Off, when `strata.exe`, `strata-q36.exe` or `llama-server` runs, when free RAM is under `-MinFreeGiB`, when the GPU holds more than `-MaxIdleGpuMiB`, when the port answers, when `-OutDir` exists or when a path parameter holds a double quote, and it stops the server by its process tree at the end and on any failure. Run: `powershell -File tools\ornith\bench71_server.ps1 -BuildDir <build> -OutDir <new folder> [-Trial]`. `status.txt` has one START, DONE and CMP line per run, then RESULT.
+
+Greedy resume under load is not meant to repeat token for token. With the defaults, while other sessions decode, the rebalance moves experts between the VRAM slots and the CPU pool according to the routing of all the sessions. An expert computed on the CPU does not add its terms in the same order as on the GPU, so a greedy resume can give another text. This is the intended behavior (decision of 26 October 2026, issue #106), as for the logits in #71: the output may vary under load as long as it stays correct. The quality is bounded by the KL of the defaults: 0.0513 on p00 to p09 (bar 0.061), top-1 300 of 320 (rev13, 26 October 2026). For an identical output from one run to the next (tests, comparisons), `STRATA_Q36_FIXED_SLOTS=1` freezes the slots: 5 of 5 resumed runs were identical on 25 October 2026, at the price of the rebalance gains, 2.6 to 6.9 % of throughput depending on the series.
+
+The server takes only chat messages (it templates and tokenizes itself, so `p00.ids` and the teacher forcing of `p00.force` cannot be sent) and returns text, `usage` counts and `finish_reason`, with no token ids and no logprobs. So the script compares text, not tokens: the answer text and `usage.completion_tokens` of each run against run 00, and it reports the first differing character. It sends p00's user message, checks that `p00.ids` is line 1 of `tools/qwen35/parity_prompts.ids` and that the server read as many prompt tokens as `p00.ids` holds, and asks for as many tokens as `p00.force` holds plus one. A SAME verdict shows that the greedy token choices were the same under load. It does not show that the logits were identical to the bit, which the CLI bench's full-logit dump does. A DIFF verdict is a real change in the server's greedy output. RESULT also counts the runs that had both loads decoding at their start and end.
 
 Forced logits and KL. The engine receives the token sequence of llama.cpp b11756 and returns its logits at each step.
 The comparison uses ten prompts of 32 steps and reports the mean KL divergence and the share of steps where the top-1
@@ -90,6 +108,51 @@ tokens/s. The plan had assumed 6.5 GB/s for the pool, which the measurement disp
 about 57 GB/s from four threads. A three-token window touches 79 % of the expert slots that three separate tokens would use, at best a 21 % saving. A token
 took 37.7 ms: 16.6 ms in the pool, 8.9 ms waiting for the GPU. Large pages were not available: the process lacks
 `SeLockMemoryPrivilege`.
+
+### Expert arena in large pages (25 October)
+
+The expert arena, about 34 GB of expert blobs in host memory, is built by `PinnedArena` (`include/strata/core/pinned.hpp`,
+`src/qwen35/q36_engine.cu`, `place_experts`). It asks for large pages first: on Windows, `VirtualAlloc(MEM_LARGE_PAGES)`,
+which needs `SeLockMemoryPrivilege`; otherwise 4 KB pages (`reserve`, `src/core/pinned.cu:91-146`, called by the constructor at `:401`). The arena is registered with CUDA
+before any page is touched. If the registration does not cover the whole arena, the engine releases it and falls back to
+`cudaHostAlloc`, then to malloc, as before, and prints a warning that names the refusal. Since #118 (26 October 2026),
+`place_experts` builds this arena with `lock_on_register_failure = false` (`src/qwen35/q36_engine.cu:3904`), so an arena that
+CUDA refuses is not locked resident before it is released: `src/core/pinned.cu:492` skips `lock_resident` there, and the
+destructor unlocks nothing (`locked_bytes` stays 0).
+
+On the .99, CUDA accepts the registration: rev16 prints the same stats line as rev15 (26 October 2026):
+
+`strata-q36: stats: the expert arena (48.07 GiB) is large pages pinned by CUDA registration (cudaHostRegister PORTABLE ok; large pages (2097152 B))`
+
+The start-up time on a machine where CUDA refuses the registration is not measured.
+
+- `STRATA_NO_LARGEPAGES=1` forces 4 KB pages. No new variable was added.
+- `STRATA_ARENA_PIN_GIB` does not cap this arena. It caps only a registration by slices (`PinnedArena` given `bounds`,
+  `src/core/pinned.cu:421`), and `place_experts` registers the arena in one block, so the variable has no effect on it (read in
+  the code on 26 October 2026).
+- `STRATA_Q36_STATS=1` prints the backing actually used: large pages, 4 KB pages pinned by registration, or the
+  `cudaHostAlloc` fallback.
+- Prerequisite on Windows: the account that runs the engine needs `SeLockMemoryPrivilege`. The Ornith box's account did not
+  have it on 25 October 2026 (`whoami /priv`). It has had it since 26 October 2026, as `whoami /priv` shows in a new ssh
+  session, without restarting the machine.
+- Measured on 26 October 2026, rev12 against rev13 (fixed slots, `--cpu-threads 6`, rebalance every 8, p00 to p05): the
+  stats line reads `stats: the expert arena (48.07 GiB) is 4 KB pages pinned by CUDA registration (... large pages refused
+  ... VirtualAlloc error 1314; using 4 KB pages)`. Error 1314 is `ERROR_PRIVILEGE_NOT_HELD`, so the privilege was still missing.
+  The full logits are byte-identical between rev12 and rev13 on six of six prompts.
+- Measured on 26 October 2026, rev15 (commit `0715a998`, `--max-context 409600`, `--mtp 1`), in a series of 12 passes with one
+  cold start each: 300 tokens after 256 of warm-up, three alternated rounds. L is the default, with large pages; N is
+  `STRATA_NO_LARGEPAGES=1`. All 12 passes exited with code 0. The stats line reads `large pages pinned by CUDA registration`
+  for L and `4 KB pages pinned by CUDA registration` for N.
+  - Short prompt: L 52.4 tokens/s median (52.2, 52.4, 52.8), N 51.8 (51.8, 51.7, 52.2), so +1.2 %.
+  - After a 34K-token prompt: L 34.4 tokens/s median (34.3, 34.4, 34.6), N 33.9 (33.8, 33.9, 34.4), so +1.5 %.
+  - L is ahead of N in all six pairs.
+  - CPU pool read rate on the line phases: 55.50 GB/s for L against 54.54 for N (short), 55.72 against 54.50 (long). Median
+    pool time at the long prompt: 4969 ms against 5079 ms.
+  - Accepted MTP drafts are identical: 117 of 182 short, 115 of 184 long. Both backings run the same computation.
+  - The gain is 1 to 2 %, smaller than the gap between two sessions (rev14 gave 53.1 to 53.4 tokens/s on the short prompt
+    in the morning), so it is valid only within this alternated series.
+  - Limit: the Ornith service runs the installed engine `E:\ornith\build` (origin/main fe794ac7), which has no large-page
+    arena. The service gets the gain only after this branch is deployed.
 
 ### Identity bisection (21 October)
 
@@ -250,6 +313,25 @@ Parity: six greedy prompts in fixed slots, 128 tokens each, give identical conte
 
 Reading (an interpretation of the figures above, not a separate measurement): without the cap, a larger PCIe share is slower. The default 0.15 beats 0.50 and 0.55 by about 5.6 tokens/s, because the host time outside the pool rises from 1.4 to 8.5 ms per token. The fixed optimum of 0.50 to 0.55 found on 22 October was measured under the 24 GB cap and does not carry over. Rebalancing every 8 steps is the only setting that beats the default, and only by 3.5 % over two launches.
 
+On 26 October 2026 (13:16 to 13:27, test PC RTX 5090, 128 GB RAM), the same uncapped setup was measured with build rev15 (commit `0715a998`), `--max-context 409600`, `--kv q4`, `--mtp 1`, `STRATA_Q36_STATS=1`, large pages for the arena, and one cold launch per pass. Each launch is one 300-token request after 256 warm-up tokens. The short launches (`v21-lp-L-short-{1,2,3}`) send a prompt of 45 to 46 tokens; the long ones (`v21-lp-L-long-{1,2,3}`) send one of 34,257 tokens. The runner VMs (140, 141, 142) were off for the whole series, and free memory fell to 8.35 GiB at its lowest. The figures are from `tools/ornith/partition_summary.py`, which read all six launches without refusing one.
+
+| Launch | Tokens/s | Pool ms per token | Wait ms per token | Host outside pool, ms per token | Slow tokens above p95 (pool / wait / host / PCIe) |
+|---|---|---|---|---|---|
+| short-1 | 52.20 | 12.80 | 4.24 | 2.11 | 14 (13 / 1 / 0 / 0) |
+| short-2 | 52.40 | 12.76 | 4.25 | 2.07 | 14 (14 / 0 / 0 / 0) |
+| short-3 | 52.80 | 12.63 | 4.26 | 2.05 | 13 (13 / 0 / 0 / 0) |
+| long-1 | 34.30 | 16.63 | 10.42 | 2.09 | 14 (14 / 0 / 0 / 0) |
+| long-2 | 34.40 | 16.56 | 10.41 | 2.13 | 14 (14 / 0 / 0 / 0) |
+| long-3 | 34.60 | 16.39 | 10.42 | 2.13 | 13 (13 / 0 / 0 / 0) |
+
+The medians are 52.40 tokens/s for the short launches and 34.40 for the long ones. Per token, the CPU pool takes 12.76 ms short and 16.56 ms long, the wait on the GPU 4.25 ms and 10.42 ms, and the host outside the pool 2.07 ms and 2.13 ms. Of the 41 slow tokens of the short launches, 40 were attributed to the pool and 1 to the wait on the GPU. All 41 of the long launches were attributed to the pool. None was attributed to the host or to PCIe. In the slow steps, the pool took 72 to 74 % of the time short and 64 % long, and the wait 18 % short and 29 to 30 % long. The pool's share of the excess over the median step was 92 to 97 % short and 95 to 99 % long.
+
+The PCIe figure is n/a in these launches, not zero by measurement. The path is off by default (`PCIe share 0.00`, 0.0 MB per token over PCIe), so the engine prints no wire window line. The script's PCIe per-step figure divides the copies' busy time by the request's decode steps, the `N steps` of its decode steps line (`tools/ornith/partition_summary.py:333`). Only a log without that line falls back to the token count, which equals the step count only with `--mtp 0`, and the launch is then marked approximate. No PCIe copies were recorded here, so this changes no figure in this paragraph.
+
+With `--mtp 1`, one decode step gives one or two tokens. The short launches ran 182 steps for 300 tokens, and the long ones 184, about 1.6 tokens per step. The per-token partition above is each counter of the request divided by its 300 tokens, as the script's header states (`tools/ornith/partition_summary.py:1-46`). Per step, the median is 21.6 to 21.9 ms in the pool, 7.0 ms in the wait and 3.2 to 3.3 ms on the host short, and 26.2 to 26.6 ms, 17.7 ms and 3.3 ms long. Each slow token is matched to the decode step that produced it: the gap before a step's first token is that step's time.
+
+Against the 25 October series above (PCIe share 0.55, `--mtp 0`, 43.6 tokens/s, 13 slow tokens: 11 in the pool and 2 in PCIe), the 26 October launches make 81 of their 82 slow tokens in the pool and one in the wait, with the PCIe path off. Reading (an interpretation, not a separate measurement): the CPU pool is what makes a token slow at both short and long context. Long context adds the GPU wait, 10.4 ms per token against 4.3 ms, and it takes a larger share of the slow steps' time, but it makes no slow token by itself.
+
 ### New defaults (owner decision, 25 October 2026)
 
 Two defaults changed from these measurements, taken on the same test PC (RTX 5090, 128 GB RAM, Ryzen 9 9950X3D), decode, one 300-token prompt, three launches per setting, alternated. The table is the decision series: measured on 25 October, before this branch's code existed, with the settings passed by option and environment variable.
@@ -262,7 +344,7 @@ Two defaults changed from these measurements, taken on the same test PC (RTX 509
 | Both | 46.5 |
 | Any `--pcie-frac` from 0.05 to 0.30 | about 42.5 |
 
-The PCIe path costs as soon as it is active, whatever the share. So the rebalance cadence default is now 8 (`STRATA_Q36_REBALANCE_EVERY`, bounds unchanged), and without `--pcie-frac` the PCIe share is 0: no probe at load, the path off. `--pcie-frac F` (F > 0) works as before. The former automatic share (probe, PcieAuto, and `STRATA_Q36_PCIE_AUTO_STEP=1` on top) now needs `--pcie-frac auto`; `STRATA_Q36_PCIE_AUTO_STEP=1` without it prints that it was ignored. The engine's load line says which share is used and why. The earlier sections of this record describe the old defaults. The check, on the test PC the same day with this branch's binary (not the table's series), three launches alternated per setting: the new defaults gave 46.7, 46.7 and 46.6 tokens/s, against 43.7, 43.7 and 43.6 for the old defaults (`--pcie-frac auto` and `STRATA_Q36_REBALANCE_EVERY=32`), which is 6.9 % more. The load line of the new defaults reads: "PCIe share off (the default: --pcie-frac F or --pcie-frac auto turns it on)". With `--pcie-frac auto`, the probe measured 57.7 GB/s and set the share to 0.55.
+The PCIe path costs as soon as it is active, whatever the share. So the rebalance cadence default was then 8 (`STRATA_Q36_REBALANCE_EVERY`, bounds unchanged; superseded by 4 in the batch of 25 October 2026), and without `--pcie-frac` the PCIe share is 0: no probe at load, the path off. `--pcie-frac F` (F > 0) works as before. The former automatic share (probe, PcieAuto, and `STRATA_Q36_PCIE_AUTO_STEP=1` on top) now needs `--pcie-frac auto`; `STRATA_Q36_PCIE_AUTO_STEP=1` without it prints that it was ignored. The engine's load line says which share is used and why. The earlier sections of this record describe the old defaults. The check, on the test PC the same day with this branch's binary (not the table's series), three launches alternated per setting: the new defaults gave 46.7, 46.7 and 46.6 tokens/s, against 43.7, 43.7 and 43.6 for the old defaults (`--pcie-frac auto` and `STRATA_Q36_REBALANCE_EVERY=32`), which is 6.9 % more. The load line of the new defaults reads: "PCIe share off (the default: --pcie-frac F or --pcie-frac auto turns it on)". With `--pcie-frac auto`, the probe measured 57.7 GB/s and set the share to 0.55.
 
 Greedy text is not identical with the new defaults. With slots moving, `--mtp 2` and `--mtp 0` do not give the same text on the six parity prompts: the first difference comes after 15 to 622 characters. The new defaults and the fixed-slot setting at `--mtp 0` differ on five of six prompts. All the texts read as coherent answers, and the differences are word choices. The likely cause, an interpretation not measured here: with moving slots, the slot assignment depends on the routing counts, which include the drafts of a verify window, so which experts run on the GPU and which on the CPU changes, and the two round differently. Identity holds only with fixed slots.
 
@@ -276,6 +358,122 @@ At 1,024 tokens with `--max-context 4096`, the median falls to 98 µs. That run 
 
 The per-head re-read of the K/V cache is still a hypothesis. Testing it needs read counters. Nsight Compute cannot provide them on this box (see the operational pitfalls). No kernel change has been made.
 
+### Non-temporal prefetch on AVX-512 (#111, 26 October)
+
+Measured on 26 October 2026 (rev13, 409600, `--mtp 1`, three alternated rounds): 53.1 tokens/s with the non-temporal hint on the expert-weight prefetches, against 53.0 without. The CPU pool takes 12.65 to 12.80 ms per token with the hint, against 12.66 to 12.82 ms without. The output is identical to the byte on p00 to p05. The gap is within noise, so the variable is removed and the kernel keeps its T0 hint.
+
+### SwiGLU skim, option (#110, 26 October)
+
+`STRATA_Q36_SWIGLU_SKIM=<tau>` is off by default. Set, it cuts a neuron of an expert served by the CPU pool when |silu(g)| < tau, g being that neuron's gate value alone. A cut neuron has `ff` = 0, and its up row is still read: this is a quality measurement, not a speed change, since the up rows are not skipped yet. The rule is `swiglu_skim` in `include/strata/kernels/cpu/native_expert.hpp`: tau <= 0 cuts nothing, and a NaN gate is never cut. The option reaches the CPU pool's experts only. The VRAM slots and the GPU path do not change.
+
+Paths. Ornith's gate and up are IQ3_XXS and its down is IQ4_XS (line 70 above). On an AVX-512 CPU with the engine's defaults (`one_token_512` off, `src/qwen35/q36_engine.cu:3973`):
+- Two tokens or more (MTP verify windows): `native_gu_rows` (`src/kernels/cpu/native_expert.cpp:212`) takes the ggml-order kernel (line 272, the call at 277). `iq512_iq3xxs_gu_rows_ggml` (`src/kernels/cpu/iq_avx512.cpp:324`, rows in `gu_rows_ggml18` at :256) writes the gate and up sums, SwiGLU follows at `native_expert.cpp:282`, and the cut is a pass after it (line 284).
+- One token: `native_gu_mt_min` gives IQ3_XXS a threshold of 2 tokens (`native_gu_mt_min`, `native_expert.cpp:177`), so the lone token takes ggml-cpu's dot loop (`native_expert.cpp:330`). The cut is applied per neuron, after g is scaled.
+- Not covered: the AVX-512 gate/up kernel `iq512_gu_rows` (`iq_avx512.cpp:312`, SwiGLU at :249), reached only with `STRATA_Q36_ONE_TOKEN_CPU` or `STRATA_NO_IQ512_GGML_ORDER`; the AVX-2 and AVX-1 kernels (`STRATA_NO_IQ512`, or a CPU without AVX-512); the NVFP4 kernels. Nothing is cut on those rows, and they are left out of the counter, so the share the stats print covers the covered paths only.
+
+Counter. `native_gu_rows` counts each call's neurons (one token's gate and up row) and its cuts in a tally, which is added to the process totals once when the call returns (`native_swiglu_skim_totals`). The pool's tasks of a layer partition all expert rows once (`src/kernels/cpu/pool.cpp:757-761`), so each neuron is counted once per token. The q36 stats take the difference of two snapshots per request, and the `stats: pool` line shows it only when the option is set: "swiglu skim X.X % of N covered neurons". N counts the covered paths only: a token served by a path the skim does not cover adds nothing to it. The first call on each covered path logs it once, as `strata: STRATA_Q36_SWIGLU_SKIM <tau>: gate/up rows on the ggml-order kernel` or `... on ggml-cpu's dot`.
+
+Status. Measured on 26 October 2026 on the test PC (RTX 5090, 128 GB RAM, 9950X3D), with builds rev16 (series S1) and rev17 (series S2, commit `49b6157e`). Protocol: prompts p00 to p09, 32 steps each, `logit_cmp` against llama.cpp b11756, pass bar 0.061.
+
+Identity: with the option off, rev15 and rev16 give identical logits on 6 of 6 prompts (p00 to p05, SHA256 of the full logits).
+
+Calibration, tau against cut share, from the stats line of a 300-token launch: 0.002 gives 19.5 %, 0.01 gives 22.7 %, 0.02 gives 26.1 %, 0.03 gives 30.3 %, 0.05 gives 39.1 %, 0.052 gives 39.8 %, 0.08 gives 50.1 %, 0.1 gives 57.9 %, 0.2 gives 81.0 %.
+
+| tau | Cut share | Mean KL | Top-1 (of 320 steps) |
+| --- | --- | --- | --- |
+| off | 0 % | 0.0513 | 300 |
+| 0.002 | 19.5 % | 0.0420 | 300 |
+| 0.03 | 30.3 % | 0.0560 | 299 |
+| 0.052 | 39.8 % | 0.0703 | 297 |
+| 0.08 | 50.1 % | 0.0819 | 300 |
+
+The 0.061 bar holds up to tau 0.03 (30 % of neurons cut) and is exceeded at 39.8 % and 50.1 %.
+
+Reproducibility (S2): three passes of the base (one on rev16, two on rev17) give the same mean, 0.0513448, and the same KL per prompt to six decimals. Tau 0.002 and 0.03 give 0.0420 and 0.0560 again, identical to S1 on all ten prompts. The 0.0420 below the base is reproducible under this protocol; its cause is not established.
+
+The up rows are still read in these runs, so they measure quality, not speed: no speed gain is measured here. Skipping those rows is the subject of issue #120.
+
+Host proof: `tests/core/swiglu_skim_test.cpp` (18 checks, gcc 14 container) passes, and fails with `<=` in place of `<` or with the absolute value removed. `tests/core/q36_stats_test.cpp` checks the stats line with the option off and on. `native_expert.cpp` and `q36_engine.cu` are not built on this host (ggml and CUDA are not in the tree). On the .99, rev17 configures and builds (exit 0), and ctest passes 149 of 152. The three known failures are `ple_parity`, `expert_parity` and `pool_test`. `swiglu_skim_test`, `q36_stats_test` and `q36_hybrid_rules_test` pass. `isa_guard_check` is skipped.
+
+## Measured launch settings (25 October 2026)
+
+Measured on the test PC (RTX 5090, 128 GB RAM, Ryzen 9 9950X3D) with build rev12 (commit `2e29c428`), on Ornith-1.5-122B with IQ3_XXS gate and up and IQ4_XS down. Each launch is one 300-token request after 256 warm-up tokens, with `--kv q4`, run by `tools/ornith/measure_partition.ps1`. Settings go in through `-ExtraArgs` or `-ExtraEnv`. Each setting is compared with the base of its own round, over three alternated rounds.
+
+The base gives 44.6 to 45.3 tokens/s at short context, with 67 of 256 experts per layer in VRAM at `--max-context 409600`. After a 34,257-token prompt it gives 30.3 to 30.5 tokens/s.
+
+Single settings, round v13 (base 45.2 to 45.3 tokens/s):
+
+- `--max-context 65536`: +8.0 % (81 slots per layer). `--max-context 131072`: +4.0 % (78 slots). `--max-context 40960`: +7.8 %.
+- `--max-context 262144` is unstable: between -30 % and +1 % depending on the round. A repeat in round v14 gave -31 % to +1 %. The cause is not explained.
+- `--cpu-threads 0` (one worker per processor; the base ran the default of 6 workers of that round): +7.4 %. Fixed counts of round v13 (base 45.2, three launches each): 12 workers 48.5 tokens/s (+7.3 %), 10 gave 47.9, 8 gave 47.1 and 7 gave 46.9 (+3.8 %). 5 gave -5.9 % and 4 gave -13.7 %.
+- Fixed counts of round v14, another series whose base is not comparable with round v13 (three launches each): 11 workers 47.7 tokens/s, 14 gave 47.9, 16 gave 47.0 to 47.3.
+- `STRATA_Q36_REBALANCE_EVERY=4`: +3.5 % (16 gave -1.5 %; the default was 8 in this round, and is 4 since the batch of 25 October 2026, see below).
+- `--mtp 1`: +2.3 % with 65 % of drafts accepted. `--mtp 2`: +1.4 % (54 %). `--mtp 3`: -8.6 % (45 %).
+- `--ser 7,0.6`: +9.8 %, but its KL fails (below). `--ser 7,0.4` is within noise.
+- No effect: `STRATA_IQ_PREFETCH` from 0 to 8192 (-0.4 % to -0.1 %), and `STRATA_POOL_SPIN_US=5000` (-0.3 %).
+- Losses: `STRATA_POOL_SPIN_US=0` (-4.1 %) and `--pcie-frac auto` (-3.8 %).
+- `STRATA_POOL_UMWAIT` does not apply: the 9950X3D has no WAITPKG.
+
+Combination, rounds v14 and v16 (base 44.5 to 44.7 tokens/s), set by these flags and variables:
+
+```
+--cpu-threads 0 --max-context 65536 --mtp 1
+STRATA_Q36_REBALANCE_EVERY=4
+```
+
+- `--cpu-threads 0 --max-context 65536`: +15.2 %.
+- Adding the rebalance cadence of 4: +18.2 % (v14), +20.6 % (v16).
+- Adding `--mtp 1`: +30.7 % (v14, 58.3 tokens/s), +31.2 % (v16, 58.5 tokens/s). This is the best combination measured.
+- Combination at `--max-context 131072`: +26.3 % at short context. After the 34K prompt: +17.7 % at 65536, +25.0 % at 131072 (38.0 against 30.4 tokens/s).
+- The gains add up to more than their sum: 7.4 + 8.0 + 3.5 + 2.3 = 21.2 %, against 31 % measured.
+
+`--max-context` is the longest context the engine serves, so at 65536 a 128K request does not fit. The service needs 200K to 400K tokens (owner's decision, 25 October 2026), which rules out 65536 and 131072. The engine defaults and the installed service do not change in this batch.
+
+Combination at the service's contexts, round v17 (base 44.4 to 45.2 tokens/s at short context, 30.2 to 30.4 after the 34K prompt), set by `--cpu-threads 0 --mtp 1` and `STRATA_Q36_REBALANCE_EVERY=4`:
+
+- At the default `--max-context 409600`: 53.5 to 53.6 tokens/s at short context (+19.8 %), 34.8 to 35.0 after the 34K prompt (+15.1 %). This is the setting the service can run. Its KL on p00 to p09 is 0.0513 with 300 of 320 top-1, under the bar of 0.061 (the base gives 0.0485 and 301 of 320).
+- At `--max-context 262144`: 36.0 tokens/s at short context (-19.5 % against the base) and 27.9 after the 34K prompt, the same on all three rounds. It holds 73 expert slots per layer against 67 at 409600, yet the CPU pool takes 18.4 ms per step against 12.5. The cause is tracked in issue #112.
+- Not reproduced on 26 October 2026, after the machine's restart. Twelve launches (rev13 defaults, rev13 with `--cpu-threads 0`, rev12 with `--cpu-threads 0` and cadence 4) gave 52.7 to 53.5 tokens/s, against 36.1 for rev12 at the same setting on 25 October. The placement was the same: 73 expert slots per layer in VRAM, 12.92 GiB free. The PCIe link (gen 5 x16) and the clocks show no difference. The cause is not named. The state of the machine before its restart remains the working hypothesis, without proof.
+
+Output identity and KL:
+
+- Identity, `STRATA_Q36_FIXED_SLOTS=1 --expert-slots 52 --pcie-frac 0`, one setting at a time: with `--cpu-threads 0`, with `--max-context 65536` and with `--mtp 1`, the full logits are byte-identical to the base on six of six prompts (p00 to p05). The rebalance cadence moves experts between slots and is covered by the KL below, not by this check.
+- KL on p00 to p09 (32 forced steps, bar 0.061): the base gives 0.0485 and 301 of 320 top-1, identical over three launches. The combination with rebalance every 4 gives 0.0362 and 303 of 320. It passes. This base differs from the 0.0423 in the Result table; the cause is not established.
+
+Defaults changed by the batch of 25 October 2026: without any option, the pool runs one worker per worker processor, capped at 12 (`kAutoPoolWorkersCap`, `src/qwen35/q36_threads.hpp`), and the rebalance cadence is 4 (`kRebalanceEveryDefault`, `src/qwen35/q36_rebalance.hpp`). The figures behind them are round v13 (12 workers at 48.5 tokens/s, the best fixed count measured; `--cpu-threads 0` +7.4 %, cadence 4 +3.5 %, both above) and round v17 (the combination's KL of 0.0513 above). The new defaults were measured on 26 October 2026, in the next paragraph.
+
+Measured on 26 October 2026 at `--max-context 409600`, `--mtp 1`, 300 tokens, median of three rounds, at short context and after a 34K prompt. Build rev12 with `--cpu-threads 0` and rebalance every 4 gave 52.7 and 34.7 tokens/s. The rev13 defaults (12 workers) gave 53.1 and 34.9. Build rev13 with `--cpu-threads 0` (15 workers) gave 52.6 and 34.5. The KL of the rev13 defaults on p00 to p09 is 0.0513, with 300 of 320 top-1 (93.75 %). The engine's journal reads "on 13 CPU threads": the 12 workers plus the host thread (`hybrid experts` line in `src/qwen35/q36_engine.cu`).
+
+Series of 26 October 2026, build rev19. Same test PC (RTX 5090, Ryzen 9 9950X3D), run by `tools/ornith/measure_partition.ps1` with `--mtp 1`, 300 generated tokens, three alternated rounds per setting, median of the three, and the chunk forced to 4096 (`STRATA_Q36_CHUNK=4096`). Times are the request's `total_ms`. The prompts are 34,257 tokens (34K), 112,768 tokens (112K) and 45 tokens (short). rev19 gave the same output as the six references on six of six prompts before the series.
+
+- Prompt swaps cap (`STRATA_Q36_PROMPT_SWAPS`), request time at 34K and at 112K. 2048: 18,441 ms and 66,406 ms. 4096: 18,356 ms (-0.46 %) and 66,113 ms (-0.44 %). 8192: 18,379 ms (-0.34 %) and 66,173 ms (-0.35 %). 0, no cap: 18,357 ms (-0.45 %) and 66,159 ms (-0.37 %). The spread between rounds at 2048 is 33 ms at 34K. 4096 is the best, and its gain of 85 ms at 34K is above the spread. Decode after the 112K prompt: 22.5 tokens/s (13,351 ms) at 2048 against 23.2 (12,933 ms) at 4096, which is 3.1 % more. 4096 is the default.
+- Rebalance cadence (`STRATA_Q36_REBALANCE_EVERY`), 34K, swaps at 4096. Every 2: 18,174 ms (-1.0 % against 4) and 35.8 tokens/s of decode. Every 4: 18,356 ms and 35.0. Every 8: 18,418 ms (+0.3 %) and 34.8. One of the three launches at 2 stopped in the prompt read with `prefill mmq: mul_mat_q: unknown error`. The Windows log shows `nvlddmkm` events 13 and 14 at 20:33:45 and 20:33:46, and events 153 between 20:33:45 and 20:33:49. `nvidia-smi` at 22:00 read 30,634 MiB used and 27 °C. The launch was run again once and passed (18,130 ms). It is not stated whether the median of 18,174 ms counts the run again. One failure in three launches does not show that the cadence causes it, so cadence 2 needs a new test of three fresh launches, and the default stays 4. Measured at 34K only: not at 112K, not on other prompts.
+- Pool cores (`--cpu-threads` with `STRATA_POOL_CORES`), short prompt. 12 threads, the default: 6,041 ms and 52.7 tokens/s. 7 threads, no list: 6,379 ms and 50.4. 7 cores on the logical processors 0 to 12 (even numbers): 6,382 ms and 50.3. 7 cores on 16 to 28 (even numbers): 6,307 ms and 51.0. 7 cores on 0, 4, 8, 12, 16, 20 and 24: 6,382 ms and 50.3. The three lists were applied. The set 16 to 28 beats the set 0 to 12 by 1.2 %. Every 7-core run is slower than the default; the best of them takes 6,307 ms against 6,041 (about 4 % more time, 51.0 against 52.7 tokens/s). The default stays. This measurement does not say which of the two groups carries the 3D V-Cache: the L3 line of the pool log (see `STRATA_POOL_CORES` in QWEN36.md) will say it at the next build. The pool log of the 7-thread runs reads "8 CPU threads": 7 pinned workers plus the host thread, which also takes jobs during a drain (`host_works`, `include/strata/kernels/cpu/pool.hpp`), as the default reads 13 for 12 workers. The host thread is not pinned, so each 7-core list fixes the workers only, and the 1.2 % gap between the two sets is not a measure of one CCD alone.
+- `--batch 2` against `--batch 1`, two requests of 300 tokens (a 34K prompt and a short one), three rounds. `--batch 1`, one after the other: 18.94 to 18.99 s and 8.42 to 8.45 s, 27.36 to 27.45 s in all. `--batch 2`, both at once: 32.09 to 32.13 s and 32.12 to 32.19 s, so both end together at about 32 s, 32.35 to 32.41 s in all. That is 18 % slower, and the short request alone takes 8.4 s. `--batch 1` stays. Not measured: more than two requests, a 112K prompt.
+- `--max-context 40960` against the service's 409600, 34K. 40960: 17,467 ms, 38.8 tokens/s, 83 expert slots per layer in VRAM. 409600: 18,422 ms, 34.6 tokens/s, 68 slots. The request takes 5.2 % less time, with 15 more slots per layer. This context cannot hold a prompt above 40,960 tokens, so the 112K case was not measured, and the service needs 200K to 400K (see above). Not adopted. The round v13 figure above (+7.8 %) is another build and another measure.
+- `--ser-pool` and `--ser`, request time against no option. Short prompt: no option 6,058 ms; `--ser-pool 7,0.4` 5,435 ms (-10.3 %); `--ser-pool 7,0.6` 5,412 ms (-10.7 %); `--ser 7,0.6` 5,311 ms (-12.3 %). 34K: no option 18,431 ms; 18,173 ms (-1.4 %); 18,312 ms (-0.6 %); 17,827 ms (-3.3 %).
+- KL of the same four settings, mean over 10 prompts of 32 steps (`run-v25-kl`), bar 0.061. No option: 0.0513, worst prompt 0.196, top-1 300 of 320. `--ser-pool 7,0.4`: 0.0711, worst 0.234, 299 of 320, above the bar. `--ser-pool 7,0.6`: 0.0555, worst 0.192, 299 of 320, below the bar. `--ser 7,0.6`: 0.0889, worst 0.271, 292 of 320, above the bar. Only `--ser-pool 7,0.6` passes. The no-option KL varies a lot from one prompt to the next (0.001 to 0.196) over only 10 prompts, and the gap between 0.0555 and 0.0513 is 0.004, which is small. The bar is applied here to the mean of 10 prompts, which is still to be confirmed. `--ser 7,0.6` gave 0.0979 in the round above (build rev12); the two figures are not reconciled here. None of the three is the default: each changes the output, and the decision is pending.
+
+Settings that fail the bar:
+
+- `--ser 7,0.6`: KL 0.0979. `--ser 7,0.8`: KL 0.1120.
+- `--cache-prior 0.005` alone: KL 0.0540, passes. `0.01`: KL 0.0609, just under the bar.
+- `--cache-prior` combined with the rest, without MTP (the option refuses to run with `--mtp` above 0): KL 0.0625 at 0.005, which fails.
+
+Names checked in `src/`: `--cpu-threads` (`src/qwen35/q36_engine.cu:4932`), `--max-context` (`:4909`), `--mtp` (`:4920`), `--ser` (`:4945`), `--cache-prior` (`:4944`), `--expert-slots` (`:4933`), `--pcie-frac` (`:4937`), `--kv` (`:4957`), `STRATA_Q36_FIXED_SLOTS` (`:3148`), `STRATA_Q36_REBALANCE_EVERY` (`:1898`, default 4 in `src/qwen35/q36_rebalance.hpp:23`), `kAutoPoolWorkersCap` (`src/qwen35/q36_threads.hpp`, the automatic worker cap), `STRATA_Q36_STATS` (`src/qwen35/q36_stats.hpp:1`), `STRATA_IQ_PREFETCH` (`src/kernels/cpu/iq_avx512.cpp:39`, the kernel this CPU runs), `STRATA_Q36_SER_TABLE` (`src/qwen35/q36_engine.cu:5152`), `STRATA_POOL_SPIN_US` (`src/kernels/cpu/pool.cpp:520`), `STRATA_POOL_UMWAIT` (`src/kernels/cpu/pool.cpp:43`).
+
+## Per-layer SER table (issue #108)
+
+`STRATA_Q36_SER_TABLE` gives each main layer its own SER Kmin; the format and checks are in `docs/QWEN36.md`, under the routing options. The global `--ser 7,0.6` fails the bar (KL 0.0979, above), so the table is meant to keep most layers at 8 or 7 and lower the Kmin only where the map shows the KL stays under 0.061.
+
+Measured on 26 October 2026 on the test PC (RTX 5090, 128 GB of RAM): the map on build rev13, the tables and their speed on build rev14. The map is `tools/qwen35/ser_layer_map.ps1`: for each layer 0 to 47 it runs the ten parity prompts with that layer alone at Kmin 6 and the other layers at `--ser 8,0.6` (SER off there, t = 0.6 for the layer under test), then `logit_cmp` against llama.cpp's full logits (32 steps, as in the series above). Read each layer against the run of `--ser` alone (`-Baseline`), which with Kmin 8 prunes nothing and should match the base. That base gives a mean KL of 0.0513 with 300 of 320 top-1, against the bar of KL 0.061 on p00 to p09. Nine layers exceed the bar (1, 4, 5, 7, 18, 23, 30, 31, 43, from 0.0623 to 0.0682), and 17 give a KL under the base. A single layer moves the KL by -0.011 to +0.017 against the base, which is the size of the noise, so the map does not rank the layers reliably.
+
+Table A, the 17 layers under the base at Kmin 6: mean KL 0.0981, top-1 289 of 320. It fails. Table B, the 8 layers with the lowest KL (17, 10, 8, 27, 13, 45, 21, 44) at Kmin 6: mean KL 0.0557, top-1 297 of 320. It passes.
+
+Speed of Table B against rev14 without `--ser` or table (`409600`, `--mtp 1`, 300 tokens, three alternating turns each): 53.4 tokens/s against 53.4 at a short prompt (medians). After a 34K prompt it gives 34.1 tokens/s against 34.9, -2.3 %, and its three turns all fall below the three of the reference. CPU pool time rises from 15.79 to 16.23 ms per token to 16.40 to 16.86 ms. The cause of the drop after 34K is not isolated.
+
+Conclusion: the one table that passes the quality bar gives no gain at a short prompt and loses 2.3 % after 34K. The per-layer SER track stops on this box. `STRATA_Q36_SER_TABLE` stays available with no effect by default: without the variable, the logits match the earlier build byte for byte (6 of 6 prompts, rev12 against rev13, 26/10).
+
 ## Operational pitfalls
 
 - A process started with `Start-Process` from an SSH session dies with the session. Start it detached instead.
@@ -286,7 +484,8 @@ The per-head re-read of the K/V cache is still a hypothesis. Testing it needs re
 - A background deletion can overwrite its own log. Verify in the foreground.
 - Working set is not memory use: pages mapped from a file count toward it.
 - Compare builds only under the same environment variables and the same `FIXED_SLOTS` setting: the variable itself changes the output.
-- The thread count reported by the engine is one more than `--cpu-threads`.
+- The thread count reported by the engine is one more than `--cpu-threads`: the host thread takes jobs during a drain and is not pinned. The `hybrid experts` line now gives both counts.
+- The service log (`serve-ornith.log`, the server's own output) has no per-request reuse count. The engine writes `strata serve: session N: prompt X tokens = R reused + ...` on its stderr, which the server sends to the `log` file of the engine config (`serve/server.py`, `stderr=self.log`). Read that file, or start the server with `STRATA_REQUEST_LINES=1`, which copies each of these lines to its output as `[strata] request prompt P cached C ...` (`echo_requests` in `serve/server.py`). The batch path (`--batch 2` or more) writes `strata batch: slot N takes a prompt of X tokens = R reused`, which that copy does not match.
 - `--mtp` above 7 is refused at startup with exit code 2.
 - Nsight Compute on the hybrid engine deadlocks it. It serializes the kernels while the host spins on a GPU doorbell (probable cause), and it can leave the GPU at 100 % with no process until a reboot. `nvidia-smi -rgc` does not clear it.
 - Per-process GPU memory reads `[N/A]` under WDDM.
@@ -303,12 +502,12 @@ Estimated gains come from calculations in the sources, not from measurements on 
 6. Speculative decoding without MTP, issue #78 (AcceptMoE, Specter). Deferred. The gain depends on the union of experts across a verification window, where a two-token window touched 0.85 to 0.89 of the slots that two separate tokens would use. The published gains do not transfer without that measurement.
 7. Attention per head, issue #81. No gain estimated. The durations of 25 October (see the section above) put the slope at 10 to 11 µs per thousand tokens of context per call, which gives about 18.8 ms of attention per token at 128K (calculated). The cache re-read per head remains a hypothesis: it needs read counters, which Nsight Compute cannot give on this box. No kernel change has been made.
 8. PCIe share, issue #80. Under the 24 GB cap, the automatic share settled at 0.45, and the fixed optimum was 0.50 to 0.55 (22 October). Without the cap, measured on 24 October, the default share of 0.15 gives 41.40 tokens/s. Fixed 0.50 and 0.55 give 35.80 and 35.75 tokens/s, about 5.6 tokens/s less, and the automatic step gives 35.10, about 6.3 tokens/s less. A larger share raises the host time outside the pool from 1.4 to 8.5 ms per token. The optimum found under the cap does not carry over. The automatic step is off unless `--pcie-frac auto` is given; since 25 October the PCIe path itself is off by default (see "New defaults").
-9. CPU pool, issue #79. The recommended path works without large pages, which need a privilege the box does not grant. First measurement: busy time against wall time per thread.
+9. CPU pool, issue #79. The recommended path works without large pages, which need a privilege the box did not grant before 26 October 2026. First measurement: busy time against wall time per thread.
 10. Expert pruning (REAP), issue #75. Not measured on Ornith. The published figure is 95.8 % kept on BoolQ alone at 20 % pruning, on another model. First measurement: KL on the ten prompts.
 11. KV precision, issue #72. Accepted by the owner on 23 October 2026: KL 0.079 on the short prompts against the 0.061 bar, with `--kv q4`. The measurements are in the Ornith section of QWEN36.md.
 12. YaRN gate, issue #73. A 99 % top-1 target cannot be reached even by llama.cpp (91.6 %). The owner must choose a criterion.
 13. Q2_0 on CPU, issue #70. Fixed on branch `fix-issues-simples`: `hy_cpu_compute` now fills the ActQ that the Q2_0 kernels read. A Q2_0 pack whose n_embd exceeds 2560 is refused at load, so Ornith (3072) stays off native Q2_0 while the ActQ keeps its size. On the Windows test PC (MSVC 2022, CUDA 13.4, sm_120), `q36_engine.cu` compiles once it includes `strata/kernels/cpu/expert_layout.hpp`, `native_q2_act_test` passes on its AVX2 path, and its `--hy-job` mode, which builds the job without an ActQ as the old code did, crashes with an access violation. No q36 model was run with a Q2_0 pack.
-14. Rebalance cadence, issue #96. Measured uncapped on 24 October 2026: rebalancing every 8 steps gives 42.85 tokens/s against 41.40 for the default, which is +3.5 % over two launches. Every 16 steps gives 41.55 tokens/s. The gain is small and rests on two launches per setting; more launches of the 8-step setting would show whether it holds.
+14. Rebalance cadence, issue #96. Measured uncapped on 24 October 2026: rebalancing every 8 steps gives 42.85 tokens/s against 41.40 for the default, which is +3.5 % over two launches. Every 16 steps gives 41.55 tokens/s. Measured again on 25 October 2026 on the test PC with the rebalance byte counters (`STRATA_Q36_STATS=1`, defaults otherwise, PCIe path off, one 300-token request after 256 warm-up tokens, three launches per cadence alternated): every 8 steps gave 46.9, 46.5 and 46.7 tokens/s, every 16 gave 45.7, 45.5 and 45.7, every 32 gave 45.5, 45.5 and 45.6. Of the 114,816 expert picks of a request, the VRAM slots served 57.9 % at 8, 56.1 % at 16 and 55.8 % at 32, the CPU pool the rest and PCIe none: the 8-step cadence moves 2.1 % of the picks from the pool to VRAM against 32. Its cost per request: 304 slot swaps, 1240.2 MB of expert blobs and 287.7 KB of slot tables copied, 36.8 to 37.8 ms of host time, about 0.6 % of the 6.4 s decode; at 32, 72 swaps, 293.7 MB, 67.6 KB and 9.3 to 9.5 ms. Net, 8 is 2.6 % faster than 32 after that cost, so it stays the default (go). Cadence 2 was measured on 26 October 2026 with build rev19: 1.0 % less request time than 4 at 34K, but one launch in three failed on the GPU, so it is to be tested again and the default stays 4, its value since the batch of 25 October 2026 (see "Series of 26 October 2026, build rev19" above).
 
 ## Resuming
 

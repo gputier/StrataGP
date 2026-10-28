@@ -1,9 +1,10 @@
-// tests/core/q36_rebalance_every_test.cpp - STRATA_Q36_REBALANCE_EVERY, the rebalance cadence of strata-q36's hybrid mode
-// (src/qwen35/q36_rebalance.hpp), no GPU: the value read from the environment and its bounds, and the draft depth a window
-// may use so that no rebalance position falls inside it.
+// tests/core/q36_rebalance_every_test.cpp - STRATA_Q36_REBALANCE_EVERY and STRATA_Q36_PROMPT_SWAPS, the rebalance settings of
+// strata-q36's hybrid mode (src/qwen35/q36_rebalance.hpp), no GPU: the values read from the environment and their bounds, and
+// the draft depth a window may use so that no rebalance position falls inside it.
 #include "check.hpp"
 #include "q36_rebalance.hpp"
 
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -13,7 +14,13 @@ namespace {
 bool refused(const char* v, int* got) {
     std::string err;
     *got = strata::q36::rebalance_every_from_env(v, &err);
-    return *got == 8 && err.find("STRATA_Q36_REBALANCE_EVERY=") == 0 && err.find("using 8") != std::string::npos;
+    return *got == 4 && err.find("STRATA_Q36_REBALANCE_EVERY=") == 0 && err.find("using 4") != std::string::npos;
+}
+// the same for STRATA_Q36_PROMPT_SWAPS: 4096 and its message
+bool swaps_refused(const char* v, int* got) {
+    std::string err;
+    *got = strata::q36::prompt_swaps_from_env(v, &err);
+    return *got == 4096 && err.find("STRATA_Q36_PROMPT_SWAPS=") == 0 && err.find("using 4096") != std::string::npos;
 }
 }  // namespace
 
@@ -22,29 +29,55 @@ int main() {
     std::printf("rebalance_every_from_env:\n");
     {
         std::string err;
-        check(rebalance_every_from_env(nullptr, &err) == 8 && err.empty(), "unset: 8, no message");
+        check(rebalance_every_from_env(nullptr, &err) == 4 && err.empty(), "unset: 4, no message");
         check(rebalance_every_from_env("1", &err) == 1 && err.empty(), "1 is accepted (a rebalance at every position)");
-        check(rebalance_every_from_env(nullptr, nullptr) == kRebalanceEveryDefault && kRebalanceEveryDefault == 8, "the default is 8");
+        check(rebalance_every_from_env(nullptr, nullptr) == kRebalanceEveryDefault && kRebalanceEveryDefault == 4, "the default is 4");
+        check(rebalance_every_from_env("8", &err) == 8 && err.empty(), "8 is accepted: the former default is an explicit value");
         check(rebalance_every_from_env("32", &err) == 32 && err.empty(), "32 is accepted");
         check(rebalance_every_from_env("1024", &err) == 1024 && err.empty(), "1024 is accepted");
         check(rebalance_every_from_env("512", &err) == 512 && err.empty(), "a value inside the range is taken as it is");
         check(rebalance_every_from_env("64", nullptr) == 64, "no message pointer: the value is still read");
         int got = 0;
-        check(refused("0", &got) && got == 8, "0 is refused: 8 and the message");
-        check(refused("1025", &got) && got == 8, "1025 is refused: 8 and the message");
-        check(refused("-1", &got) && got == 8, "a negative value is refused");
-        check(refused("", &got) && got == 8, "an empty value is refused");
-        check(refused("abc", &got) && got == 8, "a value that is not a number is refused");
-        check(refused("12x", &got) && got == 8, "trailing text after the number is refused");
-        check(refused("3.5", &got) && got == 8, "a fraction is refused");
-        check(refused("99999999999999999999", &got) && got == 8, "a value out of the long range is refused");
-        check(refused("+8", &got) && got == 8, "a leading plus sign is refused (strtol alone would read 8)");
-        check(refused(" 8", &got) && got == 8, "a leading space is refused (strtol alone would read 8)");
-        check(refused("8 ", &got) && got == 8, "a trailing space is refused");
+        check(refused("0", &got) && got == 4, "0 is refused: 4 and the message");
+        check(refused("1025", &got) && got == 4, "1025 is refused: 4 and the message");
+        check(refused("-1", &got) && got == 4, "a negative value is refused");
+        check(refused("", &got) && got == 4, "an empty value is refused");
+        check(refused("abc", &got) && got == 4, "a value that is not a number is refused");
+        check(refused("12x", &got) && got == 4, "trailing text after the number is refused");
+        check(refused("3.5", &got) && got == 4, "a fraction is refused");
+        check(refused("99999999999999999999", &got) && got == 4, "a value out of the long range is refused");
+        check(refused("+8", &got) && got == 4, "a leading plus sign is refused (strtol alone would read 8)");
+        check(refused(" 8", &got) && got == 4, "a leading space is refused (strtol alone would read 8)");
+        check(refused("8 ", &got) && got == 4, "a trailing space is refused");
         check(rebalance_every_from_env("08", &err) == 8 && err.empty(), "a leading zero is read as decimal (08 is 8)");
-        check(rebalance_every_from_env("0", nullptr) == 8 && rebalance_every_from_env("abc", nullptr) == 8 &&
-                  rebalance_every_from_env("+8", nullptr) == 8,
-              "a refused value with no message pointer: 8, and nothing is written through the null pointer");
+        check(rebalance_every_from_env("0", nullptr) == 4 && rebalance_every_from_env("abc", nullptr) == 4 &&
+                  rebalance_every_from_env("+8", nullptr) == 4,
+              "a refused value with no message pointer: 4, and nothing is written through the null pointer");
+    }
+    std::printf("prompt_swaps_from_env:\n");
+    {
+        std::string err;
+        check(prompt_swaps_from_env(nullptr, &err) == 4096 && err.empty(), "unset: 4096, no message");
+        check(prompt_swaps_from_env("", &err) == 4096 && err.empty(), "empty: 4096, no message");
+        check(prompt_swaps_from_env(nullptr, nullptr) == kPromptSwapsDefault && kPromptSwapsDefault == 4096, "the default is 4096");
+        check(prompt_swaps_from_env("2048", &err) == 2048 && err.empty(), "2048 is accepted: the former default is an explicit value");
+        check(prompt_swaps_from_env("1", &err) == 1 && err.empty(), "1 is accepted");
+        check(prompt_swaps_from_env("0", &err) == INT_MAX && err.empty(), "0: no cap, INT_MAX");
+        check(prompt_swaps_from_env("2147483647", &err) == INT_MAX && err.empty(), "INT_MAX itself is accepted");
+        check(prompt_swaps_from_env("08", &err) == 8 && err.empty(), "a leading zero is read as decimal (08 is 8)");
+        check(prompt_swaps_from_env("8192", nullptr) == 8192, "no message pointer: the value is still read");
+        int got = 0;
+        check(swaps_refused("-1", &got) && got == 4096, "a negative value is refused: 4096 and the message");
+        check(swaps_refused("abc", &got) && got == 4096, "a value that is not a number is refused");
+        check(swaps_refused("99999999999", &got) && got == 4096, "99999999999 is refused: above INT_MAX");
+        check(swaps_refused("2147483648", &got) && got == 4096, "INT_MAX + 1 is refused");
+        check(swaps_refused("99999999999999999999", &got) && got == 4096, "a value out of the long long range is refused");
+        check(swaps_refused("12x", &got) && got == 4096, "trailing text after the number is refused");
+        check(swaps_refused("+8", &got) && got == 4096, "a leading plus sign is refused");
+        check(swaps_refused(" 8", &got) && got == 4096, "a leading space is refused");
+        check(swaps_refused("3.5", &got) && got == 4096, "a fraction is refused");
+        check(prompt_swaps_from_env("-1", nullptr) == 4096 && prompt_swaps_from_env("abc", nullptr) == 4096,
+              "a refused value with no message pointer: 4096, and nothing is written through the null pointer");
     }
     std::printf("draft_depth_limit:\n");
     {
@@ -64,9 +97,12 @@ int main() {
         check(tight, "the bound is tight: the window ends right before the next rebalance position when it cuts");
         check(draft_depth_limit(0, 32, 7) == 7 && draft_depth_limit(30, 32, 7) == 1 && draft_depth_limit(31, 32, 7) == 0,
               "at 0 the asked depth stands; at 30 one draft; at 31 none (the window of the rebalance's own position)");
+        check(draft_depth_limit(0, 4, 7) == 3 && draft_depth_limit(1, 4, 7) == 2 && draft_depth_limit(3, 4, 7) == 0 &&
+                  draft_depth_limit(4, 4, 7) == 3,
+              "the default every 4: 3 drafts fit from a multiple of 4, 2 at 1, none at 3");
         check(draft_depth_limit(0, 8, 7) == 7 && draft_depth_limit(5, 8, 7) == 2 && draft_depth_limit(7, 8, 7) == 0 &&
                   draft_depth_limit(8, 8, 7) == 7,
-              "the default every 8: 7 drafts fit from a multiple of 8, 2 at 5, none at 7");
+              "every 8 (the former default, still a valid value): 7 drafts fit from a multiple of 8, 2 at 5, none at 7");
         check(draft_depth_limit(5, 1, 7) == 0 && draft_depth_limit(0, 1024, 3) == 3, "every 1: no draft; 1024 leaves room");
     }
     std::printf("%s\n", g_fail ? "FAILED" : "all passed");
