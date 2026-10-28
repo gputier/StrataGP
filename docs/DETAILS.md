@@ -836,7 +836,11 @@ print(r.choices[0].message.content)
   and when it exits. Default off. On Linux and macOS it does nothing (one line at startup says so).
 - **A hard thinking budget (opt-in).** `"reasoning_budget_tokens": N` in a request (OpenAI or Anthropic) caps the
   thinking at N tokens: when it gets there the server ends it with a short wrap-up line and `</think>`, and the model
-  answers from there (the engine continues from what it already holds, so nothing is read again). The wrap-up is
+  answers from there (the engine continues from what it already holds, so nothing is read again). The engine
+  writes a few more tokens before it sees the server's STOP; since #127 the server keeps them (up to their last whole
+  character, outside a tag), sends them on as thinking and puts them in the next prompt, which therefore still
+  extends what the engine holds. Before, they were dropped and the engine read the whole thinking again: 19.3 s for
+  3,017 tokens on DeepSeek-V4.1 (RTX 5090), 2.5 s after. The thinking can thus run a few tokens past N. The wrap-up is
   part of the thinking the client sees and counts as output tokens. `"reasoning_budget_tokens": N` in
   `strata-<model>.json` sets it for every request; a request's own value wins, and `0` means no budget. Off by default;
   Anthropic's `"thinking": {"budget_tokens": N}` chooses the level, as above, and since 0.1.45 is also the budget (a

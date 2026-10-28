@@ -4300,6 +4300,244 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(self.engine.prompts, [])
 
 
+class OverrunEngine(ThinkingEngine):
+    """#127: ThinkingEngine, but a consumer that stops early leaves `overrun_n` more tokens in `self.overrun`, as the
+    engine's drain finds the lines written between the break and the STOP.  It goes on from a prompt that already holds
+    part of its reply (the budget's wrap-up, or tokens the model wrote past the break).  CLOSE "": no end of thinking."""
+    CLOSE = "</think>\n\n"
+
+    def __init__(self, tok, overrun_n=0):
+        super().__init__(tok)
+        self.overrun_n = overrun_n
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.prompts.append(list(ids))
+        seen = self.tok.decode(ids)
+        i = seen.rfind(self.CLOSE) if self.CLOSE else -1
+        if i >= 0:
+            after = seen[i + len(self.CLOSE):]
+            text = self.ANSWER[len(after):] if self.ANSWER.startswith(after) else self.ANSWER
+        else:
+            text = self.THOUGHT + self.CLOSE + (self.ANSWER if self.CLOSE else "")
+        yield from self._stream(self.tok.encode(text) + self.tok.encode("<|im_end|>", parse_special=True), max_new,
+                                cancel)
+
+
+class ThinkingBudgetOverrun(unittest.TestCase):
+    """#127: the engine writes a few more tokens before it sees the STOP the budget's break sends.  They are in its
+    history, so the next pass's prompt carries them (prompt + segment + overrun + wrap-up): it still extends what the
+    engine holds, and the engine does not read all the generated text again."""
+
+    def start(self, overrun_n, **attrs):
+        self.tok = ByteTokenizer()
+        self.engine = OverrunEngine(self.tok, overrun_n)
+        for k, v in attrs.items():
+            setattr(self.engine, k, v)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def openai(self, **extra):
+        body = {"model": "m", "messages": [{"role": "user", "content": "2+2?"}], "max_tokens": 400, **extra}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode())
+
+    def test_the_next_prompt_holds_the_overrun(self):
+        from serve.server import REASONING_WRAP_UP
+        self.start(7)
+        b = self.openai(reasoning_budget_tokens=20)
+        wrap = REASONING_WRAP_UP.split("</think>")[0]
+        msg = b["choices"][0]["message"]
+        extra = self.tok.encode(REASONING_WRAP_UP, parse_special=True)
+        first, second = self.engine.prompts
+        self.assertEqual(second, first + self.tok.encode(ThinkingEngine.THOUGHT[:27]) + extra)
+        self.assertEqual(msg["reasoning_content"], ThinkingEngine.THOUGHT[:27] + wrap)   # the client sees them too
+        self.assertEqual(msg["content"], ThinkingEngine.ANSWER)
+        self.assertEqual(b["usage"]["completion_tokens"], 27 + len(extra) + len(ThinkingEngine.ANSWER) + 1)
+
+    def test_an_empty_overrun_changes_nothing(self):
+        from serve.server import REASONING_WRAP_UP
+        self.start(0)
+        b = self.openai(reasoning_budget_tokens=20)
+        wrap = REASONING_WRAP_UP.split("</think>")[0]
+        msg = b["choices"][0]["message"]
+        extra = self.tok.encode(REASONING_WRAP_UP, parse_special=True)
+        first, second = self.engine.prompts
+        self.assertEqual(self.engine.overrun, [])
+        self.assertEqual(second, first + self.tok.encode(ThinkingEngine.THOUGHT[:20]) + extra)
+        self.assertEqual(msg["reasoning_content"], ThinkingEngine.THOUGHT[:20] + wrap)
+        self.assertEqual(b["usage"]["completion_tokens"], 20 + len(extra) + len(ThinkingEngine.ANSWER) + 1)
+        # the same request on an engine without any overrun support: the same prompts and the same reply
+        plain = ThinkingEngine(self.tok)
+        svc = Service(plain, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions", data=json.dumps(
+            {"model": "m", "messages": [{"role": "user", "content": "2+2?"}], "max_tokens": 400,
+             "reasoning_budget_tokens": 20}).encode(), headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            ref = json.loads(r.read().decode())
+        self.assertEqual(plain.prompts, self.engine.prompts)
+        self.assertEqual(ref["choices"][0]["message"], msg)
+        self.assertEqual(ref["usage"], b["usage"])
+
+    def test_an_overrun_that_closes_the_thinking_gets_no_wrap_up(self):
+        self.start(len("</think>\n\nThe "), THOUGHT="x" * 20)
+        b = self.openai(reasoning_budget_tokens=20)
+        msg = b["choices"][0]["message"]
+        first, second = self.engine.prompts
+        # the model closed its thinking itself and began its answer: nothing is added, the pass goes on
+        self.assertEqual(second, first + self.tok.encode("x" * 20 + "</think>\n\nThe "))
+        self.assertNotIn("time to give my answer", self.tok.decode(second))
+        self.assertEqual(msg["reasoning_content"], "x" * 20)
+        self.assertEqual(msg["content"], ThinkingEngine.ANSWER)
+        self.assertEqual(b["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(b["usage"]["completion_tokens"], len(ThinkingEngine.ANSWER) + 20 + len("</think>\n\n") + 1)
+
+    def test_an_overrun_with_a_stop_token_ends_the_reply(self):
+        self.start(5, THOUGHT="x" * 22, CLOSE="")             # two more tokens, the stop token, then nothing
+        b = self.openai(reasoning_budget_tokens=20)
+        msg = b["choices"][0]["message"]
+        self.assertEqual(len(self.engine.prompts), 1)         # no wrap-up, no second pass
+        self.assertEqual(self.engine.overrun[-1], self.tok.encode("<|im_end|>", parse_special=True)[0])
+        self.assertEqual(msg["reasoning_content"], "x" * 22)
+        self.assertEqual(b["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(b["usage"]["completion_tokens"], 23)  # the stop token counts, as for any stop
+
+    def test_a_stop_token_in_the_middle_drops_what_follows_it(self):
+        self.start(0, THOUGHT="x" * 22, CLOSE="")
+        end = self.tok.encode("<|im_end|>", parse_special=True)
+        self.engine.generate = lambda ids, max_new, sampling, cancel, embeddings=None: self._with_overrun(
+            ids, max_new, cancel, [120, 121, *end, 122, 123])
+        b = self.openai(reasoning_budget_tokens=20)
+        self.assertEqual(len(self.engine.prompts), 1)
+        self.assertEqual(b["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(b["usage"]["completion_tokens"], 23)
+
+    def _with_overrun(self, ids, max_new, cancel, overrun):
+        self.engine.prompts.append(list(ids))
+        self.engine.overrun = []
+        for i, t in enumerate(self.tok.encode("x" * 40)[:max_new]):
+            try:
+                yield t
+            except GeneratorExit:
+                self.engine.overrun = list(overrun)
+                raise
+
+    def test_max_new_is_kept(self):
+        from serve.server import REASONING_WRAP_UP
+        extra = ByteTokenizer().encode(REASONING_WRAP_UP, parse_special=True)
+        max_new = 20 + 10 + len(extra) + 1 + 5               # room for 15 of the 100 tokens past the break
+        self.start(100)
+        b = self.openai(reasoning_budget_tokens=20, max_tokens=max_new)
+        first, second = self.engine.prompts
+        self.assertEqual(second, first + self.tok.encode(ThinkingEngine.THOUGHT[:35]) + extra)
+        self.assertEqual(b["usage"]["completion_tokens"], max_new)
+        self.assertEqual(b["choices"][0]["finish_reason"], "length")
+
+    def test_a_budget_wrap_up_without_room_still_leaves_one_token_to_answer(self):
+        from serve.server import REASONING_WRAP_UP
+        extra = ByteTokenizer().encode(REASONING_WRAP_UP, parse_special=True)
+        self.start(100)
+        b = self.openai(reasoning_budget_tokens=20, max_tokens=20 + len(extra) + 1)   # nothing to spare for the overrun
+        first, second = self.engine.prompts
+        self.assertEqual(second, first + self.tok.encode(ThinkingEngine.THOUGHT[:20]) + extra)
+        self.assertEqual(b["usage"]["completion_tokens"], 20 + len(extra) + 1)
+
+
+class CleanOverrun(unittest.TestCase):
+    """#127: the overrun is taken up to its last clean point only, and the look ahead moves nothing."""
+
+    def setUp(self):
+        from serve.frontend import OutputParser
+        from serve.server import Detokenizer
+        self.tok = ByteTokenizer()
+        self.detok, self.parser = Detokenizer(self.tok), OutputParser(thinking=True)
+        self.stop = {self.tok.encode("<|im_end|>", parse_special=True)[0]}
+
+    def cut(self, text):
+        from serve.server import clean_overrun
+        return clean_overrun(self.tok.encode(text, parse_special=True), self.detok, self.parser, self.stop)
+
+    def test_a_whole_text_is_kept(self):
+        self.assertEqual(self.cut("so the answer"), self.tok.encode("so the answer"))
+
+    def test_a_character_split_at_the_end_is_left_out(self):
+        ids = self.tok.encode("ok é")
+        from serve.server import clean_overrun
+        self.assertEqual(clean_overrun(ids[:-1], self.detok, self.parser, self.stop), self.tok.encode("ok "))
+
+    def test_a_tag_held_at_the_end_is_left_out(self):
+        self.assertEqual(self.cut("done </thi"), self.tok.encode("done "))
+
+    def test_up_to_a_stop_token(self):
+        self.assertEqual(self.cut("end<|im_end|>more"), self.tok.encode("end<|im_end|>", parse_special=True))
+
+    def test_the_look_ahead_moves_nothing(self):
+        self.cut("abc </thi")
+        self.assertEqual((self.parser.buf, self.parser.state, self.detok.ids), ("", "reasoning", []))
+
+
+class EngineOverrunDrain(unittest.TestCase):
+    """#127: the engine client keeps the ids of the `T` lines that come in after its STOP, in order."""
+
+    def bare(self, can_stop=True):
+        import io
+        import queue
+        engine = StrataEngine.__new__(StrataEngine)
+        engine.proc = mock.Mock()
+        engine.proc.stdin = io.StringIO()
+        engine.proc.poll.return_value = None
+        engine.lines, engine.can_stop, engine.max_context = queue.Queue(), can_stop, 4096
+        engine.silence_s, engine.log_path, engine.last = 0, None, None
+        return engine
+
+    def test_the_drain_keeps_the_tokens_after_the_stop_in_order(self):
+        engine = self.bare()
+        for line in ("T 5", "T 6", "PP 1 1 1 1.0", "T 7", "T 8", "DONE 4 1 1 1 length"):
+            engine.lines.put(line)
+        gen = engine.generate([1], 10, {}, threading.Event())
+        self.assertEqual(next(gen), 5)
+        gen.close()                                           # the consumer stops: STOP, then the drain
+        self.assertIn("STOP", engine.proc.stdin.getvalue())
+        self.assertEqual(engine.overrun, [6, 7, 8])
+
+    def test_a_request_that_ran_to_its_end_has_no_overrun(self):
+        engine = self.bare()
+        for line in ("T 5", "T 6", "DONE 2 1 1 1 length"):
+            engine.lines.put(line)
+        self.assertEqual(list(engine.generate([1], 10, {}, threading.Event())), [5, 6])
+        self.assertEqual(engine.overrun, [])
+
+    def test_the_overrun_starts_empty_with_each_request(self):
+        engine = self.bare()
+        for line in ("T 5", "T 6", "DONE 2 1 1 1 length"):
+            engine.lines.put(line)
+        gen = engine.generate([1], 10, {}, threading.Event())
+        next(gen)
+        gen.close()
+        self.assertEqual(engine.overrun, [6])
+        for line in ("T 9", "DONE 1 1 1 1 length"):
+            engine.lines.put(line)
+        self.assertEqual(list(engine.generate([1], 10, {}, threading.Event())), [9])
+        self.assertEqual(engine.overrun, [])
+
+    def test_an_engine_that_does_not_take_the_stop_gives_none(self):
+        engine = self.bare(can_stop=False)                     # it runs on to max_new: no continuation of the text
+        for line in ("T 5", "T 6", "T 7", "DONE 3 1 1 1 length"):
+            engine.lines.put(line)
+        gen = engine.generate([1], 10, {}, threading.Event())
+        next(gen)
+        gen.close()
+        self.assertNotIn("STOP", engine.proc.stdin.getvalue())
+        self.assertEqual(engine.overrun, [])
+
+
 class CallingEngine(MockEngine):
     """Thinks, then answers in text - unless its prompt already opens a call (a forced tool_choice): then it finishes
     that call.  Records every prompt it is given."""

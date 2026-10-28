@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import collections
+import copy
 import base64
 import hashlib
 import hmac
@@ -288,13 +289,34 @@ class MockEngine:
     """Replays a scripted completion (text) as token ids, one per step, then the end-of-turn token.  Given a list of
     scripts, each request gets the next one and the last one repeats (a tool call, then the answer after it)."""
 
-    def __init__(self, tokenizer, script: str | list[str], max_context: int = 32768, delay_s: float = 0.0):
+    def __init__(self, tokenizer, script: str | list[str], max_context: int = 32768, delay_s: float = 0.0,
+                 overrun_n: int = 0):
         self.tok, self.max_context, self.delay = tokenizer, max_context, delay_s
         end = tokenizer.encode(IM_END, parse_special=True)
         self.scripts = [tokenizer.encode(x, parse_special=True) + end for x in ([script] if isinstance(script, str)
                                                                                  else script)]
         self.script, self.turns = self.scripts[0], 0
         self.last_prompt: list[int] = []
+        # #127: the tokens the engine writes between the consumer stopping and its STOP being seen, as
+        # StrataEngine.generate collects them: the next `overrun_n` tokens of the script after the one the consumer
+        # stopped at
+        self.overrun_n, self.overrun = overrun_n, []
+
+    def _stream(self, tokens, max_new, cancel):
+        """The scripted tokens one by one (at most max_new); a consumer that stops early leaves `overrun_n` more of
+        them in `self.overrun`, the way the real engine's drain finds the lines that came in after the STOP."""
+        self.overrun = []
+        tokens = tokens[:max_new]
+        for i, t in enumerate(tokens):
+            if cancel.is_set():
+                return
+            if self.delay:
+                time.sleep(self.delay)
+            try:
+                yield t
+            except GeneratorExit:
+                self.overrun = list(tokens[i + 1:i + 1 + self.overrun_n])
+                raise
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.last_prompt = list(ids)
@@ -302,12 +324,7 @@ class MockEngine:
         if len(self.scripts) > 1:
             self.script = self.scripts[min(self.turns, len(self.scripts) - 1)]
             self.turns += 1
-        for t in self.script[:max_new]:
-            if cancel.is_set():
-                return
-            if self.delay:
-                time.sleep(self.delay)
-            yield t
+        yield from self._stream(self.script, max_new, cancel)
 
 
 class EngineDied(RuntimeError):
@@ -1928,6 +1945,10 @@ class StrataEngine:
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
+        # #127: the ids of the `T` lines that came in after the STOP below, in order (the engine ran on until it saw
+        # it): tokens it holds in its history that this consumer did not take.  A caller that continues the same text
+        # in a next pass puts them back in that pass's prompt, so the prompt still extends what the engine holds.
+        self.overrun = []
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
         bias_api.validate_request(sampling or {}, self, None)
@@ -2046,6 +2067,11 @@ class StrataEngine:
                         break
                     if not self.can_stop:
                         heard = time.monotonic()
+                    elif line.startswith("T "):
+                        try:
+                            self.overrun.append(int(line[2:]))      # #127: kept, not thrown away
+                        except ValueError:
+                            pass
 
     def _activity(self) -> tuple[float, int] | None:
         """#1317: (CPU seconds, I/O bytes) the engine process has used so far, or None when they cannot be read."""
@@ -3009,6 +3035,30 @@ class Detokenizer:
             return ""
         delta, self.sent = text[self.sent:], len(text)
         return delta
+
+    def fork(self) -> "Detokenizer":
+        """A copy that decodes on from the same point, for a look ahead that must not move this one."""
+        other = copy.copy(self)
+        other.ids = list(self.ids)
+        if self.inc is not None:
+            other.inc = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            other.inc.setstate(self.inc.getstate())
+        return other
+
+
+def clean_overrun(ids: list[int], detok: Detokenizer, parser, stop_ids) -> list[int]:
+    """#127: the longest start of `ids` that ends at a clean point (no character split across tokens, no tag held
+    back by the parser), so a wrap-up written after it starts on a whole character and outside a tag; up to and
+    including a stop token when one comes first (the reply ends there, nothing follows it).  Read on copies:
+    `detok` and `parser` do not move."""
+    d, p, keep = detok.fork(), copy.deepcopy(parser), 0
+    for i, t in enumerate(ids):
+        if t in stop_ids:
+            return ids[:i + 1]
+        p.feed(d.push(t))
+        if not p.buf and not d.pending():
+            keep = i + 1
+    return ids[:keep]
 
 
 OPENAI_MAX_STOP = 4                                  # OpenAI's limit on `stop`
@@ -4352,6 +4402,7 @@ class Service:
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
                         opens = False                   # the thinking is over: write the forced call's opening
+                        ov, ov_void = [], False         # #127: what the engine wrote after the STOP; unusable
                         try:
                             # A value the frontend holds back (a tool call's array or object argument is sent
                             # whole, once complete) can keep the stream silent for minutes while tokens are
@@ -4371,7 +4422,8 @@ class Service:
                                 if t in self.stop_ids:
                                     if force and parser.state == "reasoning" and parser.buf == THINK_END:
                                         opens = True    # #537: the held </think> was the end: the call opens there
-                                        break
+                                        ov_void = True  # #127: the stop token is not in the next prompt: what the
+                                        break           # engine wrote after it cannot follow what the prompt holds
                                     finish = "stop"
                                     raw_ids.append(t)
                                     break
@@ -4450,6 +4502,8 @@ class Service:
                                 self._say_died(e)
                                 if not leaving and not cancel.is_set():
                                     raise
+                            # #127: the tokens gen.close() found after the STOP (not for the batched path: it has none)
+                            ov = list(getattr(self.engine, "overrun", None) or [])
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
@@ -4524,11 +4578,55 @@ class Service:
                         # was generated plus the wrap-up, so the engine continues from the prefix it already holds.
                         # A forced call (tool_choice) is opened the same way: after the wrap-up, or where the
                         # thinking ended, after the blank line the template puts before a call.
+                        # #127: the engine did not stop at the break: it wrote more tokens before it saw the STOP,
+                        # and holds them in its history.  They go the way every token goes (count, events, parser),
+                        # then the wrap-up follows them, and the next prompt carries them, so it still extends what
+                        # the engine holds (else it read all the generated text again).  Room is kept for the text
+                        # that follows, so the answer is not given up for them.
+                        taken, stopped = [], False
+                        if ov and not ov_void:
+                            after = REASONING_WRAP_UP + (force or "") if wrap else "\n\n" + force
+                            room = max_new - n - len(self.tok.encode(after, parse_special=True)) - 1
+                            for t in clean_overrun(ov[:max(0, room)], detok, parser, self.stop_ids):
+                                n += 1
+                                if t in self.stop_ids:
+                                    if force and parser.state == "reasoning" and parser.buf == THINK_END:
+                                        wrap, opens = False, True   # #537, as above: the call opens where it ended
+                                        budget = st["thinking_budget"] = None
+                                    else:
+                                        finish, stopped = "stop", True
+                                        raw_ids.append(t)
+                                    break
+                                raw_ids.append(t)
+                                taken.append(t)
+                                thinking_n += parser.state in ("reasoning", "rcall")
+                                run_len = run_len + 1 if t == run_tok else 1
+                                run_tok = t
+                                piece = detok.push(t)
+                                tail = (tail + piece)[-2:]
+                                evs = cut(parser.feed(piece))
+                                self._note(n, evs, st, rate)
+                                for ev in evs:
+                                    if self.reasoning_loop_recovery and ev.kind == "reasoning":
+                                        reasoning_text += ev.text or ""
+                                    if ev.kind in ("content", "tool_start", "tool_call"):
+                                        answered = True
+                                    if ev.kind in ("tool_start", "tool_call"):
+                                        force = None        # the model is writing a call of its own
+                                    yield "event", ev
+                                if stops is not None and stops.hit is not None:
+                                    finish, stopped = "stop", True
+                                    break
+                            if stopped:
+                                break                       # a stop as any other: nothing more is asked of the model
                         if wrap:
                             budget = st["thinking_budget"] = None
+                        if wrap and not (taken and parser.state != "reasoning"):
                             text = REASONING_WRAP_UP + (force or "")
-                        else:
+                        elif force:
                             text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
+                        else:
+                            text = ""       # #127: it closed its thinking itself (or a call opened): it goes on
                         force = None
                         extra = self.tok.encode(text, parse_special=True)
                         if max_new - n - len(extra) < 1:
@@ -4547,7 +4645,7 @@ class Service:
                         if stops is not None and stops.hit is not None:
                             finish = "stop"
                             break
-                        prompt = prompt + seg + extra
+                        prompt = prompt + seg + taken + extra
                     if cancel.is_set():
                         finish = "cancel"
                     elif looped:
