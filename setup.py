@@ -903,7 +903,8 @@ def cpu_info():
     else:
         try:
             txt = open("/proc/cpuinfo").read()
-            flags = set(re.search(r"^flags\s*:\s*(.*)$", txt, re.M).group(1).split())
+            m = re.search(r"^flags\s*:\s*(.*)$", txt, re.M)     # no such line on ARM ("Features")
+            flags = set(m.group(1).split()) if m else set()
             avx2 = "avx2" in flags
             avx512 = {"avx512f", "avx512bw", "avx512vl", "avx512_vnni", "avx512vbmi"} <= flags
             m = re.search(r"^model name\s*:\s*(.*)$", txt, re.M)

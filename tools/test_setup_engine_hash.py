@@ -303,8 +303,13 @@ class WhatARefusalDoesToTheCaller(unittest.TestCase):
 
     def get_prebuilt(self, updating, digest):
         out = io.StringIO()
-        with contextlib_redirect(out),                 mock.patch.object(setup, "download", self.fake_download),                 mock.patch.object(setup, "engine_digest", return_value=digest):
+        with contextlib_redirect(out),                 mock.patch.object(setup, "download", self.fake_download),                 mock.patch.object(setup, "engine_digest", return_value=digest),                 self.published():
             return setup.get_prebuilt(setup.PREBUILT_URL, {"arch": 89}, "gpu", updating=updating), out
+
+    def published(self):
+        # get_prebuilt asks the release (HEAD) before it downloads: answered here, so the test does not depend on
+        # what the live release holds or on the network.
+        return mock.patch.object(setup.urllib.request, "urlopen", return_value=mock.MagicMock())
 
     def test_updating_keeps_the_installed_engine_instead_of_stopping(self):
         # The call site's own words: "a failed download must not stop the model from starting".
@@ -323,7 +328,7 @@ class WhatARefusalDoesToTheCaller(unittest.TestCase):
         self.assertIsNone(eng, "a refusal must not escape get_prebuilt as SystemExit")
 
     def test_a_first_install_stops_because_there_is_nothing_to_fall_back_to(self):
-        with mock.patch.object(setup, "download", self.fake_download),                 mock.patch.object(setup, "engine_digest", return_value=(999, "f" * 64)):
+        with mock.patch.object(setup, "download", self.fake_download),                 mock.patch.object(setup, "engine_digest", return_value=(999, "f" * 64)),                 self.published():
             with self.assertRaises(SystemExit):
                 setup.get_prebuilt(setup.PREBUILT_URL, {"arch": 89}, "gpu")
 
