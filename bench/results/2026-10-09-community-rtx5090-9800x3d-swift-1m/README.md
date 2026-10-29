@@ -343,3 +343,5 @@ come from the original captured engine/client results. No engine or default
 change is proposed. Related existing discussion:
 [prefill chunk tradeoffs at 1M, #669](https://github.com/Niko1221/Strata/issues/669)
 (different machine/model/version; no cross-report speedup comparison here).
+
+Checksum note (29 October 2026). The `README.md` entry of `checksums.sha256` did not match the file as submitted in upstream PR #1722 (expected `4e1437ea…1748e`, the file gave `93cfc8e6…0ee67`; no CRLF involved). The hash was most likely taken before a last edit of this README. The entry was recomputed on 29 October 2026, after this note was added; the 65 other entries are unchanged and still match the submission.
