@@ -21,8 +21,9 @@ class Parallel(unittest.TestCase):
 
     def test_pinned_ram(self):
         # measured: 12.38 GiB (13.29 GB) of pinned RAM per session at 1M int8 with KV streaming; none without it
-        self.assertAlmostEqual(S.parallel_pinned_gb(1048576, "int8", True), 13.29, delta=0.05)
-        self.assertEqual(S.parallel_pinned_gb(1048576, "int8", False), 0.0)
+        self.assertAlmostEqual(S.parallel_pinned_gb(1048576, "int8"), 13.29, delta=0.05)
+        self.assertAlmostEqual(S.parallel_pinned_gb(1048576, "k8v4"), 10.27, delta=0.05)
+        self.assertLess(S.parallel_pinned_gb(1048576, "q4_0"), S.parallel_pinned_gb(1048576, "k8v4"))
         iq3s = S.MODELS["IQ3_S"]["arena_gb"]
         # the measured PC (125.6 GiB): 4 slots at 1M left 8 GiB free and half the arena unpinned
         self.assertFalse(S.parallel_ram_fits(4, 125.6, iq3s, 1048576, "int8", True))
@@ -50,6 +51,10 @@ class Parallel(unittest.TestCase):
         note = S.parallel_note(None, 48, q2, 1048576, "int8", True, 64)
         self.assertIn("pins ~13.3 GB of RAM", note[0])
         self.assertIn("pins ~13.3 GB of RAM", S.parallel_note(2, 48, q2, 1048576, "int8", True, 64)[0])
+        # VRAM is the limit and RAM is fine: the note does not blame the pinned RAM
+        note = S.parallel_note(None, 12, q2, 32768, "int8", False, 128)
+        self.assertNotIn("pins", note[0])
+        self.assertIn("10-25% speed", note[0])
 
     def test_notes_recommend_never_force(self):
         q2 = S.MODELS["Q2_0"]["arena_gb"]

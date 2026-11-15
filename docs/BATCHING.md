@@ -157,8 +157,8 @@ slots, and the slots may take at most a fifth of it, up to 4 slots. With Q2_0 at
 card, 4 from 32 GB or on a split such as 2 x 16 GB; IQ3_S needs 32 GB or a split. Everywhere else (any 12 or 16 GB
 card alone) it stays at one at a time and setup says: "parallel N reduces waiting for several users but costs
 about 10-25% speed per request on this card". With KV streaming the slots must also fit in RAM: the expert arena,
-the server's own session and every slot's pinned K/V leave at least 16 GB to the system, or setup stays at one at a
-time and says how much RAM each request would pin. Measured on 125.6 GiB with IQ3_S at 1M: 8 slots stopped the
+the server's own session and every slot's pinned K/V must stay within 75 % of the RAM (Windows refused to pin more
+at 99 of 125.6 GiB), or setup stays at one at a time and says how much RAM each request would pin. Measured on 125.6 GiB with IQ3_S at 1M: 8 slots stopped the
 engine (pinning refused at 99 GiB), 4 slots started with 8 GiB free and half the arena unpinned, and every request
 ran 3-4x slower, a request alone included. `--parallel N` is honoured as asked either way.
 

@@ -5303,11 +5303,13 @@ PARALLEL_COST_NOTE = ("parallel N reduces waiting for several users but costs ab
 
 PARALLEL_CELL_BYTES = 1850     # VRAM per context cell beyond 32K a session keeps in any KV mode (QSA indexer rows,
                                # RoPE tables): 0.95 GiB at 262K, 2.27 GiB at 1M per slot with --kv-resident 32768
-PARALLEL_RAM_FREE = 16         # GB of RAM left to the system beside the expert arena and the sessions' pinned K/V
+PARALLEL_PIN_SHARE = 0.75      # share of the RAM the expert arena plus every session's pinned K/V may take: measured on
+                               # a 125.6 GiB PC, pinning was refused at 99 GiB (79%)
 
 
 def _parallel_kv_tok(kv: str) -> int:
-    return 12 * (576 if kv == "q4_0" else 1056)   # bytes of K/V per token over the 12 QSA layers
+    # 12 layers: the measured pin (12.38 GiB at 1M int8), not the 13 of kv_streaming_ram_gb
+    return 12 * KV_CELL_BYTES.get(kv, 1056)
 
 
 def parallel_slot_gb(ctx: int, kv: str, streaming: bool) -> float:
@@ -5319,19 +5321,21 @@ def parallel_slot_gb(ctx: int, kv: str, streaming: bool) -> float:
     return (kv_cells * _parallel_kv_tok(kv) + max(0, ctx - 32768) * PARALLEL_CELL_BYTES) / 1e9 + 0.17
 
 
-def parallel_pinned_gb(ctx: int, kv: str, streaming: bool) -> float:
+def parallel_pinned_gb(ctx: int, kv: str) -> float:
     """The RAM one session pins with KV streaming: the host copy of its whole K/V (12.38 GiB at 1M int8, measured).
-    The server's own session and every slot each pin one.  Without streaming the K/V stays in VRAM: nothing."""
-    return ctx * _parallel_kv_tok(kv) / 1e9 if streaming else 0.0
+    The server's own session and every slot each pin one.  Callers apply it only when streaming."""
+    return ctx * _parallel_kv_tok(kv) / 1e9
 
 
 def parallel_ram_fits(n: int, ram_gb: float | None, arena_gb: float, ctx: int, kv: str, streaming: bool) -> bool:
-    """Whether the expert arena, the server's session and n slots' pinned K/V leave PARALLEL_RAM_FREE to the system.
+    """Whether the expert arena plus the pinned K/V of the server's session and n slots stay within PARALLEL_PIN_SHARE
+    of the RAM (ram_gb is in GiB, the arena and the pins in GB).
     Measured on 125.6 GiB with the 50.3 GB IQ3_S arena at 1M: 8 slots stopped the engine (pinning refused at 99 GiB),
     4 slots started with 8 GiB free and half the arena unpinned, every request 3-4x slower.  ram_gb None: not known."""
     if ram_gb is None or not streaming:
         return True
-    return arena_gb + (n + 1) * parallel_pinned_gb(ctx, kv, streaming) + PARALLEL_RAM_FREE <= ram_gb
+    pinned_gib = (arena_gb + (n + 1) * parallel_pinned_gb(ctx, kv)) * 1e9 / 2**30
+    return pinned_gib <= PARALLEL_PIN_SHARE * ram_gb
 
 
 def parallel_recommend(vram_gbs, arena_gb: float, ctx: int, kv: str, streaming: bool,
@@ -5361,8 +5365,8 @@ def parallel_note(asked: int | None, vram_gbs, arena_gb: float, ctx: int, kv: st
     one), or how the asked count compares with it (kept as asked: recommend, never force)."""
     rec = parallel_recommend(vram_gbs, arena_gb, ctx, kv, streaming, ram_gb)
     slot = parallel_slot_gb(ctx, kv, streaming)
-    pinned = parallel_pinned_gb(ctx, kv, streaming)
-    ram_bound = not parallel_ram_fits(2, ram_gb, arena_gb, ctx, kv, streaming)
+    pinned = parallel_pinned_gb(ctx, kv) if streaming else 0.0
+    ram_bound = rec == 0 and parallel_recommend(vram_gbs, arena_gb, ctx, kv, streaming) >= 2
     why = (f"each request at once pins ~{pinned:.1f} GB of RAM for its K/V at this context, more than this PC can "
            "spare beside the experts" if ram_bound else PARALLEL_COST_NOTE)
     if asked is None or asked <= 1:
